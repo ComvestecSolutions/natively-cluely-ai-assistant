@@ -1,6 +1,6 @@
 {
   "name": "natively",
-  "version": "2.9.1",
+  "version": "2.9.4",
   "main": "dist-electron/electron/main.js",
   "engines": {
     "node": ">=22.6.0"
@@ -33,7 +33,7 @@
     "dist": "npm run app:build",
     "dist:signed": "npm run app:build:signed && node scripts/upload-release.mjs",
     "build:native": "node scripts/build-native.js",
-    "test": "npm run build:electron && node scripts/run-with-env.mjs --default-tmpdir NATIVELY_TEST_USERDATA=natively-test-userdata --default-tmpdir CODEX_HOME=natively-test-codex-home --set ELECTRON_RUN_AS_NODE=1 -- electron --test \"electron/services/__tests__/**/*.test.mjs\" \"electron/services/extensions/__tests__/**/*.test.mjs\" \"electron/intelligence/autoAnswer/__tests__/**/*.test.mjs\" \"electron/lib/__tests__/**/*.test.mjs\" \"electron/llm/__tests__/**/*.test.mjs\" \"electron/llm/codeVerification/__tests__/**/*.test.mjs\" \"electron/audio/__tests__/**/*.test.mjs\" \"electron/audio/whisper/__tests__/**/*.test.mjs\" \"electron/audio/whisper/nemotron/__tests__/**/*.test.mjs\" \"electron/rag/__tests__/**/*.test.mjs\" \"electron/utils/__tests__/**/*.test.mjs\" \"electron/update/**/*.test.mjs\"",
+    "test": "npm run build:electron && node scripts/run-with-env.mjs --default-tmpdir NATIVELY_TEST_USERDATA=natively-test-userdata --default-tmpdir CODEX_HOME=natively-test-codex-home --set ELECTRON_RUN_AS_NODE=1 -- electron --test \"electron/services/__tests__/**/*.test.mjs\" \"electron/services/extensions/__tests__/**/*.test.mjs\" \"electron/courses/__tests__/**/*.test.mjs\" \"electron/intelligence/autoAnswer/__tests__/**/*.test.mjs\" \"electron/lib/__tests__/**/*.test.mjs\" \"electron/llm/__tests__/**/*.test.mjs\" \"electron/llm/codeVerification/__tests__/**/*.test.mjs\" \"electron/audio/__tests__/**/*.test.mjs\" \"electron/audio/whisper/__tests__/**/*.test.mjs\" \"electron/audio/whisper/nemotron/__tests__/**/*.test.mjs\" \"electron/rag/__tests__/**/*.test.mjs\" \"electron/utils/__tests__/**/*.test.mjs\" \"electron/update/**/*.test.mjs\"",
     "test:auto-answer": "npm run build:electron && node scripts/run-with-env.mjs --default-tmpdir NATIVELY_TEST_USERDATA=natively-auto-answer-test-userdata --default-tmpdir CODEX_HOME=natively-auto-answer-test-codex-home --set ELECTRON_RUN_AS_NODE=1 -- electron --test \"electron/intelligence/autoAnswer/__tests__/**/*.test.mjs\"",
     "test:auto-answer:judge": "npm run build:electron && node electron/intelligence/autoAnswer/__tests__/judgeEval.mjs",
     "test:intelligence": "npm run build:electron && node --test \"electron/intelligence/__tests__/**/*.test.mjs\" \"electron/context-intelligence/__tests__/**/*.test.mjs\"",
@@ -344,6 +344,7 @@
     "@types/three": "^0.182.0",
     "axios": "^1.7.7",
     "better-sqlite3": "12.11.1",
+    "cheerio": "^1.2.0",
     "class-variance-authority": "^0.7.0",
     "clsx": "^2.1.1",
     "electron-store": "^8.1.0",
@@ -352,6 +353,7 @@
     "framer-motion": "^12.29.2",
     "groq-sdk": "^0.37.0",
     "jspdf": "^4.0.0",
+    "jszip": "^3.10.2",
     "katex": "^0.16.27",
     "keytar": "^7.9.0",
     "liquid-glass-react": "^1.1.1",
