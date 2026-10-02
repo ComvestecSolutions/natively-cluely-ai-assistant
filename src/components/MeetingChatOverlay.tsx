@@ -11,6 +11,7 @@ import { splitGistLineStreaming } from '../lib/displayMarkup';
 // .lg-bubble (your questions), imported here so the chat does not depend on
 // MeetingDetails having loaded the stylesheet first.
 import '../ui-components/LiquidGlassButton.css';
+import { getCoursePinIds } from '../lib/coursePins';
 
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -458,7 +459,7 @@ ${contextString}`;
                         question,
                         undefined,
                         systemPrompt,
-                        { skipSystemPrompt: true }
+                        { skipSystemPrompt: true, courseIds: getCoursePinIds() }
                     );
                 }
             } else {
@@ -525,7 +526,7 @@ ${contextString}`;
                     question,
                     undefined,
                     systemPrompt,
-                    { skipSystemPrompt: true }
+                    { skipSystemPrompt: true, courseIds: getCoursePinIds() }
                 );
             }
 
