@@ -21,6 +21,7 @@ import { resolveDebugLogPath } from "./utils/debugLogPath.mjs"
 import { MeetingLifecycleQueue, type MeetingLifecycleState } from "./audio/meetingLifecycleQueue"
 import { autoUpdater } from "electron-updater"
 import { summarizeUpdateDownload } from "./update/updateDownloadSummary"
+import { registerCourseMediaSchemes, handleCourseMediaProtocol } from "./courses/mediaProtocol"
 
 import {
   classifyServiceAccountFile,
@@ -42,6 +43,10 @@ installResilientDnsLookup();
 if (!app.isPackaged) {
   require('dotenv').config();
 }
+
+// Courses Studio media scheme (P0 batch 4): the privileged registration must
+// happen before the app is ready — see electron/courses/mediaProtocol.ts.
+registerCourseMediaSchemes();
 
 // ============================================================================
 // FONTATIONS RENDERER-CRASH MITIGATION (2026-07-10) — user crash report on
@@ -8454,6 +8459,12 @@ async function initializeApp() {
     electron: process.versions.electron,
   })
   logStartupPhase('after-app-whenReady', { userData: app.getPath('userData') });
+
+  // Courses Studio media scheme (P0 batch 4): privileged registration ran at
+  // module load; protocol.handle may only be bound once the app is ready.
+  // Serves course-media://<courseId>/<path> from <userData>/courses/<courseId>
+  // — see electron/courses/mediaProtocol.ts for path-safety details.
+  handleCourseMediaProtocol(app);
 
   // 2a-verify. Context OS flag-parity assertion (2026-07-14 real-app
   // source-switch repair): no-op unless NATIVELY_VERIFICATION_MODE=1 is

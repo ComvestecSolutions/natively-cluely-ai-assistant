@@ -12,8 +12,22 @@ import * as os from 'os';
 import * as path from 'path';
 import { AudioDevices } from './audio/AudioDevices';
 import { DatabaseManager } from './db/DatabaseManager'; // Import Database Manager
+import { CourseStore } from './courses/courseStore';
+import { indexCourseForRetrieval } from './courses/embeddings';
+import { resolveCoursesStudioSettings } from './courses/defaults';
+import { runCourseImport } from './courses/ingest';
+import { resolveCourseDataDir, safeCourseDirName } from './courses/courseDir';
+import { buildCourseGroundedBlock } from './courses/chatGrounding';
+import { generateStudyAid } from './courses/studyAids';
+import { stripCourseFrontmatter } from './courses/markdown';
+import JSZip from 'jszip';
+import { BUNDLE_SCHEMA_VERSION, exportCourseBundle, importCourseBundle, rekeyLessons, slugOfLesson, type CourseBundleMeta } from './courses/bundle';
+import { planGeneric } from './courses/profiles/generic';
+import { createFetchHttpClient, planMicrosoftLearn } from './courses/profiles/microsoftLearn';
+import { webSearch, resolveWebSearchSettings } from './webSearch';
 import { AppState } from './main';
 import { CodexCliService, getCodexAuthStatus, isCodexAuthError } from './services/CodexCliService';
+import { FULL_ACCESS, FULL_ACCESS_LICENSE_DETAILS } from './fullAccessOverride';
 import { describeServiceAccountRejection } from './services/googleServiceAccount';
 import { PhoneMirrorService } from './services/PhoneMirrorService';
 import { sanitizeContextEnvelope } from './services/browser-context/sanitize';
@@ -661,6 +675,10 @@ export function initializeIpcHandlers(appState: AppState): void {
    * Used to gate profile intelligence features (resume upload, JD upload, company research, etc.).
    */
   const isProOrTrialActive = (): boolean => {
+    // 0. Master override — flip FULL_ACCESS in electron/fullAccessOverride.ts
+    // to unlock every paywalled feature without a real license.
+    if (FULL_ACCESS) return true;
+
     // 1. Full premium license (Dodo / Gumroad / Natively API subscription)
     try {
       const { LicenseManager } = require('../premium/electron/services/LicenseManager');
@@ -681,6 +699,22 @@ export function initializeIpcHandlers(appState: AppState): void {
     } catch {
       return false;
     }
+  };
+
+  // Courses Studio persistence — one store over the app database. Resolved lazily
+  // (the DB may not be open yet at handler-registration time) and cached from then
+  // on; null while unavailable, in which case the courses:* IPCs report
+  // { disabled: true } instead of throwing.
+  let courseStoreInstance: CourseStore | null = null;
+  const getCourseStore = (): CourseStore | null => {
+    if (courseStoreInstance) return courseStoreInstance;
+    try {
+      const sqliteDb = DatabaseManager.getInstance().getDb();
+      if (sqliteDb) courseStoreInstance = new CourseStore(sqliteDb);
+    } catch (e: any) {
+      console.warn('[CoursesStudio] store unavailable:', e?.message);
+    }
+    return courseStoreInstance;
   };
 
   // Clears premium-only context when the pro license is lost.
@@ -836,6 +870,8 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
   safeHandle('license:check-premium', async () => {
+    // Master override — see electron/fullAccessOverride.ts.
+    if (FULL_ACCESS) return true;
     try {
       const { LicenseManager } = require('../premium/electron/services/LicenseManager');
       return LicenseManager.getInstance().isPremium();
@@ -845,6 +881,8 @@ export function initializeIpcHandlers(appState: AppState): void {
   });
 
   safeHandle('license:get-details', async () => {
+    // Master override — see electron/fullAccessOverride.ts.
+    if (FULL_ACCESS) return { ...FULL_ACCESS_LICENSE_DETAILS };
     try {
       const { LicenseManager } = require('../premium/electron/services/LicenseManager');
       return LicenseManager.getInstance().getLicenseDetails();
@@ -856,6 +894,8 @@ export function initializeIpcHandlers(appState: AppState): void {
   // Returns false only if the server definitively revokes the key.
   // Network errors fail-open (returns cached sync result).
   safeHandle('license:check-premium-async', async () => {
+    // Master override — see electron/fullAccessOverride.ts.
+    if (FULL_ACCESS) return true;
     try {
       const { LicenseManager } = require('../premium/electron/services/LicenseManager');
       return await LicenseManager.getInstance().isPremiumAsync();
@@ -1432,8 +1472,15 @@ export function initializeIpcHandlers(appState: AppState): void {
       message: string,
       imagePaths?: string[],
       context?: string,
-      options?: { skipSystemPrompt?: boolean; ignoreKnowledgeMode?: boolean },
+      options?: { skipSystemPrompt?: boolean; ignoreKnowledgeMode?: boolean; courseIds?: unknown },
     ): Promise<null> => {
+      const _courseIdsRaw = options?.courseIds;
+      const pinnedCourseIds = Array.isArray(_courseIdsRaw)
+        ? _courseIdsRaw.filter((v): v is string => typeof v === 'string' && v.length > 0).slice(0, 8)
+        : [];
+      // Courses Studio ground-truth block; declared here (handler-body level) so
+      // both the V3 branch and the legacy args tuple can fold it in.
+      let courseBlock: string | null = null;
       let myController: AbortController | null = null;
       let _manualFgToken: string | null = null;
       // Intelligence OS observe-only trace (Phase 1). Hoisted so the catch can record
@@ -1816,6 +1863,23 @@ export function initializeIpcHandlers(appState: AppState): void {
             ];
             const port = v3Ports.length > 1 ? combineRetrievalPorts(v3Ports as never[]) : modePort;
 
+            // Courses Studio ground-truth evidence, computed once before V3
+            // composition (assigned into the handler-body-level `courseBlock`
+            // declared near myController). Never throws; null when no courses
+            // are configured or nothing relevant matched.
+            try {
+              const cdb = DatabaseManager.getInstance().getDb();
+              if (cdb) {
+                courseBlock = await buildCourseGroundedBlock({
+                  message,
+                  pinnedCourseIds,
+                  storeLike: new CourseStore(cdb),
+                  db: cdb,
+                  pipeline: appState.getRAGManager()?.getEmbeddingPipeline() ?? null,
+                });
+              }
+            } catch (e) { console.warn('[courses] chat grounding unavailable', e); courseBlock = null; }
+
             // ONE construction, shared with every engine surface: the bridge
             // resolves the per-mode Answer policy, reads conversation state for
             // prior-turn continuity, orchestrates, composes, emits the [V3]
@@ -2052,6 +2116,8 @@ export function initializeIpcHandlers(appState: AppState): void {
             // Bug 003: V3 owns this turn end to end, so if the skill block is not
             // appended here it is injected nowhere at all.
             const v3SystemPrompt = skillPromptBlock ? `${composed.system}\n\n## ACTIVE SKILL\n${skillPromptBlock}` : composed.system;
+            // Courses Studio ground-truth (appended after V3-packed user message)
+            if (courseBlock) composed.user += '\n\n' + courseBlock;
             const v3Stream = llmHelper.streamChatWithOutcome(
               composed.user,
               imagePaths,
@@ -4138,10 +4204,12 @@ export function initializeIpcHandlers(appState: AppState): void {
           // its post-answer repairs to replay — same transcript, images,
           // system prompt, scopes and route the answer got. Keyed by this
           // stream's own controller so a later turn cannot inherit it.
+          // Courses Studio ground-truth folded into the legacy context slot.
+          const ctxForCall = courseBlock ? (context ? `${context}\n\n${courseBlock}` : courseBlock) : context;
           const _manualAnswerArgs: StreamChatArgs = [
             message,
             imagePaths,
-            context,
+            ctxForCall,
             systemPromptOverride,
             ignoreKnowledge,
             isCodingChat || isSafetyAnswer, // skipModeInjection; safety/coding must not pull active-mode resume/JD/reference context
@@ -13606,8 +13674,8 @@ export function initializeIpcHandlers(appState: AppState): void {
     appState.modelSelectorWindowHelper.hideWindow();
   });
 
-  safeHandle('toggle-model-selector', (_, coords: { x: number; y: number; activate?: boolean }) => {
-    appState.modelSelectorWindowHelper.toggleWindow(coords.x, coords.y, { activate: coords.activate });
+  safeHandle('toggle-model-selector', (_, coords: { x: number; y: number; yAbove?: number; activate?: boolean }) => {
+    appState.modelSelectorWindowHelper.toggleWindow(coords.x, coords.y, { activate: coords.activate, yAbove: coords.yAbove });
   });
 
   // ROUND 3 FIX (#4): click-outside close for ModelSelector. With panel-
@@ -13620,6 +13688,15 @@ export function initializeIpcHandlers(appState: AppState): void {
     const win = appState.modelSelectorWindowHelper.getWindow();
     if (win && !win.isDestroyed() && win.isVisible()) {
       appState.modelSelectorWindowHelper.hideWindow();
+    }
+  });
+
+  // Fire-and-forget size report from the selector renderer: it measures its
+  // list's natural height and main resizes the detached window, clamped to
+  // [SELECTOR_MIN_HEIGHT, SELECTOR_MAX_HEIGHT] inside the helper.
+  safeOn('model-selector:set-content-size', (_event, size?: { height?: number }) => {
+    if (size && typeof size.height === 'number') {
+      appState.modelSelectorWindowHelper.setContentHeight(size.height);
     }
   });
 
@@ -13946,6 +14023,470 @@ export function initializeIpcHandlers(appState: AppState): void {
     } catch (e: any) {
       console.warn('[LectureIntelligenceV2] notes generation failed (non-fatal):', e?.message);
       return { enabled: true, notes: null };
+    }
+  });
+
+  // COURSES STUDIO (P0 wiring). Course persistence lives in CourseStore over the app
+  // database; these are the renderer's read/toggle entry points. Gated on the same
+  // premium-or-trial check as the other intelligence surfaces, and every path
+  // degrades to { disabled: true } (license off, store unavailable, or error)
+  // instead of throwing out of IPC.
+  safeHandle('courses:list', async () => {
+    try {
+      if (!isProOrTrialActive()) return { disabled: true };
+      const store = getCourseStore();
+      if (!store) return { disabled: true };
+      // Per-row lesson/chunk counts for the renderer ("N lessons · M chunks"); a corrupt or
+      // partial DB must not break list rendering, so fall back to zeros on any count error.
+      return store.listCourses().map((course) => {
+        let stats = { lessons: 0, chunks: 0 };
+        try {
+          stats = store.countCourseStats(course.id);
+        } catch (e: any) {
+          console.warn(`[CoursesStudio] count failed for course ${course.id}:`, e?.message);
+        }
+        return { ...course, lessonCount: stats.lessons, chunkCount: stats.chunks };
+      });
+    } catch (e: any) {
+      console.warn('[CoursesStudio] list failed:', e?.message);
+      return { disabled: true };
+    }
+  });
+
+  safeHandle('courses:get', async (_event, id: string) => {
+    try {
+      if (!isProOrTrialActive()) return { disabled: true };
+      const store = getCourseStore();
+      if (!store) return { disabled: true };
+      if (typeof id !== 'string' || !id) return { course: null, lessons: [] };
+      return { course: store.getCourse(id), lessons: store.listLessons(id) };
+    } catch (e: any) {
+      console.warn('[CoursesStudio] get failed:', e?.message);
+      return { disabled: true };
+    }
+  });
+
+  safeHandle('courses:set-enabled', async (_event, { id, enabled }: { id: string; enabled: boolean }) => {
+    try {
+      if (!isProOrTrialActive()) return { disabled: true };
+      const store = getCourseStore();
+      if (!store) return { disabled: true };
+      if (typeof id !== 'string' || !id) return { course: null };
+      store.setCourseEnabled(id, !!enabled);
+      return { course: store.getCourse(id) ?? null };
+    } catch (e: any) {
+      console.warn('[CoursesStudio] set-enabled failed:', e?.message);
+      return { disabled: true };
+    }
+  });
+
+  // Reader support: one lesson's stored markdown plus its metadata. Path layout mirrors
+  // ingest.ts — files live under <userData>/courses/<courseId>/ (assets/<name>,
+  // lessons/<slug>.md). local_md_path, when set, is absolute or course-dir-relative;
+  // when null the path is derived from the lesson id ('<courseId>:<slug>'), because
+  // addLessons does not persist it yet. Shared by the reader and study-aid handlers:
+  // resolves a lesson's markdown file (absolute local_md_path trusted as-is; relative or
+  // id-derived paths must stay inside the course dir) and reads it.
+  const readCourseLessonMd = (
+    courseId: string,
+    lesson: { id: string; localMdPath?: unknown },
+  ): { md?: string; path?: string; error?: string } => {
+    const coursesRoot = path.join(app.getPath('userData'), 'courses');
+    // On-disk course dirs use the sanitized id (courseDir.ts); the resolver keeps
+    // pre-fix raw-id dirs working and never throws for missing ones.
+    const resolvedCourseDir = resolveCourseDataDir(coursesRoot, courseId);
+    let mdFile: string | null = null;
+    if (typeof lesson.localMdPath === 'string' && lesson.localMdPath) {
+      mdFile = path.isAbsolute(lesson.localMdPath)
+        ? lesson.localMdPath
+        : path.join(resolvedCourseDir, lesson.localMdPath);
+    } else {
+      const slug = lesson.id.includes(':') ? lesson.id.slice(lesson.id.lastIndexOf(':') + 1) : '';
+      if (slug && !slug.includes('/') && !slug.includes('\\')) mdFile = path.join(resolvedCourseDir, 'lessons', `${slug}.md`);
+    }
+    if (!mdFile) return { error: 'no markdown file recorded for lesson' };
+    const resolvedMd = path.resolve(mdFile);
+    // A relative local_md_path / id-derived fallback must stay inside the course dir —
+    // ids are partially user-influenced ('course-<url>'), so a crafted courseId could
+    // otherwise escape courses/ via '..'. An absolute local_md_path is trusted as-is.
+    if (typeof lesson.localMdPath !== 'string' || !path.isAbsolute(lesson.localMdPath)) {
+      const courseDir = path.resolve(resolvedCourseDir) + path.sep;
+      if (!resolvedMd.startsWith(courseDir)) return { error: 'invalid markdown path' };
+    }
+    let content: string;
+    try {
+      content = fs.readFileSync(resolvedMd, 'utf8');
+    } catch (e: any) {
+      console.warn('[CoursesStudio] lesson markdown missing on disk:', resolvedMd);
+      return { error: 'lesson markdown not found on disk' };
+    }
+    // Persisted files carry the plan §7 front-matter header (persistLesson still writes it —
+    // bundle export reads the raw file and must keep it); drop it so consumers see clean markdown.
+    return { md: stripCourseFrontmatter(content), path: resolvedMd };
+  };
+
+  safeHandle('courses:lesson-content', async (_event, { courseId, lessonId }: { courseId: string; lessonId: string }) => {
+    try {
+      if (!isProOrTrialActive()) return { disabled: true };
+      const store = getCourseStore();
+      if (!store) return { disabled: true };
+      if (typeof courseId !== 'string' || !courseId || typeof lessonId !== 'string' || !lessonId) {
+        return { ok: false, error: 'invalid course or lesson id' };
+      }
+      if (!store.getCourse(courseId)) return { ok: false, error: `course not found: ${courseId}` };
+      const lesson = store.listLessons(courseId).find((l) => l.id === lessonId);
+      if (!lesson) return { ok: false, error: `lesson not found: ${lessonId}` };
+
+      const resolved = readCourseLessonMd(courseId, lesson);
+      if (resolved.error || !resolved.md || !resolved.path) {
+        return { ok: false, error: resolved.error ?? 'no markdown file recorded for lesson' };
+      }
+      return {
+        ok: true,
+        title: lesson.title,
+        url: lesson.url,
+        kind: lesson.kind,
+        parent: lesson.parent,
+        orderNo: lesson.orderNo,
+        tocPath: lesson.tocPath,
+        completedAt: lesson.completedAt,
+        localMdPath: resolved.path,
+        content: resolved.md,
+      };
+    } catch (e: any) {
+      console.warn('[CoursesStudio] lesson-content failed:', e?.message);
+      return { ok: false, error: 'failed to read lesson markdown' };
+    }
+  });
+
+  // Web search (Courses Studio P5): keyless provider cascade — no premium gate here.
+  // Live settings read per call; an explicit settings.webSearch.enabled === false turns the
+  // whole feature off inside webSearch() itself ({ok:false,error:'web search is disabled'}).
+  safeHandle('search:query', async (_event, input?: { q?: unknown }) => {
+    try {
+      const raw = typeof input?.q === 'string' ? input.q.trim() : '';
+      if (!raw) return { ok: false, error: 'missing query' };
+      const wsRaw = SettingsManager.getInstance().get('webSearch');
+      return await webSearch({ q: raw.slice(0, 400), settings: wsRaw });
+    } catch (e: any) {
+      console.warn('[WebSearch] search:query failed:', e?.message);
+      return { ok: false, error: typeof e?.message === 'string' ? e.message : 'web search failed' };
+    }
+  });
+
+  safeHandle('search:get-status', async () => {
+    try {
+      const wsRaw = SettingsManager.getInstance().get('webSearch');
+      const resolved = resolveWebSearchSettings(wsRaw);
+      return {
+        enabled: !!resolved.enabled,
+        provider: resolved.provider,
+        searxngConfigured: Boolean(wsRaw?.searxngUrl),
+        timeoutMs: resolved.timeoutMs,
+      };
+    } catch (e: any) {
+      console.warn('[WebSearch] search:get-status failed:', e?.message);
+      return { enabled: true, provider: 'duckduckgo' as const, searxngConfigured: false, timeoutMs: 12000 };
+    }
+  });
+
+  // Study aids (P3): one LLM call per (type, content) over up to four lessons; the engine
+  // caches results at <userData>/courses/<courseId>/study-aids.json keyed on prepared text.
+  // Same premium/store guards and {ok,error} envelope as courses:lesson-content — never
+  // throws out of IPC.
+  safeHandle('courses:generate-study-aid', async (_event, payload?: { courseId?: string; type?: 'summary' | 'glossary' | 'quiz' | 'flashcards'; lessonIds?: unknown; force?: boolean }) => {
+    try {
+      if (!isProOrTrialActive()) return { disabled: true };
+      const store = getCourseStore();
+      if (!store) return { disabled: true };
+      const courseId = typeof payload?.courseId === 'string' ? payload.courseId : '';
+      const type = payload?.type;
+      if (typeof courseId !== 'string' || !courseId) return { ok: false, error: 'invalid course id' };
+      if (type !== 'summary' && type !== 'glossary' && type !== 'quiz' && type !== 'flashcards') {
+        return { ok: false, error: 'invalid study aid type' };
+      }
+      const lessonIds = Array.isArray(payload?.lessonIds)
+        ? payload.lessonIds.filter((v): v is string => typeof v === 'string' && v.length > 0).slice(0, 4)
+        : [];
+      if (lessonIds.length < 1) return { ok: false, error: 'no lesson ids provided' };
+      if (!store.getCourse(courseId)) return { ok: false, error: `course not found: ${courseId}` };
+
+      const lessons = store.listLessons(courseId);
+      const sources: { title: string; md: string }[] = [];
+      for (const lessonId of lessonIds) {
+        const lesson = lessons.find((l) => l.id === lessonId);
+        if (!lesson) return { ok: false, error: `lesson not found: ${lessonId}` };
+        const resolved = readCourseLessonMd(courseId, lesson);
+        // Skip empty/unreadable lessons; require at least one with content.
+        if (resolved.error || !resolved.md || resolved.md.trim() === '') continue;
+        sources.push({ title: lesson.title || lessonId, md: resolved.md });
+      }
+      if (sources.length < 1) return { ok: false, error: 'no lesson content available' };
+
+      const helper = appState.processingHelper?.getLLMHelper?.();
+      if (!helper) return { ok: false, error: 'no language model configured' };
+      // chat() is the buffered universal completion (cloud or local provider); a truncated
+      // stream throws inside it and lands in the catch below as {ok:false,error}.
+      const result = await generateStudyAid({
+        rootDir: path.join(app.getPath('userData'), 'courses'),
+        courseId,
+        type,
+        sources,
+        force: payload?.force === true,
+        llm: (prompt) => helper.chat(prompt),
+      });
+      return result;
+    } catch (e: any) {
+      console.warn('[CoursesStudio] generate-study-aid failed:', e?.message);
+      const message = e && typeof e.message === 'string' && e.message.trim() !== '' ? e.message : 'study aid generation failed';
+      return { ok: false, error: message };
+    }
+  });
+
+  // Courses Studio P4 portability: zip bundle export/import + cascade delete.
+  // Same premium/store guards and {ok,error} envelope as courses:lesson-content — never
+  // throws out of IPC. Bundles live at <userData>/courses/<courseId> (lessons/ + assets/).
+  safeHandle('courses:export-bundle', async (_event, { courseId }: { courseId?: string }) => {
+    try {
+      if (!isProOrTrialActive()) return { disabled: true };
+      const store = getCourseStore();
+      if (!store) return { disabled: true };
+      if (typeof courseId !== 'string' || !courseId) return { ok: false, error: 'invalid course id' };
+      const course = store.getCourse(courseId);
+      if (!course) return { ok: false, error: `course not found: ${courseId}` };
+      const coursesRoot = path.join(app.getPath('userData'), 'courses');
+      const rows = store.listLessons(course.id);
+      const meta: CourseBundleMeta = {
+        schemaVersion: BUNDLE_SCHEMA_VERSION,
+        courseId: course.id,
+        name: course.name,
+        profile: course.profile ?? null,
+        sourceUrl: course.sourceUrl,
+        status: course.status,
+        enabled: !!course.enabled,
+        lessons: rows.map((r) => ({ id: r.id, title: r.title, url: r.url, kind: r.kind ?? null, parent: r.parent ?? null, orderNo: r.orderNo, tocPath: r.tocPath ?? null, completedAt: r.completedAt ?? null })),
+        exportedAt: new Date().toISOString(),
+      };
+      const res = await exportCourseBundle(coursesRoot, course.id, meta);
+      if (!res.ok) return res;
+      const safeSlug = course.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'course';
+      // dialog types require the window overload to get a definite BaseWindow.
+      const saveOptions = {
+        title: 'Export course bundle',
+        defaultPath: `${safeSlug}-course.zip`,
+        filters: [{ name: 'Courses Studio bundles', extensions: ['zip'] }],
+      };
+      const win = appState.getMainWindow();
+      const r2 = win
+        ? await dialog.showSaveDialog(win, saveOptions)
+        : await dialog.showSaveDialog(saveOptions);
+      if (r2.canceled || !r2.filePath) return { canceled: true };
+      try {
+        await fs.promises.writeFile(r2.filePath, res.zip);
+      } catch (e: any) {
+        console.warn('[CoursesStudio] export-bundle write failed:', e?.message);
+        return { ok: false, error: `could not write file: ${e?.message ?? 'unknown error'}` };
+      }
+      return { ok: true, path: r2.filePath };
+    } catch (e: any) {
+      console.warn('[CoursesStudio] export-bundle failed:', e?.message);
+      return { ok: false, error: 'failed to export course bundle' };
+    }
+  });
+
+  safeHandle('courses:import-bundle', async (_event) => {
+    try {
+      if (!isProOrTrialActive()) return { disabled: true };
+      const store = getCourseStore();
+      if (!store) return { disabled: true };
+      const coursesRoot = path.join(app.getPath('userData'), 'courses');
+      const win = appState.getMainWindow();
+      // Options stay inline at both call sites so the 'openFile' literal keeps its type.
+      const opened = win
+        ? await dialog.showOpenDialog(win, {
+            title: 'Import course bundle',
+            properties: ['openFile'],
+            filters: [{ name: 'Courses Studio bundles', extensions: ['zip'] }],
+          })
+        : await dialog.showOpenDialog({
+            title: 'Import course bundle',
+            properties: ['openFile'],
+            filters: [{ name: 'Courses Studio bundles', extensions: ['zip'] }],
+          });
+      if (opened.canceled) return { canceled: true };
+      const filePath = opened.filePaths[0];
+      if (!filePath) return { canceled: true };
+      let buf: Buffer;
+      try {
+        buf = await fs.promises.readFile(filePath);
+      } catch (e: any) {
+        console.warn('[CoursesStudio] import-bundle read failed:', e?.message);
+        return { ok: false, error: `could not read file: ${e?.message ?? 'unknown error'}` };
+      }
+      // Pre-parse meta.json for conflict resolution before the engine validates + extracts.
+      let parsedMeta: any;
+      try {
+        const z = await JSZip.loadAsync(buf);
+        const entry = z.file('meta.json');
+        if (!entry) return { ok: false, error: 'not a valid course bundle' };
+        parsedMeta = JSON.parse(await entry.async('string'));
+      } catch (e: any) {
+        console.warn('[CoursesStudio] import-bundle pre-parse failed:', e?.message);
+        return { ok: false, error: 'not a valid course bundle' };
+      }
+      const origId = parsedMeta && typeof parsedMeta.courseId === 'string' ? parsedMeta.courseId : '';
+      if (origId.length === 0) return { ok: false, error: 'not a valid course bundle' };
+      const existing = store.getCourse(origId);
+      const finalId = !existing || String(existing.sourceUrl) === String(parsedMeta.sourceUrl)
+        ? origId
+        : `${origId}-${Date.now().toString(36)}`;
+      const res = await importCourseBundle(buf, finalId, coursesRoot);
+      if (!res.ok) return res;
+      store.upsertCourse({ id: finalId, name: res.meta.name, sourceUrl: res.meta.sourceUrl, profile: res.meta.profile ?? undefined, status: String(res.meta.status), enabled: res.meta.enabled ? 1 : 0 });
+      store.addLessons(finalId, rekeyLessons(res.meta, finalId).map((l) => ({ ...l, localMdPath: path.join(coursesRoot, safeCourseDirName(finalId), 'lessons', slugOfLesson(l.id) + '.md') })));
+      return { ok: true, courseId: finalId };
+    } catch (e: any) {
+      console.warn('[CoursesStudio] import-bundle failed:', e?.message);
+      return { ok: false, error: 'failed to import course bundle' };
+    }
+  });
+
+  safeHandle('courses:delete-course', async (_event, { courseId }: { courseId?: string }) => {
+    try {
+      if (!isProOrTrialActive()) return { disabled: true };
+      const store = getCourseStore();
+      if (!store) return { disabled: true };
+      if (typeof courseId !== 'string' || !courseId) return { ok: false, error: 'invalid course id' };
+      const coursesRoot = path.join(app.getPath('userData'), 'courses');
+      store.deleteCourseCascade(courseId);
+      // Best-effort on-disk cleanup; resolve + containment-check before rm (same guard
+      // style as readCourseLessonMd) so a crafted id can never escape the courses root.
+      try {
+        // Resolve the sanitized on-disk dir; legacy raw-id dirs keep working too.
+        const courseDir = path.resolve(resolveCourseDataDir(coursesRoot, courseId));
+        if (courseDir.startsWith(path.resolve(coursesRoot) + path.sep)) {
+          await fs.promises.rm(courseDir, { recursive: true, force: true });
+        }
+      } catch (e: any) {
+        console.warn('[CoursesStudio] delete-course file cleanup failed:', e?.message);
+      }
+      return { ok: true };
+    } catch (e: any) {
+      console.warn('[CoursesStudio] delete-course failed:', e?.message);
+      return { ok: false, error: 'failed to delete course' };
+    }
+  });
+
+  safeHandle('courses:set-lesson-completed', async (_event, payload: { courseId?: string; lessonIds: unknown; done: boolean }) => {
+    try {
+      if (!isProOrTrialActive()) return { disabled: true };
+      const store = getCourseStore();
+      if (!store) return { disabled: true };
+      const courseId = payload && typeof payload.courseId === 'string' ? payload.courseId : '';
+      if (courseId && !store.getCourse(courseId)) return { error: `unknown course: ${courseId}` };
+      const ids = Array.isArray(payload?.lessonIds)
+        ? payload.lessonIds.filter((v): v is string => typeof v === 'string' && v.length > 0).slice(0, 50)
+        : [];
+      if (ids.length === 0) return { error: 'no valid lesson ids' };
+      store.markLessonsCompleted(ids, payload?.done === true);
+      return { ok: true };
+    } catch (e: any) {
+      console.warn('[CoursesStudio] set-lesson-completed failed:', e?.message);
+      return { disabled: true };
+    }
+  });
+
+  safeHandle('courses:import', async (_event, input: any) => {
+    const sendProgress = (stage: string, detail?: string) => {
+      appState.getMainWindow()?.webContents.send('courses:progress', { stage, detail });
+    };
+    try {
+      if (!isProOrTrialActive()) return { disabled: true };
+      const store = getCourseStore();
+      if (!store) return { disabled: true };
+      if (typeof input !== 'object' || input === null || typeof input.sourceUrl !== 'string') {
+        sendProgress('failed', 'invalid course import payload');
+        return { course: null };
+      }
+      // Zero-lesson guard: plan before any DB write so a URL whose planner finds nothing
+      // never creates an empty course row. Mirrors runCourseImport's host-based selection;
+      // both planners resolve (never throw) and surface problems in `warnings`.
+      const importHttp = createFetchHttpClient();
+      let rootHost = '';
+      try {
+        rootHost = new URL(input.sourceUrl).hostname;
+      } catch {
+        // unparseable — the generic planner reports it in warnings below
+      }
+      const prePlan = await (rootHost === 'learn.microsoft.com'
+        ? planMicrosoftLearn(input.sourceUrl, importHttp)
+        : planGeneric(input.sourceUrl, importHttp));
+      if (prePlan.items.length === 0) {
+        const detail = Array.isArray(prePlan.warnings) && prePlan.warnings.length > 0
+          ? ` — ${prePlan.warnings[0]}`
+          : '';
+        const error = `No lessons found at this URL${detail}`;
+        sendProgress('failed', error);
+        return { ok: false, error };
+      }
+      sendProgress('importing', typeof input.name === 'string' ? input.name : undefined);
+      const courseIdValue = typeof input.id === 'string' && input.id !== ''
+        ? input.id
+        : `course-${input.sourceUrl}`;
+      const courseName = typeof input.name === 'string' && input.name !== '' ? input.name : input.sourceUrl;
+      const course = store.upsertCourse({ id: courseIdValue, name: courseName, sourceUrl: input.sourceUrl });
+      // P1 post-process (fire-and-forget): crawl the root URL into lessons, then vectorize
+      // them for RAG. The handler must return { course } immediately; failures are logged,
+      // never swallowed silently.
+      const studioSettings = resolveCoursesStudioSettings();
+      void (async () => {
+        await runCourseImport(input.sourceUrl, courseIdValue, {
+          courseId: courseIdValue,
+          rootDir: path.join(app.getPath('userData'), 'courses'),
+          store,
+          maxPages: studioSettings.maxPagesPerCourse,
+          concurrency: studioSettings.concurrency,
+          delayMs: studioSettings.delayMs,
+          respectRobots: studioSettings.respectRobots,
+          // Same client as the pre-plan; runCourseImport replans internally from rootUrl.
+          http: importHttp,
+          onProgress: (p) => sendProgress(p.phase === 'done' ? 'crawled' : p.phase, p.current ? `${p.done}/${p.total} ${p.current}` : undefined),
+        });
+        const db = DatabaseManager.getInstance().getDb();
+        const pipeline = appState.getRAGManager()?.getEmbeddingPipeline();
+        if (db && pipeline) {
+          // Indexing is best-effort — the crawl already persisted lessons.
+          sendProgress('indexing');
+          await indexCourseForRetrieval({ db, courseId: courseIdValue, embedder: pipeline });
+        }
+        // Single terminal progress event: only after the crawl and indexing (or its skip) finish.
+        sendProgress('done', course.id);
+      })().catch((e) => { console.error('[courses] import post-process failed', e); sendProgress('failed', String(e)); });
+      return { course };
+    } catch (e: any) {
+      console.warn('[CoursesStudio] import failed:', e?.message);
+      sendProgress('failed', String(e?.message ?? 'import failed'));
+      return { disabled: true };
+    }
+  });
+
+  // P1: rebuild the vector index for one course's lessons (premium; idempotent).
+  safeHandle('courses:reindex', async (_event, input: any) => {
+    try {
+      if (!isProOrTrialActive()) return { disabled: true };
+      const store = getCourseStore();
+      if (!store) return { disabled: true };
+      if (typeof input !== 'object' || input === null || typeof input.id !== 'string') {
+        return { error: 'invalid course reindex payload' };
+      }
+      const sqliteDb = DatabaseManager.getInstance().getDb();
+      if (!sqliteDb) return { error: 'database not ready' };
+      const pipeline = appState.getRAGManager()?.getEmbeddingPipeline();
+      if (!pipeline) return { error: 'embedding pipeline not ready' };
+      return await indexCourseForRetrieval({ db: sqliteDb, courseId: input.id, embedder: pipeline });
+    } catch (e: any) {
+      console.warn('[CoursesStudio] reindex failed:', e?.message);
+      return { error: String(e?.message ?? 'reindex failed') };
     }
   });
 
