@@ -152,6 +152,33 @@ export interface AppSettings {
         localModelId?: string;
     };
     /**
+     * Courses Studio import / AI-assist tuning (P0). Absent keys fall back to the
+     * documented defaults at their use sites: maxPagesPerCourse 2000, maxAssetMB
+     * 2048, concurrency 4, delayMs 700, respectRobots true, aiAssistMode 'auto',
+     * autoGroundingEnabled true.
+     */
+    coursesStudio?: {
+        maxPagesPerCourse?: number;
+        maxAssetMB?: number;
+        concurrency?: number;
+        delayMs?: number;
+        respectRobots?: boolean;
+        aiAssistMode?: 'auto' | 'on' | 'off';
+        autoGroundingEnabled?: boolean;
+    };
+    /**
+     * Web-search provider backing Courses Studio. Absent keys fall back to
+     * provider 'duckduckgo', timeoutMs 120000, and no searxngUrl at their use
+     * sites. `enabled` defaults ON when absent; an explicit false turns the whole
+     * web-search feature off.
+     */
+    webSearch?: {
+        provider: 'duckduckgo' | 'tavily' | 'searxng';
+        searxngUrl?: string;
+        timeoutMs?: number;
+        enabled?: boolean; // absent ⇒ on; explicit false ⇒ feature off
+    };
+    /**
      * Reranker configuration, independent of BOTH the generation model and the
      * embedding model. Embedding retrieval finds the candidate set; reranking
      * decides the order of those candidates, and a user may reasonably want a
