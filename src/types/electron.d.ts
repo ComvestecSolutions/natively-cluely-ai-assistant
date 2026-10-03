@@ -84,6 +84,28 @@ export interface ElectronAPI {
     width: number
     height: number
   }) => Promise<void>
+  // Courses Studio (P0): local course list/detail/toggle over CourseStore.
+  coursesList: () => Promise<any>
+  coursesGet: (id: string) => Promise<any>
+  coursesSetEnabled: (id: string, enabled: boolean) => Promise<any>
+  coursesImport: (input: any) => Promise<any>
+  coursesReindex: (id: string) => Promise<any>
+  // Courses Studio reader: lesson markdown + metadata / completion toggles.
+  coursesLessonContent: (courseId: string, lessonId: string) => Promise<any>
+  // Courses Studio study aids: one cached LLM pass over up to four lessons.
+  coursesGenerateStudyAid: (courseId: string, type: 'summary' | 'glossary' | 'quiz' | 'flashcards', lessonIds: string[], force?: boolean) =>
+    Promise<{ ok: boolean; cached?: boolean; data?: unknown; error?: string }>
+  // Courses Studio P4 portability: zip bundle export/import + cascade delete.
+  coursesExportBundle: (courseId: string) => Promise<{ ok?: boolean; canceled?: boolean; path?: string; error?: string }>
+  coursesImportBundle: () => Promise<{ ok?: boolean; canceled?: boolean; courseId?: string; error?: string }>
+  coursesDeleteCourse: (courseId: string) => Promise<{ ok?: boolean; error?: string }>
+  coursesSetLessonCompleted: (lessonIds: string[], done: boolean) => Promise<any>
+  // Web search (P5): keyless provider cascade; toggleable off via settings.
+  webSearchQuery: (q: string) =>
+    Promise<{ ok?: boolean; provider?: string; hits?: Array<{ title: string; url: string; snippet: string }>; error?: string }>
+  webSearchGetStatus: () =>
+    Promise<{ enabled: boolean; provider: 'duckduckgo' | 'tavily' | 'searxng'; searxngConfigured: boolean; timeoutMs: number }>
+  onCoursesProgress: (callback: (progress: any) => void) => () => void
   // X-anchored overlay resize. Resolves with the size the main process
   // ACTUALLY applied after its floor(workArea * 0.9) clamp — the renderer
   // adopts that value so its panel width, toggle anchor and hover-gate margin
@@ -771,7 +793,7 @@ export interface ElectronAPI {
   onSessionReset: (callback: () => void) => () => void;
 
   // Streaming listeners
-  streamGeminiChat: (message: string, imagePaths?: string[], context?: string, options?: { skipSystemPrompt?: boolean, ignoreKnowledgeMode?: boolean }) => Promise<void>
+  streamGeminiChat: (message: string, imagePaths?: string[], context?: string, options?: { skipSystemPrompt?: boolean, courseIds?: string[], ignoreKnowledgeMode?: boolean }) => Promise<void>
   onGeminiStreamToken: (callback: (token: string, meta?: { streamId?: number }) => void) => () => void
   onGeminiStreamDone: (callback: (data?: { finalText?: string; streamId?: number }) => void) => () => void
   onGeminiStreamError: (callback: (error: string, meta?: { streamId?: number | null; source?: string }) => void) => () => void;
@@ -791,8 +813,11 @@ export interface ElectronAPI {
   setFastModel: (modelId: string | null) => Promise<{ success: boolean; error?: string }>;
   /** Narrows picker options to the ids the fast path can actually dispatch. */
   filterFastModelCandidates: (ids: string[]) => Promise<{ ids: string[] }>;
-  toggleModelSelector: (coords: { x: number; y: number; activate?: boolean }) => Promise<void>;
+  toggleModelSelector: (coords: { x: number; y: number; yAbove?: number; activate?: boolean }) => Promise<void>;
   modelSelectorCloseIfOpen: () => Promise<void>;
+  /** Fire-and-forget size report from the selector renderer. Main resizes the
+   *  detached window to `height` (clamped); longer lists scroll internally. */
+  setModelSelectorContentSize: (size: { height: number }) => void;
   // NOTE: this interface and the one in electron/preload.ts are maintained
   // separately and drift. That drift is what hid the Ollama bug: the settings
   // screen reached these through a generic `invoke` that neither file declares

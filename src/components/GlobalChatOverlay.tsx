@@ -4,6 +4,8 @@ import { X, Copy, Check, Globe, ArrowUp } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { genMessageId } from '../utils/messageId';
 import nativelyIcon from './icon.png';
+import CoursePinBar from './courses/CoursePinBar';
+import { getCoursePinIds } from '../lib/coursePins';
 import { useResolvedTheme } from '../hooks/useResolvedTheme';
 
 // ============================================
@@ -401,7 +403,7 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
                 if (oldErrorCleanup) activeCleanups.push(oldErrorCleanup);
 
                 // Call standard chat — same client-side ceiling as ragQueryGlobal above.
-                const fallbackCall = window.electronAPI?.streamGeminiChat(question, undefined, undefined, { skipSystemPrompt: false });
+                const fallbackCall = window.electronAPI?.streamGeminiChat(question, undefined, undefined, { skipSystemPrompt: false, courseIds: getCoursePinIds() });
                 if (fallbackCall) {
                     try {
                         await withTimeout(fallbackCall, RAG_QUERY_CLIENT_TIMEOUT_MS, 'streamGeminiChat');
@@ -482,6 +484,9 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
                                 <img src={nativelyIcon} className="w-3.5 h-3.5 force-black-icon opacity-50" alt="logo" />
                                 <span className="text-[13px] font-medium">Search all meetings</span>
                             </div>
+                            <span className="flex items-center gap-2 min-w-0 ml-auto">
+                                <CoursePinBar compact />
+                            </span>
                             <button
                                 onClick={onClose}
                                 className="p-2 transition-colors group"
