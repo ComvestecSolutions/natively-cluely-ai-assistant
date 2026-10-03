@@ -65,6 +65,23 @@ type DirectAssistEvent =
 // Types for the exposed Electron API
 interface ElectronAPI {
   updateContentDimensions: (dimensions: { width: number; height: number }) => Promise<void>;
+  // Courses Studio (P0): local course list/detail/toggle over CourseStore.
+  coursesList: () => Promise<any>;
+  coursesGet: (id: string) => Promise<any>;
+  coursesSetEnabled: (id: string, enabled: boolean) => Promise<any>;
+  coursesImport: (input: any) => Promise<any>;
+  coursesReindex: (id: string) => Promise<any>;
+  coursesLessonContent: (courseId: string, lessonId: string) => Promise<any>;
+  coursesGenerateStudyAid: (courseId: string, type: 'summary' | 'glossary' | 'quiz' | 'flashcards', lessonIds: string[], force?: boolean) => Promise<any>;
+  // Courses Studio P4 portability: zip bundle export/import + cascade delete.
+  coursesExportBundle: (courseId: string) => Promise<{ ok?: boolean; canceled?: boolean; path?: string; error?: string }>;
+  coursesImportBundle: () => Promise<{ ok?: boolean; canceled?: boolean; courseId?: string; error?: string }>;
+  coursesDeleteCourse: (courseId: string) => Promise<{ ok?: boolean; error?: string }>;
+  coursesSetLessonCompleted: (lessonIds: string[], done: boolean) => Promise<any>;
+  // Web search (P5): keyless provider cascade; toggleable off via settings.
+  webSearchQuery: (q: string) => Promise<any>;
+  webSearchGetStatus: () => Promise<any>;
+  onCoursesProgress: (callback: (progress: any) => void) => () => void;
   updateContentDimensionsCentered: (dimensions: {
     width: number;
     height: number;
@@ -627,8 +644,11 @@ interface ElectronAPI {
   getDefaultModel: () => Promise<{ model: string }>;
   setModel: (modelId: string) => Promise<{ success: boolean; error?: string }>;
   setDefaultModel: (modelId: string) => Promise<{ success: boolean; error?: string }>;
-  toggleModelSelector: (coords: { x: number; y: number; activate?: boolean }) => Promise<void>;
+  toggleModelSelector: (coords: { x: number; y: number; yAbove?: number; activate?: boolean }) => Promise<void>;
   modelSelectorCloseIfOpen: () => Promise<void>;
+  /** Fire-and-forget size report from the selector renderer. Main resizes the
+   *  detached window to `height` (clamped); longer lists scroll internally. */
+  setModelSelectorContentSize: (size: { height: number }) => void;
   /** Returns the handler's real shape. This was declared `Promise<void>` while
    *  the handler has always returned `{ success }`, which is why the settings
    *  screen read `result.success` behind a @ts-ignore. */
@@ -1314,6 +1334,31 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('update-content-dimensions', dimensions),
   updateContentDimensionsCentered: (dimensions: { width: number; height: number }) =>
     ipcRenderer.invoke('update-content-dimensions-centered', dimensions),
+  // Courses Studio (P0): local course list/detail/toggle over CourseStore.
+  coursesList: () => ipcRenderer.invoke('courses:list'),
+  coursesGet: (id: string) => ipcRenderer.invoke('courses:get', id),
+  coursesSetEnabled: (id: string, enabled: boolean) =>
+    ipcRenderer.invoke('courses:set-enabled', { id, enabled }),
+  coursesImport: (input: any) => ipcRenderer.invoke('courses:import', input),
+  coursesReindex: (id: string) => ipcRenderer.invoke('courses:reindex', { id }),
+  coursesLessonContent: (courseId: string, lessonId: string) =>
+    ipcRenderer.invoke('courses:lesson-content', { courseId, lessonId }),
+  coursesGenerateStudyAid: (courseId: string, type: 'summary' | 'glossary' | 'quiz' | 'flashcards', lessonIds: string[], force?: boolean) =>
+    ipcRenderer.invoke('courses:generate-study-aid', { courseId, type, lessonIds, force }),
+  // Courses Studio P4 portability: zip bundle export/import + cascade delete.
+  coursesExportBundle: (courseId: string) => ipcRenderer.invoke('courses:export-bundle', { courseId }),
+  coursesImportBundle: () => ipcRenderer.invoke('courses:import-bundle'),
+  coursesDeleteCourse: (courseId: string) => ipcRenderer.invoke('courses:delete-course', { courseId }),
+  coursesSetLessonCompleted: (lessonIds: string[], done: boolean) =>
+    ipcRenderer.invoke('courses:set-lesson-completed', { lessonIds, done }),
+  // Web search (P5): keyless provider cascade; toggleable off via settings.
+  webSearchQuery: (q: string) => ipcRenderer.invoke('search:query', { q }),
+  webSearchGetStatus: () => ipcRenderer.invoke('search:get-status'),
+  onCoursesProgress: (callback: (progress: any) => void) => {
+    const subscription = (_event: any, progress: any) => callback(progress);
+    ipcRenderer.on('courses:progress', subscription);
+    return () => ipcRenderer.removeListener('courses:progress', subscription);
+  },
   // ── Overlay aux windows (pill / resize toggle) coordination ──────────────
   // Overlay renderer → main → aux windows: UI-state broadcast.
   sendOverlayUiState: (state: Record<string, unknown>) =>
@@ -2379,9 +2424,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getFastModel: () => ipcRenderer.invoke('get-fast-model'),
   setFastModel: (modelId: string | null) => ipcRenderer.invoke('set-fast-model', modelId),
   filterFastModelCandidates: (ids: string[]) => ipcRenderer.invoke('filter-fast-model-candidates', ids),
-  toggleModelSelector: (coords: { x: number; y: number; activate?: boolean }) =>
+  toggleModelSelector: (coords: { x: number; y: number; yAbove?: number; activate?: boolean }) =>
     ipcRenderer.invoke('toggle-model-selector', coords),
   modelSelectorCloseIfOpen: () => ipcRenderer.invoke('model-selector:close-if-open'),
+  setModelSelectorContentSize: (size: { height: number }) => {
+    ipcRenderer.send('model-selector:set-content-size', size);
+  },
   forceRestartOllama: () => ipcRenderer.invoke('force-restart-ollama'),
   isOllamaReachable: () => ipcRenderer.invoke('is-ollama-reachable'),
   ensureOllamaRunning: () => ipcRenderer.invoke('ensure-ollama-running'),

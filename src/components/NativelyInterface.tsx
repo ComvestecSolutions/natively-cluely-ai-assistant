@@ -368,6 +368,8 @@ import type { DynamicActionPayload } from '../types/electron';
 import { getCodexCliModelDisplayName, gatewayModelLabel, litellmModelLabel } from '../utils/modelUtils';
 import { getModifierSymbol, isMac, isWindows } from '../utils/platformUtils';
 import { DynamicActionBar } from './dynamic-actions/DynamicActionBar';
+import CoursePinBar from './courses/CoursePinBar';
+import { getCoursePinIds } from '../lib/coursePins';
 import GlassEffectLayer from './ui/GlassEffectLayer';
 import { OverlayBanner, OverlayBannerButton } from './ui/OverlayBanner';
 import RollingTranscript from './ui/RollingTranscript';
@@ -1138,7 +1140,7 @@ const MessageRow = React.memo(
                 }
                 const single = previews.length === 1;
                 const frameClass = `relative overflow-hidden rounded-[14px] border ${
-                  isLightTheme ? 'border-black/10 bg-black/[0.03]' : 'border-white/15 bg-white/[0.06]'
+                  isLightTheme ? 'border-black/10 bg-black/[0.03]' : 'border-white/[0.15] bg-white/[0.06]'
                 }`;
                 return (
                   <div
@@ -8410,7 +8412,7 @@ Provide only the answer, nothing else.`;
             question,
             currentAttachments.length > 0 ? currentAttachments.map((s) => s.path) : undefined,
             prompt,
-            { skipSystemPrompt: true },
+            { skipSystemPrompt: true, courseIds: getCoursePinIds() },
           );
         } catch (err) {
           // R-17: a throw from invoke() never reaches the main process, so no
@@ -8625,6 +8627,7 @@ Provide only the answer, nothing else.`;
         userText || 'Analyze this screenshot',
         currentAttachments.length > 0 ? currentAttachments.map((s) => s.path) : undefined,
         conversationContextForSubmit, // Pass freshly-derived context so "answer this" works
+        { courseIds: getCoursePinIds() },
       );
     } catch (err) {
       // R-17: release the claim taken above — see the note at the other call site.
@@ -10084,7 +10087,7 @@ Provide only the answer, nothing else.`;
   // Suppressed: LLM privacy label pill is not required in the UI.
   // Suppressed: vision pill ("Vision: provider") is not required in the UI.
   const hasStatusPill = shouldShowSttSummaryPill || !!pageContext || !!captureFallback;
-  const statusPillBaseClass = `flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px] font-medium shadow-sm backdrop-blur-xl ${isLightTheme ? 'bg-white/55 border-black/10' : 'bg-black/20 border-white/10'}`;
+  const statusPillBaseClass = `flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px] font-medium shadow-sm backdrop-blur-xl ${isLightTheme ? 'bg-white/[0.55] border-black/10' : 'bg-black/20 border-white/10'}`;
 
   // Suppress the shell's scale/translate entry animation until it has rendered
   // expanded at least once (set via onAnimationComplete). On the first content
@@ -10615,6 +10618,10 @@ Provide only the answer, nothing else.`;
                                 Appears between status pills and rolling transcript so users see
                                 actionable suggestions in their primary scan path. Bar self-hides
                                 when no actions are present. */}
+
+              {/* Pinned course chips (compact); self-hides when there is nothing pinned. */}
+              <CoursePinBar compact />
+
               <DynamicActionBar
                 onAcceptAction={(action: DynamicActionPayload) => {
                   void handleWhatToSay(action.promptInstruction);
@@ -11332,16 +11339,19 @@ Provide only the answer, nothing else.`;
                     <button
                       data-model-selector-toggle="true"
                       onClick={(e) => {
-                        // Calculate position for detached window
-                        if (!contentRef.current) return;
-                        const contentRect = contentRef.current.getBoundingClientRect();
+                        // Calculate position for detached window. Anchor under the
+                        // CHIP ROW (not below the whole panel — with one provider
+                        // the card is ~60px and parking it below the panel looked
+                        // broken). yAbove hands main our bottom edge's screen-Y so
+                        // it can flip above when there is no room below.
                         const buttonRect = e.currentTarget.getBoundingClientRect();
                         const GAP = 8;
 
                         const x = window.screenX + buttonRect.left;
-                        const y = window.screenY + contentRect.bottom + GAP;
+                        const y = window.screenY + buttonRect.bottom + GAP;
+                        const yAbove = window.screenY + buttonRect.top - GAP;
 
-                        window.electronAPI.toggleModelSelector({ x, y, activate: false });
+                        window.electronAPI.toggleModelSelector({ x, y, yAbove, activate: false });
                       }}
                       className={`
                                                 flex items-center gap-2 px-3 py-1.5

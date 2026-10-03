@@ -145,6 +145,7 @@ const DEFAULT_TOP_K = 6;
 // pass a larger explicit value.
 // Exported so ipcHandlers.ts and LLMHelper.ts can reference the same values.
 export const DOC_GROUNDED_TOKEN_BUDGET = 3600;
+export const COURSE_GROUNDED_TOKEN_BUDGET = 4800;
 export const DOC_GROUNDED_TOP_K = 12;
 const MIN_RELEVANCE_SCORE = 0.18;
 const CHUNK_WORDS = 140;
