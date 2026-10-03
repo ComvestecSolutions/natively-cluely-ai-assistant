@@ -147,7 +147,13 @@ export declare function getHardwareId(): string
 
 export declare function getInputDevices(): Array<AudioDeviceInfo>
 
+/** Who is capturing from a microphone right now; null where the OS can't say. */
+export declare function getMicUsers(): Array<MicUser> | null
+
 export declare function getOutputDevices(): Array<AudioDeviceInfo>
+
+/** The visible top-level windows; null where the OS can't say. */
+export declare function getVisibleWindows(): Array<WindowInfo> | null
 
 /**
  * Windows needs no OS permission for a WH_KEYBOARD_LL hook (unlike macOS
@@ -182,6 +188,15 @@ export declare function isAccessibilityGranted(): boolean
  */
 export declare function isImeKeyboardActive(): boolean
 
+export interface MicUser {
+  /** macOS: the capturing process. Windows: unknown (the consent store is per app). */
+  pid?: number
+  /** macOS: the process's bundle id. Windows: a packaged app's family name. */
+  bundleId?: string
+  /** The executable: macOS proc_pidpath; Windows a NonPackaged entry's path. */
+  path?: string
+}
+
 /**
  * Overlay bounds accepted for API parity with macOS. Windows does not wire an
  * outside-click stop (neither does the shipped macOS build — its bounds
@@ -201,6 +216,8 @@ export interface OverlayBoundsInput {
  * other platforms, whose backends are not display-bound.
  */
 export declare function screenCaptureDisplaysAvailable(): boolean
+
+export declare function setForeignWindowsCaptureExcluded(excluded: boolean, ownHandles: Array<Buffer>): number
 
 /**
  * One joint-state transition from the dual-channel tracker
@@ -246,3 +263,12 @@ export declare function verifyDodoKey(licenseKey: string, deviceLabel: string): 
  * The HTTP call runs on a libuv worker thread to prevent blocking the Node.js event loop.
  */
 export declare function verifyGumroadKey(licenseKey: string): Promise<unknown>
+
+export interface WindowInfo {
+  pid: number
+  /** The owning app's name (macOS kCGWindowOwnerName; Windows the exe's file name). */
+  owner: string
+  /** Empty when unknown (macOS without Screen Recording permission). */
+  title: string
+  path?: string
+}

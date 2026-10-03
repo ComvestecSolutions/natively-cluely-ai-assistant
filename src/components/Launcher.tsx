@@ -6,6 +6,8 @@ import icon from "./icon.png";
 import mainui from "../UI_comp/mainui.png";
 import UpcomingCalendarCard from './ui/UpcomingCalendarCard';
 import { useToggleInit } from './settings/useToggleInit';
+import { noteUpcomingEvents, warmCalendarSnapshot } from '../lib/calendarSnapshot.mjs';
+import { plainMeetingTitle } from '../lib/codingAnswer.mjs';
 import MeetingDetails from './MeetingDetails';
 import CoursesHome from './courses/CoursesHome';
 import TopSearchPill from './TopSearchPill';
@@ -48,7 +50,16 @@ interface Meeting {
     time?: string; // Optional for compatibility
 }
 
+/**
+ * Something outside the Launcher asking it to open its search bar or a meeting
+ * (Settings › About). A new `seq` is a new request, so asking twice works.
+ */
+export type LauncherRequest =
+    | { kind: 'search'; seq: number }
+    | { kind: 'meeting'; id: string; seq: number };
+
 interface LauncherProps {
+    request?: LauncherRequest | null;
     onStartMeeting: () => void;
     onOpenSettings: (tab?: string) => void;
     onOpenProfile?: () => void;
@@ -84,7 +95,7 @@ const formatTime = (dateStr: string) => {
     return date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true }).toLowerCase();
 };
 
-const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onOpenProfile, onOpenModes, onPageChange, ollamaPullStatus = 'idle', ollamaPullPercent = 0, ollamaPullMessage = '' }) => {
+const Launcher: React.FC<LauncherProps> = ({ request, onStartMeeting, onOpenSettings, onOpenProfile, onOpenModes, onPageChange, ollamaPullStatus = 'idle', ollamaPullPercent = 0, ollamaPullMessage = '' }) => {
     const t = useT();
     const [meetings, setMeetings] = useState<Meeting[]>([]);
     const [isDetectable, setIsDetectable] = useState(false);
@@ -97,6 +108,9 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
     // panel's z-index below.
     const [meetingChatOpen, setMeetingChatOpen] = useState(false);
     const [upcomingEvents, setUpcomingEvents] = useState<any[]>([]);
+    // The first calendar fetch has answered. Until then the calendar card shows
+    // skeletons, not "No upcoming events", which would flash on every launch.
+    const [eventsLoaded, setEventsLoaded] = useState(false);
     const [isCalendarConnected, setIsCalendarConnected] = useState(false);
     const [isRefreshing, setIsRefreshing] = useState(false);
     const [showNotification, setShowNotification] = useState(false);
@@ -120,7 +134,10 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
 
     const fetchEvents = () => {
         if (window.electronAPI && window.electronAPI.getUpcomingEvents) {
-            window.electronAPI.getUpcomingEvents().then(setUpcomingEvents).catch(err => console.error("Failed to fetch events:", err));
+            window.electronAPI.getUpcomingEvents()
+                .then((list) => { setUpcomingEvents(list); noteUpcomingEvents(list); })
+                .catch(err => console.error("Failed to fetch events:", err))
+                .finally(() => setEventsLoaded(true));
         }
     }
 
@@ -188,7 +205,10 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
         // Sync initial undetectable state
         if (window.electronAPI?.getUndetectable) {
             window.electronAPI.getUndetectable().then((undetectable) => {
-                if (mounted) setIsDetectable(!undetectable);
+                if (mounted) {
+                    setIsDetectable(!undetectable);
+                    analytics.setUndetectable(undetectable);
+                }
             });
         }
 
@@ -196,7 +216,10 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
         let removeUndetectableListener: (() => void) | undefined;
         if (window.electronAPI?.onUndetectableChanged) {
             removeUndetectableListener = window.electronAPI.onUndetectableChanged((undetectable) => {
-                setIsDetectable(!undetectable);
+                if (mounted) {
+                    setIsDetectable(!undetectable);
+                    analytics.setUndetectable(undetectable);
+                }
             });
         }
 
@@ -225,8 +248,8 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
             fetchMeetings();
         });
 
-        // Simple polling for events every minute
-        const interval = setInterval(fetchEvents, 60000);
+        // Simple polling for events every minute (stealth-gated: no calendar egress while undetectable)
+        const interval = setInterval(() => { if (isDetectable) fetchEvents(); }, 60000);
 
         // Orchestrator: foreground/background tracking via window blur/focus.
         // On macOS Cmd+H and Cmd+Tab the BrowserWindow fires 'blur'/'focus'
@@ -276,6 +299,24 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
         };
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []); // Mount-only: stable setup that must run exactly once
+
+    // The card follows the connection wherever it changes: a disconnect in
+    // Settings › Calendar puts "Link your calendar" back, a connect there shows
+    // the linked card. Its meetings go with a disconnect at once.
+    useEffect(() => window.electronAPI?.onCalendarConnectionChanged?.((connected) => {
+        setIsCalendarConnected(connected);
+        if (connected) fetchEvents(); else setUpcomingEvents([]);
+        void warmCalendarSnapshot(window.electronAPI);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }), []);
+
+    // Settings › Calendar opens from calendarSnapshot instead of fetching: fill
+    // it in the background once startup has settled (the minute poll above then
+    // keeps its meetings current).
+    useEffect(() => {
+        const timer = window.setTimeout(() => { void warmCalendarSnapshot(window.electronAPI); }, 2000);
+        return () => window.clearTimeout(timer);
+    }, []);
 
     // Separate effect for keyboard listener — re-registers when isShortcutPressed changes
     useEffect(() => {
@@ -426,6 +467,20 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
             return false;
         }
     };
+
+    // Requests from outside (Settings › About). A meeting is fetched by id, as a
+    // search hit is; one that no longer exists (the demo meeting deleted, say)
+    // leaves the Launcher where it is.
+    const [searchOpenRequest, setSearchOpenRequest] = useState(0);
+    const handledRequest = useRef(request?.seq ?? 0);
+    useEffect(() => {
+        if (!request || request.seq === handledRequest.current) return;
+        handledRequest.current = request.seq;
+        if (request.kind === 'search') setSearchOpenRequest(request.seq);
+        else void openMeetingAtMoment(request.id);
+        // openMeetingAtMoment only reads setters and the IPC bridge.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [request]);
 
     // Helper to format duration to mm:ss or mmm:ss
     // Helper to format duration to mm:ss or mmm:ss
@@ -588,6 +643,7 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
                 {/* Center: Spotlight-style Search Pill */}
                 <TopSearchPill
                     meetings={meetings}
+                    openRequest={searchOpenRequest}
                     onAIQuery={(query) => {
                         analytics.trackCommandExecuted('ai_query_search');
                         emitOrchestratorEvent({ type: 'turn:done', surface: 'chat' });
@@ -1186,9 +1242,12 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
                                         <UpcomingCalendarCard
                                             className="md:col-span-1"
                                             isConnected={isCalendarConnected}
-                                            onConnect={() => setIsCalendarConnected(true)}
+                                            // Re-fetch: the events loaded at mount were fetched before the
+                                            // connection existed, so the card would stay empty until a Refresh.
+                                            onConnect={(info) => { setIsCalendarConnected(true); if (info.fresh) setEventsLoaded(false); fetchEvents(); void warmCalendarSnapshot(window.electronAPI); }}
                                             meetings={visibleMeetings}
                                             totalCount={upcomingMeetings.length}
+                                            loading={!eventsLoaded}
                                         />
                                     </div>
                                 </div>
@@ -1212,7 +1271,7 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
                                                             onClick={() => handleOpenMeeting(m)}
                                                         >
                                                             <div className={`font-medium text-[14px] max-w-[60%] truncate ${m.title === 'Processing...' ? 'text-blue-400 italic animate-pulse' : 'text-text-primary'}`}>
-                                                                {m.title}
+                                                                {plainMeetingTitle(m.title)}
                                                             </div>
 
                                                             {/* Time & Duration Section */}

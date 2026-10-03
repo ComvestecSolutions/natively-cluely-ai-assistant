@@ -30,10 +30,12 @@ import {
   filterEvidenceByProviderScopes,
   dataScopesForEvidence,
   isScopeDenied,
+  answeredOnThisDevice,
 } from '../policies/provider-scope-policy';
 import type { AnswerSurface, EvidenceScope } from '../contracts/types';
 import type { ProviderDataScope } from '../../llm/ProviderRouter';
 import { describeUserInstructionDelivery } from '../../llm/userInstructionContract';
+import { readSelectionStaysOnDevice } from '../../llm/activeCustomProvider';
 
 /**
  * Credential-scrub a [V3] trace payload before stringifying. Keeps every
@@ -69,6 +71,13 @@ export function speechWindowContains(speech: string, answer: string): boolean {
 
 export interface BridgeInput {
   surface: AnswerSurface;
+  /** The answer is read rather than said (the launcher's chat) — see
+   *  ComposeInput.readingSurface. */
+  readingSurface?: boolean;
+  /** Who said the question on what-to-answer. 'user' when the engine chose the
+   *  user's own newer spoken line over the other party's (2026-09-30): that
+   *  question's "we" is the user's side, not the other speaker's. */
+  questionSpeaker?: 'other' | 'user';
   question: string;
   /** Raw templateType from ModesManager; unknown ids fall back rather than throw. */
   modeTemplateType?: string | null;
@@ -78,6 +87,9 @@ export interface BridgeInput {
   /** How many reference files the active mode has. Lets the composer say "no
    *  document is attached" instead of "the document does not mention it". */
   attachedSourceCount?: number;
+  /** Estimated tokens of the active mode's attached text (referenceCorpusTokens);
+   *  null when a file has no text yet. Lets a small corpus be read whole. */
+  attachedCorpusTokens?: number | null;
   /**
    * Bounded fast-model query rewrite for low-confidence retrieval — see
    * retrieval/llm-query-rewrite.ts. The CALLER binds the model (this module has
@@ -153,6 +165,12 @@ export interface BridgeInput {
   realtimeInstruction?: string;
   /** The APP's per-turn length default — see ComposeInput.defaultLengthDirective. Never concatenate it onto realtimeInstruction. */
   defaultLengthDirective?: string;
+  /**
+   * A system-design diagram turn — see ComposeInput.diagramTurn. Resolved by the
+   * caller (electron/llm/diagramPromptSignals.ts), like every other prompt
+   * signal: this subsystem does not read the flag registry or the session.
+   */
+  diagramTurn?: { note?: string; activeDesignBlock?: string };
   conversationSummary?: string;
   /**
    * Multi-turn chat history (Settings > Intelligence > Memory > "Chat history").
@@ -298,6 +316,7 @@ export async function buildV3Prompt(input: BridgeInput): Promise<BridgeResult | 
       // turn whose only documents are the résumé / job description looks IN them.
       profileOnlyDocuments: (input.attachedSourceCount ?? 0) === 0 && (input.profileSourceCount ?? 0) > 0,
       attachedSourceCount: input.attachedSourceCount,
+      attachedCorpusTokens: input.attachedCorpusTokens ?? null,
       queryRewriter: input.queryRewriter,
       attachedFileNames: input.attachedFileNames,
       screenText: input.screenText,
@@ -406,6 +425,9 @@ export async function buildV3Prompt(input: BridgeInput): Promise<BridgeResult | 
             // evicted every older turn.
             screenBudgetChars: MAX_TURN_SCREEN_CHARS * 2,
             screensDenied,
+            // Text read off a kept-on-device screenshot: shown only when this
+            // turn stays on this device. Asked live, like the scope above.
+            onDeviceScreens: readSelectionStaysOnDevice(),
             // Older exchanges this question is about, in full (RECALL tier).
             query: question,
             recallBudgetChars: RECALL_BUDGET_CHARS,
@@ -462,6 +484,7 @@ export async function buildV3Prompt(input: BridgeInput): Promise<BridgeResult | 
             // prompt on every what-to-answer and assist turn.
             screenBudgetChars: MAX_TURN_SCREEN_CHARS * 2,
             screensDenied: isScopeDenied('screenshots', readProviderScopePolicy()),
+            onDeviceScreens: readSelectionStaysOnDevice(),
             // Dedupe against the ACTUAL window text, not "was it recent": the
             // 2,400-char cut lands inside the 90 seconds, so recency alone
             // could leave a turn in neither place. A screen turn is never
@@ -550,6 +573,16 @@ export async function buildV3Prompt(input: BridgeInput): Promise<BridgeResult | 
       }) ?? undefined;
     } catch { personaBase = undefined; }
 
+    // The design on the table is prior assistant output — CONVERSATION_STATE
+    // data, the same class as the history block — so it leaves with the
+    // transcript scope or not at all. The note is app text and always rides.
+    // (A model on this device is sent it either way: the same rule the
+    // resolver decided the turn by — see activeDesignShareable.)
+    const diagramDesignAllowed = Boolean(input.diagramTurn?.activeDesignBlock) && (answeredOnThisDevice() || !isScopeDenied('transcript', scopePolicy));
+    const diagramTurn = input.diagramTurn
+      ? { note: input.diagramTurn.note, ...(diagramDesignAllowed ? { activeDesignBlock: input.diagramTurn.activeDesignBlock } : {}) }
+      : undefined;
+
     const composed = composePrompt({
       decision: result.decision,
       policy,
@@ -558,9 +591,12 @@ export async function buildV3Prompt(input: BridgeInput): Promise<BridgeResult | 
       withheldScopes: [...withheldScopes],
       realtimeInstruction: input.realtimeInstruction,
       defaultLengthDirective: input.defaultLengthDirective,
+      diagramTurn,
       conversationSummary: convoSummary,
       // What-to-answer answers the OTHER person's question: their "I" is theirs.
-      heardQuestion: input.surface === 'what-to-answer',
+      heardQuestion: input.surface === 'what-to-answer' && input.questionSpeaker !== 'user',
+      questionSpokenByUser: input.surface === 'what-to-answer' && input.questionSpeaker === 'user',
+      readingSurface: input.readingSurface === true,
       conversationHasContent: convoHasContent && Boolean(convoSummary),
       // Only TRUE when a screen line actually survived into the rendered
       // history — so a withheld `screenshots` scope cannot make the composer
@@ -582,6 +618,7 @@ export async function buildV3Prompt(input: BridgeInput): Promise<BridgeResult | 
       dataScopesForEvidence(scopeFilter.evidence.filter((e) => includedIds.has(e.evidenceId))),
     );
     if (convoSummary) packedDataScopes.add('transcript');
+    if (diagramDesignAllowed) packedDataScopes.add('transcript');
     // Declared separately from `transcript`: an audit that asks "did screen
     // content leave the device this turn?" must not have to know that screen
     // text is smuggled inside the conversation summary.
@@ -673,6 +710,9 @@ export async function buildV3Prompt(input: BridgeInput): Promise<BridgeResult | 
           admitted: a.admittedAfterScopeFilter,
           rejected: a.rejectedByScopeFilter,
           ...(a.failed ? { failed: true } : {}),
+          // A pass that ran WITHOUT vectors (2026-09-30) — e.g. the query embed
+          // hard-failed mid-turn. Previously indistinguishable from a clean pass.
+          ...(a.degraded ? { degraded: a.degraded } : {}),
         })),
         answerability: result.trace.answerability,
         fallback: result.trace.fallbackUsed,
