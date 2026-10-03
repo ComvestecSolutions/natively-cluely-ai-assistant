@@ -644,11 +644,8 @@ interface ElectronAPI {
   getDefaultModel: () => Promise<{ model: string }>;
   setModel: (modelId: string) => Promise<{ success: boolean; error?: string }>;
   setDefaultModel: (modelId: string) => Promise<{ success: boolean; error?: string }>;
-  toggleModelSelector: (coords: { x: number; y: number; yAbove?: number; activate?: boolean }) => Promise<void>;
+  toggleModelSelector: (coords: { x: number; y: number; activate?: boolean }) => Promise<void>;
   modelSelectorCloseIfOpen: () => Promise<void>;
-  /** Fire-and-forget size report from the selector renderer. Main resizes the
-   *  detached window to `height` (clamped); longer lists scroll internally. */
-  setModelSelectorContentSize: (size: { height: number }) => void;
   /** Returns the handler's real shape. This was declared `Promise<void>` while
    *  the handler has always returned `{ success }`, which is why the settings
    *  screen read `result.success` behind a @ts-ignore. */
@@ -2424,12 +2421,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getFastModel: () => ipcRenderer.invoke('get-fast-model'),
   setFastModel: (modelId: string | null) => ipcRenderer.invoke('set-fast-model', modelId),
   filterFastModelCandidates: (ids: string[]) => ipcRenderer.invoke('filter-fast-model-candidates', ids),
-  toggleModelSelector: (coords: { x: number; y: number; yAbove?: number; activate?: boolean }) =>
+  toggleModelSelector: (coords: { x: number; y: number; activate?: boolean }) =>
     ipcRenderer.invoke('toggle-model-selector', coords),
   modelSelectorCloseIfOpen: () => ipcRenderer.invoke('model-selector:close-if-open'),
-  setModelSelectorContentSize: (size: { height: number }) => {
-    ipcRenderer.send('model-selector:set-content-size', size);
-  },
   forceRestartOllama: () => ipcRenderer.invoke('force-restart-ollama'),
   isOllamaReachable: () => ipcRenderer.invoke('is-ollama-reachable'),
   ensureOllamaRunning: () => ipcRenderer.invoke('ensure-ollama-running'),

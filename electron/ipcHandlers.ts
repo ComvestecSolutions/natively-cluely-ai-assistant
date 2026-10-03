@@ -13674,8 +13674,8 @@ export function initializeIpcHandlers(appState: AppState): void {
     appState.modelSelectorWindowHelper.hideWindow();
   });
 
-  safeHandle('toggle-model-selector', (_, coords: { x: number; y: number; yAbove?: number; activate?: boolean }) => {
-    appState.modelSelectorWindowHelper.toggleWindow(coords.x, coords.y, { activate: coords.activate, yAbove: coords.yAbove });
+  safeHandle('toggle-model-selector', (_, coords: { x: number; y: number; activate?: boolean }) => {
+    appState.modelSelectorWindowHelper.toggleWindow(coords.x, coords.y, { activate: coords.activate });
   });
 
   // ROUND 3 FIX (#4): click-outside close for ModelSelector. With panel-
@@ -13688,15 +13688,6 @@ export function initializeIpcHandlers(appState: AppState): void {
     const win = appState.modelSelectorWindowHelper.getWindow();
     if (win && !win.isDestroyed() && win.isVisible()) {
       appState.modelSelectorWindowHelper.hideWindow();
-    }
-  });
-
-  // Fire-and-forget size report from the selector renderer: it measures its
-  // list's natural height and main resizes the detached window, clamped to
-  // [SELECTOR_MIN_HEIGHT, SELECTOR_MAX_HEIGHT] inside the helper.
-  safeOn('model-selector:set-content-size', (_event, size?: { height?: number }) => {
-    if (size && typeof size.height === 'number') {
-      appState.modelSelectorWindowHelper.setContentHeight(size.height);
     }
   });
 

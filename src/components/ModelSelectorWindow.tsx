@@ -327,27 +327,10 @@ const ModelSelectorWindow = () => {
         ? 'bg-[#1E1E1E]/80 border-white/10 shadow-black/40'
         : 'bg-[#F3F4F6]/92 border-black/10 shadow-black/10';
 
-    // The window has no fixed height: report the list's natural height so main
-    // can size it (clamped to MIN/MAX). Sum the children rather than
-    // el.scrollHeight / el.offsetHeight — once the window grows past the
-    // content, the element box inflates to fill it and we could never shrink
-    // back down when the list gets shorter again.
-    const listRef = useRef<HTMLDivElement | null>(null);
-    useLayoutEffect(() => {
-        const el = listRef.current;
-        if (!el) return; // loading state renders no list — nothing to measure yet
-        let natural = 0;
-        for (const child of Array.from(el.children)) {
-            natural += (child as HTMLElement).offsetHeight;
-        }
-        natural += Math.max(0, el.childElementCount - 1) * 2; // gap-0.5 between rows
-        window.electronAPI?.setModelSelectorContentSize?.({ height: natural });
-    }, [isLoading, availableModels.length]);
-
     return (
-        <div className="w-fit h-screen overflow-hidden bg-transparent flex flex-col">
+        <div className="w-fit h-fit bg-transparent flex flex-col">
             <div
-                className={`w-[140px] flex-1 min-h-0 backdrop-blur-md border rounded-[16px] overflow-hidden shadow-2xl p-2 flex flex-col animate-scale-in origin-top-left overlay-shell-surface ${panelClass}`}
+                className={`w-[140px] h-[200px] backdrop-blur-md border rounded-[16px] overflow-hidden shadow-2xl p-2 flex flex-col animate-scale-in origin-top-left overlay-shell-surface ${panelClass}`}
                 style={{ ...appearance.shellStyle }}
             >
                 <div className="relative z-[1] flex-1 min-h-0 flex flex-col">
@@ -357,7 +340,7 @@ const ModelSelectorWindow = () => {
                             <span className="text-xs">Loading models...</span>
                         </div>
                     ) : (
-                        <div ref={listRef} className="flex-1 overflow-y-auto scrollbar-hide flex flex-col gap-0.5">
+                        <div className="flex-1 overflow-y-auto scrollbar-hide flex flex-col gap-0.5">
                             {availableModels.length === 0 ? (
                                 <div className={`px-4 py-3 text-center text-xs overlay-text-muted ${isDarkBg ? 'text-slate-500' : 'text-slate-400'}`}>
                                     No models connected.<br />Check Settings.

@@ -11339,19 +11339,16 @@ Provide only the answer, nothing else.`;
                     <button
                       data-model-selector-toggle="true"
                       onClick={(e) => {
-                        // Calculate position for detached window. Anchor under the
-                        // CHIP ROW (not below the whole panel — with one provider
-                        // the card is ~60px and parking it below the panel looked
-                        // broken). yAbove hands main our bottom edge's screen-Y so
-                        // it can flip above when there is no room below.
+                        // Calculate position for detached window
+                        if (!contentRef.current) return;
+                        const contentRect = contentRef.current.getBoundingClientRect();
                         const buttonRect = e.currentTarget.getBoundingClientRect();
                         const GAP = 8;
 
                         const x = window.screenX + buttonRect.left;
-                        const y = window.screenY + buttonRect.bottom + GAP;
-                        const yAbove = window.screenY + buttonRect.top - GAP;
+                        const y = window.screenY + contentRect.bottom + GAP;
 
-                        window.electronAPI.toggleModelSelector({ x, y, yAbove, activate: false });
+                        window.electronAPI.toggleModelSelector({ x, y, activate: false });
                       }}
                       className={`
                                                 flex items-center gap-2 px-3 py-1.5

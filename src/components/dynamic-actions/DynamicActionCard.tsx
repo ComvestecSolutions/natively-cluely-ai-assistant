@@ -37,7 +37,7 @@ export const DynamicActionCard: React.FC<Props> = ({ action, isPrimary, onAccept
         'border backdrop-blur-md no-drag select-none',
         isPrimary
           ? 'border-accent-focus bg-accent-subtle hover:bg-accent-muted'
-          : 'border-white/10 bg-white/5 hover:bg-white/8',
+          : 'border-white/10 bg-white/5 hover:bg-white/[0.08]',
         'transition-colors duration-150 cursor-pointer',
       ].join(' ')}
       onClick={async () => {
@@ -52,7 +52,7 @@ export const DynamicActionCard: React.FC<Props> = ({ action, isPrimary, onAccept
       title={action.description ?? action.label}
       data-testid={`dynamic-action-card-${action.id}`}
     >
-      <div className="flex items-center justify-center w-7 h-7 rounded-full bg-white/8 shrink-0">
+      <div className="flex items-center justify-center w-7 h-7 rounded-full bg-white/[0.08] shrink-0">
         <Zap className={`w-3.5 h-3.5 ${isPrimary ? 'text-accent-primary' : 'text-white/70'}`} />
       </div>
 
@@ -64,13 +64,13 @@ export const DynamicActionCard: React.FC<Props> = ({ action, isPrimary, onAccept
           )}
         </div>
         {evidenceSnippet && (
-          <span className="text-[10.5px] text-white/55 truncate">"{evidenceSnippet}"</span>
+          <span className="text-[10.5px] text-white/[0.55] truncate">"{evidenceSnippet}"</span>
         )}
       </div>
 
       <div className="flex items-center gap-1 shrink-0">
         {isPrimary && (
-          <kbd className="hidden sm:inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium text-white/60 bg-white/8 border border-white/10">
+          <kbd className="hidden sm:inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-medium text-white/60 bg-white/[0.08] border border-white/10">
             Tab
           </kbd>
         )}

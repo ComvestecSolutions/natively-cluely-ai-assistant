@@ -649,3 +649,6 @@ tests/e2e-modes/hosted-userdata-*/
 
 # Written by `npm run dev:agent` — per-worktree CDP port + session id.
 agent-browser.json
+
+// Agent shots — screenshots of the agent browser UI.
+.agent-shots

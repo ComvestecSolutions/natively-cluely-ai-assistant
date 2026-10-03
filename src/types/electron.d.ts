@@ -813,11 +813,8 @@ export interface ElectronAPI {
   setFastModel: (modelId: string | null) => Promise<{ success: boolean; error?: string }>;
   /** Narrows picker options to the ids the fast path can actually dispatch. */
   filterFastModelCandidates: (ids: string[]) => Promise<{ ids: string[] }>;
-  toggleModelSelector: (coords: { x: number; y: number; yAbove?: number; activate?: boolean }) => Promise<void>;
+  toggleModelSelector: (coords: { x: number; y: number; activate?: boolean }) => Promise<void>;
   modelSelectorCloseIfOpen: () => Promise<void>;
-  /** Fire-and-forget size report from the selector renderer. Main resizes the
-   *  detached window to `height` (clamped); longer lists scroll internally. */
-  setModelSelectorContentSize: (size: { height: number }) => void;
   // NOTE: this interface and the one in electron/preload.ts are maintained
   // separately and drift. That drift is what hid the Ollama bug: the settings
   // screen reached these through a generic `invoke` that neither file declares

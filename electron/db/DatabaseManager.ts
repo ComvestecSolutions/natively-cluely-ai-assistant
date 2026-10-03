@@ -6,6 +6,7 @@ import { app } from 'electron';
 import fs from 'fs';
 import * as sqliteVec from 'sqlite-vec';
 import { buildLegacySpaceCaseSql } from '../rag/embeddingSpace';
+import { COURSES_SCHEMA_SQL } from '../courses/courseStore';
 import type { ActionItem, DecisionItem, FollowUpDraft, MeetingSummaryGenerationMeta, MeetingSummaryModeMeta, MeetingSummarySectionV3, NoteBlock, PersonMention, QuestionItem, RiskItem, SourceQualityMeta, SpeakerLabelMap, SummaryStatus, TimelineItem } from '../services/meeting/types';
 
 // Interfaces for our data objects
@@ -1829,6 +1830,20 @@ export class DatabaseManager {
                 // Same rule as v28/v29/v30 above: stop rather than fall through,
                 // so a later migration cannot stamp user_version past a v31 that
                 // never applied and make `version < 31` false forever.
+                return;
+            }
+        }
+
+        // Version 31 → 32: Courses Studio tables (P0 batch 1, COURSES_FEATURE_PLAN §7).
+        if (version < 32) {
+            console.log('[DatabaseManager] Applying migration v31 → v32: Courses Studio tables');
+            try {
+                this.db.exec(COURSES_SCHEMA_SQL);
+                this.db.pragma('user_version = 32');
+            } catch (e) {
+                console.error('[DatabaseManager] v32 courses schema failed (leaving version at 31 to retry next launch):', e);
+                // Same rule as v28/v29/v30 above: stop rather than fall through, so a
+                // later migration cannot stamp user_version past an unapplied v32.
                 return;
             }
         }
