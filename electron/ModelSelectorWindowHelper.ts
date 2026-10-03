@@ -16,8 +16,20 @@ const startUrl = isDev
 import type { WindowHelper } from "./WindowHelper"
 import { DEV_SERVER_URL } from './devServerUrl';
 
+// The detached selector window is a FIXED-WIDTH, content-height card:
+// MIN is a compact single-row card, MAX caps long lists (they scroll inside).
+const SELECTOR_WIDTH = 140;
+const SELECTOR_MIN_HEIGHT = 60;
+const SELECTOR_MAX_HEIGHT = 280;
+// Panel padding (p-2 = 8px top + 8px bottom) added to the list's natural
+// height when main sizes the window in setContentHeight().
+const SELECTOR_PANEL_PADDING = 16;
+
 type WindowActivationOptions = {
     activate?: boolean
+    // Screen Y where this window's BOTTOM edge should land if there is no room
+    // below the chip and it must open ABOVE. The renderer pre-computes it.
+    yAbove?: number
 }
 
 export class ModelSelectorWindowHelper {
@@ -35,6 +47,12 @@ export class ModelSelectorWindowHelper {
     // follows drags, content-height growth, and the width spring. Driven by
     // WindowHelper.repositionOverlayPopovers().
     private overlayAnchor: { offsetXFromPanel: number; offsetY: number } | null = null;
+
+    // One-shot flip-above context for ensureVisibleOnScreen() on the next open:
+    // screen Y where our bottom edge should land if there is no room below.
+    // Consumed immediately so a later content resize re-clamps in place instead
+    // of flipping.
+    private showFlipTarget: number | null = null;
 
     public setWindowHelper(wh: WindowHelper): void {
         this.windowHelper = wh;
@@ -80,6 +98,8 @@ export class ModelSelectorWindowHelper {
             // Always hide from MC as it's a dropdown
             this.window.setHiddenInMissionControl(true);
         }
+
+        this.showFlipTarget = options.yAbove !== undefined ? Math.round(options.yAbove) : null;
 
         // Standard dropdown positioning
         this.window.setPosition(Math.round(x), Math.round(y))
@@ -140,6 +160,25 @@ export class ModelSelectorWindowHelper {
         );
     }
 
+    // Renderer-reported natural content height of the model list (px). The
+    // window tracks it within [SELECTOR_MIN_HEIGHT, SELECTOR_MAX_HEIGHT] —
+    // longer lists scroll inside instead of growing further; shorter ones
+    // shrink the card so a one-provider setup isn't an 85%-empty window.
+    public setContentHeight(naturalListHeight: number): void {
+        if (!this.window || this.window.isDestroyed()) return;
+        if (!Number.isFinite(naturalListHeight) || naturalListHeight <= 0) return;
+        const target = Math.round(
+            Math.min(SELECTOR_MAX_HEIGHT, Math.max(SELECTOR_MIN_HEIGHT, naturalListHeight + SELECTOR_PANEL_PADDING)),
+        );
+        // Dedupe: the renderer re-reports on layout passes; identical
+        // setContentSize calls still churn resize events for nothing.
+        if (this.window.getContentSize()[1] === target) return;
+        this.window.setContentSize(SELECTOR_WIDTH, target);
+        if (this.window.isVisible()) {
+            this.ensureVisibleOnScreen();
+        }
+    }
+
     public toggleWindow(x: number, y: number, options: WindowActivationOptions = {}): void {
         if (this.window && !this.window.isDestroyed()) {
             if (this.window.isVisible()) {
@@ -164,8 +203,8 @@ export class ModelSelectorWindowHelper {
     ): void {
         const isMac = process.platform === 'darwin';
         const windowSettings: Electron.BrowserWindowConstructorOptions = {
-            width: 140,
-            height: 200,
+            width: SELECTOR_WIDTH,
+            height: SELECTOR_MIN_HEIGHT,
             frame: false,
             transparent: true,
             resizable: false,
@@ -253,11 +292,15 @@ export class ModelSelectorWindowHelper {
                 }
             }
             if (showWhenReady) {
-                this.showWindow(
-                    this.window?.getBounds().x || 0,
-                    this.window?.getBounds().y || 0,
-                    showOptions,
-                )
+                const bounds = this.window ? this.window.getBounds() : null;
+                // Skip the show rather than force an unset position to the
+                // origin — a selector snapped to (0,0) looks broken in every
+                // corner case that reaches here.
+                if (!bounds || !Number.isFinite(bounds.x) || !Number.isFinite(bounds.y)) {
+                    console.warn('[ModelSelectorWindowHelper] ready-to-show without valid bounds; skipping show');
+                    return;
+                }
+                this.showWindow(bounds.x, bounds.y, showOptions);
             }
         })
 
@@ -293,31 +336,45 @@ export class ModelSelectorWindowHelper {
     }
 
     private ensureVisibleOnScreen() {
-        if (!this.window) return;
+        if (!this.window || this.window.isDestroyed()) return;
         const { x, y, width, height } = this.window.getBounds();
+        // Unset bounds must never be forced to the origin — leave the window
+        // exactly where (and whether) it is.
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return;
         const display = screen.getDisplayNearestPoint({ x, y });
-        const bounds = display.workArea;
+        const work = display.workArea;
 
-        let newX = x;
-        let newY = y;
+        let targetX = x;
+        let targetY = y;
+
+        // First open only: no room below the chip → flip ABOVE it. The caller
+        // pre-computed where our BOTTOM edge should land (chip top minus gap);
+        // subtracting the height gives the top, and the clamps below still run
+        // in case even that lands off-screen.
+        const flipBottom = this.showFlipTarget;
+        this.showFlipTarget = null;
+        if (flipBottom !== null && y + height > work.y + work.height) {
+            targetY = flipBottom - height;
+        }
 
         // Keep within horizontal bounds
-        if (x + width > bounds.x + bounds.width) {
-            newX = bounds.x + bounds.width - width;
+        if (targetX + width > work.x + work.width) {
+            targetX = work.x + work.width - width;
         }
-        if (x < bounds.x) {
-            newX = bounds.x;
-        }
-
-        // Keep within vertical bounds
-        if (y + height > bounds.y + bounds.height) {
-            newY = bounds.y + bounds.height - height;
-        }
-        if (y < bounds.y) {
-            newY = bounds.y;
+        if (targetX < work.x) {
+            targetX = work.x;
         }
 
-        this.window.setPosition(newX, newY);
+        // Keep within vertical bounds — post-flip fallback that slides the
+        // window back into view when it fits neither above nor below.
+        if (targetY + height > work.y + work.height) {
+            targetY = work.y + work.height - height;
+        }
+        if (targetY < work.y) {
+            targetY = work.y;
+        }
+
+        this.window.setPosition(Math.round(targetX), Math.round(targetY));
     }
 
     public setContentProtection(enable: boolean): void {
