@@ -1,12 +1,13 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useT } from '../i18n';
-import { ToggleLeft, ToggleRight, Search, Calendar, MoreHorizontal, Globe, Clock, ChevronRight, Settings, LayoutGrid, RefreshCw, Eye, EyeOff, Ghost, Plus, Mail, Link as LinkIcon, ChevronDown, Trash2, Bell, Download, DownloadCloud, CheckCircle, AlertCircle, User, UserSearch, Sparkles, ArrowUpRight } from 'lucide-react';
+import { ToggleLeft, ToggleRight, Search, Calendar, MoreHorizontal, Globe, Clock, ChevronRight, Settings, LayoutGrid, RefreshCw, Eye, EyeOff, Ghost, Plus, Mail, Link as LinkIcon, ChevronDown, Trash2, Bell, Download, DownloadCloud, CheckCircle, AlertCircle, User, UserSearch, Sparkles, ArrowUpRight, GraduationCap } from 'lucide-react';
 import { generateMeetingPDF } from '../utils/pdfGenerator';
 import icon from "./icon.png";
 import mainui from "../UI_comp/mainui.png";
 import UpcomingCalendarCard from './ui/UpcomingCalendarCard';
 import { useToggleInit } from './settings/useToggleInit';
 import MeetingDetails from './MeetingDetails';
+import CoursesHome from './courses/CoursesHome';
 import TopSearchPill from './TopSearchPill';
 import GlobalChatOverlay from './GlobalChatOverlay';
 import { motion, AnimatePresence, useReducedMotion, type TargetAndTransition, type Variants } from 'framer-motion';
@@ -89,6 +90,9 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
     const [isDetectable, setIsDetectable] = useState(false);
     const [isMeetingActive, setIsMeetingActive] = useState(false);
     const [selectedMeeting, setSelectedMeeting] = useState<Meeting | null>(null);
+    // Courses Studio view (P0 entry point): an internal launcher surface shown
+    // in place of the meeting list — no new ?window= BrowserWindow needed.
+    const [showCourses, setShowCourses] = useState(false);
     // The notes page's "ask about this meeting" chat is open. See the details
     // panel's z-index below.
     const [meetingChatOpen, setMeetingChatOpen] = useState(false);
@@ -361,7 +365,7 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
     // Notify parent if we are on the main launcher list view; also feed the
     // orchestrator's homepage-mounted clock.
     useEffect(() => {
-        const isMain = !selectedMeeting && !isGlobalChatOpen;
+        const isMain = !selectedMeeting && !showCourses && !isGlobalChatOpen;
         if (onPageChange) onPageChange(isMain);
         if (isMain) {
             emitOrchestratorEvent({ type: 'launcher:mounted' });
@@ -370,7 +374,7 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
         }
         // Cleanup on unmount: ensure unmount is fired
         return () => emitOrchestratorEvent({ type: 'launcher:unmounted' });
-    }, [selectedMeeting, isGlobalChatOpen, onPageChange]);
+    }, [selectedMeeting, showCourses, isGlobalChatOpen, onPageChange]);
 
     const handleOpenMeeting = async (meeting: Meeting) => {
         setSelectedMomentMs(null);
@@ -836,6 +840,15 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
                     </div>
                     <button
                         onClick={() => {
+                            setShowCourses(true);
+                        }}
+                        title={t("Courses Studio")}
+                        className={`p-2 text-text-secondary hover:text-text-primary transition-all duration-300 ${isLight ? 'hover:drop-shadow-[0_0_6px_rgba(0,0,0,0.25)]' : 'hover:drop-shadow-[0_0_8px_rgba(255,255,255,0.5)]'}`}
+                    >
+                        <GraduationCap size={18} />
+                    </button>
+                    <button
+                        onClick={() => {
                             onOpenSettings();
                         }}
                         title={t("Settings")}
@@ -909,6 +922,22 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
                                     onTitleSaved={fetchMeetings}
                                 />
                             </motion.div>
+                        </motion.div>
+                    ) : showCourses ? (
+                        <motion.div
+                            key="courses"
+                            data-page="courses"
+                            className="absolute inset-0 z-20 overflow-hidden bg-bg-primary"
+                            initial={{ opacity: 0 }}
+                            animate={{ opacity: 1 }}
+                            exit={{ opacity: 0 }}
+                            transition={{ duration: 0.18, ease: 'easeOut' }}
+                        >
+                            <CoursesHome
+                                isLight={isLight}
+                                onBack={() => setShowCourses(false)}
+                                onUpgrade={() => onOpenSettings('plans')}
+                            />
                         </motion.div>
                     ) : (
                         <motion.div
@@ -1034,11 +1063,25 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
                                             </AnimatePresence>
                                         </div>
 
-                                        {/* Unified CTA pill — plain <button> (no `layout`, no `initial`) so both
-                                            the pill AND its label appear in their final position on mount with
-                                            no fly-in or fade-up. The label swap (idle ↔ meeting-active) still
-                                            crossfades via AnimatePresence mode="wait" — exit 0.14s, enter 0.22s
-                                            with apple-ease — which reads as a soft label change, not a fly. */}
+                                        {/* CTA cluster — secondary "Open Chat" pill + main Start Natively / Meeting ongoing.
+                                            Open Chat lets the user reach the overlay chat surface without starting a meeting
+                                            (no mic capture, no STT, no meeting persistence) — behaves identically on macOS and
+                                            Windows because it just flips the window mode; nothing platform-specific runs. */}
+                                        <div className="flex items-center gap-2">
+                                        {!isMeetingActive && (
+                                            <button
+                                                onClick={() => {
+                                                    // Open the overlay in inactive mode so it appears without stealing OS focus
+                                                    // (preserves stealth / undetectable behavior). No meeting is started.
+                                                    window.electronAPI?.setWindowMode?.('overlay', true);
+                                                    analytics.trackCommandExecuted('open_chat_without_meeting');
+                                                }}
+                                                className="px-4 py-2.5 rounded-full text-[13px] font-medium text-text-primary bg-bg-elevated/80 hover:bg-bg-elevated border border-border-muted backdrop-blur-xl transition-all duration-200 active:scale-[0.98] hover:scale-[1.01] shrink-0"
+                                                title={t('Open chat without starting a meeting')}
+                                            >
+                                                {t('Open Chat')}
+                                            </button>
+                                        )}
                                         <button
                                             onClick={() => {
                                                 if (isMeetingActive) {
@@ -1126,6 +1169,7 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
                                                 </AnimatePresence>
                                             </div>
                                         </button>
+                                        </div>
                                     </div>
 
                                     {/* 2. Hero Section Cards */}

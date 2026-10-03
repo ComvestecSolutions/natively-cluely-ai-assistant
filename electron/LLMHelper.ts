@@ -6281,8 +6281,8 @@ let isMultimodal = !!(imagePaths?.length);
 
     // 5. Execute
     // Bounded timeout: without it a hung user-configured endpoint stalls the
-    // whole session for ~2 min (Node's default socket timeout). 60s is generous
-    // for a non-streaming completion while still failing over in bounded time.
+    // whole session indefinitely. 5 min is generous for local models that may
+    // need to load into VRAM, while still failing over in bounded time.
     try {
       const templateSource = JSON.stringify(curlConfig.data ?? {});
       const markerIntegrity = /\{\{\s*TEXT\s*\}\}/.test(templateSource);
@@ -6298,7 +6298,10 @@ let isMultimodal = !!(imagePaths?.length);
         url: url,
         headers: headers,
         data: data,
-        timeout: 60_000,
+        // Matches the 5-minute budget documented above for local models that
+        // may need to load into VRAM before responding. Cloud providers finish
+        // well before this, so the ceiling only bites on genuine hangs.
+        timeout: 300_000,
         // The URL above is the only destination that passed the SSRF policy.
         // Never replay the prompt, credentials, or image body to an unchecked
         // redirect target.
@@ -6503,9 +6506,13 @@ let isMultimodal = !!(imagePaths?.length);
     //     local endpoint — 8 CustomProviderWirePayload cases went red with
     //     "SSRF protection blocked URL (Loopback addresses are not allowed)".
 
-    // 5. Execute Fetch (30s timeout — same as RestSTT uploads)
+    // 5. Execute Fetch — generous timeout for local models that may need to load
+    //    into VRAM before processing (model load + prompt eval + generation can
+    //    easily exceed 30s for quantized models). User-cancel via the UI still
+    //    terminates immediately. Cloud providers respond in seconds anyway.
+    const CUSTOM_PROVIDER_TIMEOUT_MS = 300_000; // 5 minutes
     const customAbort = new AbortController();
-    const customTimeout = setTimeout(() => customAbort.abort(), 30_000);
+    const customTimeout = setTimeout(() => customAbort.abort(), CUSTOM_PROVIDER_TIMEOUT_MS);
     try {
       const serializedBody = JSON.stringify(body);
       // markerIntegrity reports whether the template actually substituted our
@@ -11618,17 +11625,33 @@ let isMultimodal = !!(imagePaths?.length);
       if (blocked) throw new Error(`Custom provider endpoint refused: ${blocked}`);
     }
 
+    // Auto-inject "stream": true for OpenAI-compatible bodies so local servers
+    // (LM Studio, Ollama, etc.) stream tokens incrementally instead of buffering
+    // the entire response. Without this, the server blocks until generation
+    // completes — which can exceed the timeout, especially when the model needs
+    // to be loaded into VRAM first. This matches what Zed sends to LM Studio.
+    if (body && typeof body === 'object' && Array.isArray(body.messages) && body.stream === undefined) {
+      body.stream = true;
+    }
+
+    // Generous timeout for local models: model loading + prompt processing +
+    // first-token latency can easily exceed 30s (e.g. quantized 27B model
+    // loading into VRAM). Use 5 minutes to match typical local model behavior.
+    // The caller's abortSignal still allows instant cancellation on user action.
+    const LOCAL_STREAM_TIMEOUT_MS = 300_000; // 5 minutes
     const streamAbort = new AbortController();
-    // 30s predates Direct Assist (v2.2.0) and is the right generous default
-    // for the legacy/general-purpose callers of this function. Direct Assist
-    // callers get the SAME per-path budget streamWithNatively already uses
-    // (DIRECT_ASSIST_CONNECT_TIMEOUT_MS/VISION_CONNECT_TIMEOUT_MS, LLMHelper.ts
-    // ~195-196) instead of always waiting the vision-sized window on a plain
-    // text turn — a stalled custom text endpoint now fails over in ~15s per
-    // attempt instead of ~30s.
+    // Direct Assist callers get the SAME per-path budget streamWithNatively
+    // already uses (DIRECT_ASSIST_CONNECT_TIMEOUT_MS/VISION_CONNECT_TIMEOUT_MS,
+    // LLMHelper.ts ~195-196) instead of always waiting the vision-sized window
+    // on a plain text turn — a stalled custom text endpoint fails over in
+    // ~15s per attempt instead of waiting the full local-model budget below.
+    // Legacy/general-purpose (non-Direct-Assist) callers — which is where
+    // local servers like LM Studio/Ollama are reached — get the generous
+    // LOCAL_STREAM_TIMEOUT_MS budget instead, since model loading + prompt
+    // processing can easily exceed 30s.
     const customConnectTimeoutMs = strictErrors
       ? (imagePaths?.length ? DIRECT_ASSIST_VISION_CONNECT_TIMEOUT_MS : DIRECT_ASSIST_CONNECT_TIMEOUT_MS)
-      : 30_000;
+      : LOCAL_STREAM_TIMEOUT_MS;
     const streamTimeout = setTimeout(() => streamAbort.abort(), customConnectTimeoutMs);
     // Forward the caller's user-cancel signal into the same controller so
     // the fetch socket closes immediately on supersession, freeing the
@@ -11804,7 +11827,7 @@ let isMultimodal = !!(imagePaths?.length);
         }
       }
 
-    } catch (e) {
+    } catch (e: any) {
       clearTimeout(streamTimeout);
       // A CALLER-INITIATED abort is not a provider error and must not produce
       // content. The fetch above rejects with AbortError the moment the caller

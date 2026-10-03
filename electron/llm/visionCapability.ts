@@ -85,16 +85,18 @@ export function resolveOllamaVision(modelId: string, probed: boolean | null): bo
  * A custom provider supports vision when EITHER:
  *   1. The user explicitly wired the image into the template via the
  *      `{{IMAGE_BASE64}}` placeholder (they know their endpoint's image field), OR
- *   2. The request body is OpenAI-chat-compatible (`messages` array), in which
- *      case `injectImageIntoMessages` auto-upgrades the last user message to a
- *      multimodal `image_url` content array.
+ *   2. The dialect is OpenAI chat-completions — recognized either by the
+ *      canonical `/chat/completions` route or by an OpenAI-shaped body (`messages`
+ *      array containing a user message) — in which case `injectImageIntoMessages`
+ *      auto-upgrades the last user message to a multimodal `image_url` content
+ *      array.
  *
  * An explicit `multimodal` flag, when present, overrides the auto-detection
  * (true forces on, false forces off) so users can correct a wrong guess.
  *
- * Conservative by design: a non-OpenAI body with no `{{IMAGE_BASE64}}` returns
- * false, so the chain SKIPS the provider for vision instead of committing to it
- * and silently dropping the screenshot.
+ * Default-OPEN for the OpenAI dialect, default-CLOSED elsewhere: an
+ * unknown/unrecognizable template returns false, so the chain SKIPS the provider
+ * for vision instead of committing to it and silently dropping the screenshot.
  */
 export function customProviderSupportsVision(
   provider: { curlCommand?: string; multimodal?: boolean } | null | undefined,
@@ -103,44 +105,56 @@ export function customProviderSupportsVision(
   if (typeof provider.multimodal === 'boolean') return provider.multimodal;
 
   const curl = provider.curlCommand || '';
+  // No template → the dialect cannot be detected at all. Fail closed: the chain
+  // skips this provider for vision rather than guessing.
   if (!curl) return false;
 
   // (1) Explicit image placeholder anywhere in the template.
   if (/\{\{\s*IMAGE_BASE64\s*\}\}/i.test(curl)) return true;
 
-  // (2) OpenAI-compatible body: look for a JSON `"messages"` array in the
-  //     payload. We avoid a full JSON parse (the body contains {{TEXT}}-style
-  //     placeholders that aren't valid JSON) and instead detect the canonical
-  //     OpenAI shape: a `"messages"` array containing a `"role":"user"` message.
-  //     We require the USER role specifically because injectImageIntoMessages
-  //     only upgrades a user message — a system-only `messages` body would pass
-  //     a looser check but then silently drop the image. Aligning detection
-  //     with the injector's precondition prevents committing to a provider that
-  //     can't actually carry the screenshot.
-  const hasMessagesArray = /"messages"\s*:\s*\[/.test(curl);
-  const hasUserRole = /"role"\s*:\s*"user"/.test(curl);
-  if (!hasMessagesArray || !hasUserRole) return false;
-
-  //     A `messages` array is NOT proof the endpoint speaks OpenAI's multimodal
-  //     dialect — only that it has a messages array. Two other APIs share the
-  //     shape and reject what injectImageIntoMessages produces:
+  // Known non-OpenAI `messages` dialects are excluded BEFORE any positive OpenAI
+  // signal is considered, because they reject or silently ignore what
+  // injectImageIntoMessages produces:
   //
-  //       • Anthropic Messages wants `{type:"image", source:{...}}`; handed an
-  //         `image_url` part it returns 400 invalid_request.
-  //       • Ollama's native /api/chat wants a message-level `images:[b64]`; it
-  //         IGNORES the `image_url` part and answers text-only about a
-  //         screenshot it never saw — the silent drop this whole function
-  //         exists to prevent.
+  //   • Anthropic Messages wants `{type:"image", source:{...}}`; handed an
+  //     `image_url` part it returns 400 invalid_request.
+  //   • Ollama's native /api/chat wants a message-level `images:[b64]`; it
+  //     IGNORES the `image_url` part and answers text-only about a screenshot it
+  //     never saw — the silent drop this whole function exists to prevent.
   //
-  //     So the auto-detect branch requires the absence of those signatures.
-  //     A user on such an endpoint can still force vision on with the explicit
-  //     `multimodal` flag plus an `{{IMAGE_BASE64}}` placeholder they position
-  //     correctly for their API — branch (1) above, which is checked first.
-  //     Failing closed here is the documented intent: skip the provider rather
-  //     than commit to one that cannot carry the image.
+  // A user on such an endpoint can still force vision on with the explicit
+  // `multimodal` flag plus an `{{IMAGE_BASE64}}` placeholder positioned correctly
+  // for their API (branch 1 above, checked first). Failing closed here is the
+  // documented intent: skip the provider rather than commit to one that cannot
+  // carry the image.
   if (isNonOpenAiMessagesDialect(curl)) return false;
 
-  return true;
+  // (2) OpenAI chat-completions dialect → vision-capable BY DEFAULT. Two signals,
+  //     either suffices — we avoid a full JSON parse because the body contains
+  //     {{TEXT}}-style placeholders that aren't valid JSON.
+  const url = firstUrl(curl);
+  const openAiRoute = /\/chat\/completions\b/i.test(url);
+  const hasMessagesArray = /"messages"\s*:\s*\[/.test(curl);
+  // The USER role is required for the body signal because injectImageIntoMessages
+  // only upgrades a user message — a system-only `messages` body would pass a
+  // looser check but then silently drop the image. Aligning detection with the
+  // injector's precondition prevents committing to a provider that can't actually
+  // carry the screenshot.
+  const hasUserRole = /"role"\s*:\s*"user"/.test(curl);
+
+  // Default-open for this dialect is safe: an `image_url` content part IS part of
+  // the OpenAI wire format, and a server that cannot decode one rejects the
+  // request with an API error — which surfaces per-rung in the vision chain as a
+  // normal provider failure. It never becomes the worse outcome (a text-only
+  // answer about a screenshot it never saw), because the known dialects that do
+  // that are excluded above. This is what keeps a plain OpenAI-compatible server
+  // (LM Studio, vLLM, llama.cpp on /v1) usable for screen-vision without the user
+  // having to find and set the multimodal flag first.
+  if (openAiRoute || (hasMessagesArray && hasUserRole)) return true;
+
+  // Unknown dialect: no placeholder, not a chat-completions route, and no
+  // recognizable OpenAI messages body. Fail closed.
+  return false;
 }
 
 /**
