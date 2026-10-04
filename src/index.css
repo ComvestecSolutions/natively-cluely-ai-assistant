@@ -11875,3 +11875,10 @@ html[data-tooltips='off'] .t-tt {
     animation-timing-function: ease-in-out;
   }
 }
+
+/* Indeterminate import-meter sweep (CourseProgressCard). Transform-only, so it is
+   theme-agnostic and compositor-cheap; both endpoints sit fully off the track. */
+@keyframes course-meter-sweep {
+  from { transform: translateX(-105%); }
+  to   { transform: translateX(320%); }
+}

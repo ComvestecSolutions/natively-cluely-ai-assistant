@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { AlertTriangle, ArrowLeft, CheckCircle2, GraduationCap, XCircle } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, CheckCircle2, ChevronRight, GraduationCap, XCircle } from 'lucide-react';
 import { useT } from '../../i18n';
 import CourseProgressCard, { type CourseImportRun } from './CourseProgressCard';
 import LessonReader from './LessonReader';
@@ -121,6 +121,8 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
     useEffect(() => { runRef.current = run; }, [run]);
     // Timer that ends the active run ~800ms after its terminal event.
     const runEndTimer = useRef<number | undefined>(undefined);
+    // The URL behind the active run — Retry on a failed terminal re-sends it without the form.
+    const runSourceUrlRef = useRef<string | null>(null);
     // Course ids with an in-flight enable/disable toggle (guards double-clicks).
     const [pendingToggles, setPendingToggles] = useState<Record<string, boolean>>({});
 
@@ -132,6 +134,11 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
     const [busyAction, setBusyAction] = useState<string | null>(null);
     // Transient result line rendered under the toolbar until a later action replaces it.
     const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'err'; text: string } | null>(null);
+
+    // Two-step delete confirm: id of the row whose Delete armed a Confirm/Cancel pair. Auto-disarms,
+    // so an abandoned arm never outlives the moment; no native dialogs.
+    const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+    const confirmDeleteTimer = useRef<number | undefined>(undefined);
 
     const refreshCourses = useCallback(async () => {
         if (!window.electronAPI || !window.electronAPI.coursesList) return;
@@ -216,6 +223,8 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                     next.phase = 'done';
                     // Collapse the bar so a finished run renders complete.
                     if (next.total > 0) next.done = next.total;
+                } else if (event.phase === 'failed') {
+                    next.phase = 'failed';
                 } else if (event.stage === 'importing') {
                     next.phase = 'importing';
                 } else if (event.stage === 'done' || event.stage === 'failed') {
@@ -235,29 +244,38 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                 return next;
             });
 
-            const terminal = event.phase === 'done' || event.stage === 'done' || event.stage === 'failed';
-            if (terminal) {
+            const isFailure = event.phase === 'failed' || event.stage === 'failed';
+            if (event.phase === 'done' || event.stage === 'done' || isFailure) {
                 window.clearTimeout(runEndTimer.current);
-                // Brief beat so the final state is visible, then drop the run and refresh.
-                const detailId = typeof event.detail === 'string' && event.detail !== '' ? event.detail : active.courseId;
-                runEndTimer.current = window.setTimeout(() => {
-                    setRun(null);
-                    if (event.stage === 'failed') void refreshCourses();
-                    // Terminal 'done': finishImportRun performs the same refresh and, in
-                    // passing, posts the fresh-stats completion notice.
-                    else void finishImportRun(detailId);
-                }, 800);
+                if (isFailure) {
+                    // Failed terminal: keep the run on screen — the card offers Retry / Dismiss.
+                    // Refresh in place so any partial course row surfaces under it.
+                    void refreshCourses();
+                } else {
+                    // Brief beat so the final state is visible, then drop the run and refresh.
+                    const detailId = typeof event.detail === 'string' && event.detail !== '' ? event.detail : active.courseId;
+                    runEndTimer.current = window.setTimeout(() => {
+                        setRun(null);
+                        // Terminal 'done': finishImportRun performs the same refresh and, in
+                        // passing, posts the fresh-stats completion notice. Only success auto-clears.
+                        void finishImportRun(detailId);
+                    }, 800);
+                }
             }
         });
     }, [refreshCourses, finishImportRun]);
 
-    useEffect(() => () => window.clearTimeout(runEndTimer.current), []);
+    useEffect(() => () => {
+        window.clearTimeout(runEndTimer.current);
+        window.clearTimeout(confirmDeleteTimer.current);
+    }, []);
 
     // One-shot import submit: validate the URL, ask main to start the run, adopt its
     // course id as the active one. The UI never starts a second run; main guards it too.
-    const startImport = async () => {
+    const startImport = async (retryUrl?: string) => {
         if (submitting || runRef.current) return;
-        const url = importUrl.trim();
+        // Retry re-sends the captured URL without touching the form field.
+        const url = (retryUrl ?? importUrl).trim();
         if (!isHttpUrl(url)) {
             setFormError(t('Enter a valid http(s) URL.'));
             return;
@@ -284,6 +302,7 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
             const courseId = pickImportedCourseId(res);
             if (!courseId) return;
             window.clearTimeout(runEndTimer.current);
+            runSourceUrlRef.current = url; // Retry's anchor for this run
             setRun({ courseId, phase: 'importing', done: 0, total: 0, failed: 0, skipped: 0 });
             setImportOpen(false);
         } catch {
@@ -371,8 +390,22 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
         else setNotice({ tone: 'ok', text: t('Course re-indexed for AI grounding') });
     });
 
+    // Two-step delete without a native dialog: Delete arms a Confirm/Cancel pair on the row
+    // for a few seconds; the armed Confirm performs it, Cancel or timeout disarms.
+    const armDeleteConfirm = (courseId: string) => {
+        window.clearTimeout(confirmDeleteTimer.current);
+        setConfirmDelete(courseId);
+        confirmDeleteTimer.current = window.setTimeout(() => setConfirmDelete(null), 4000);
+    };
+
+    const cancelDeleteConfirm = () => {
+        window.clearTimeout(confirmDeleteTimer.current);
+        setConfirmDelete(null);
+    };
+
     const deleteCourse = (course: CourseSummary) => {
-        if (!window.confirm(`Delete "${course.name}" and all its lessons, assets and progress? This cannot be undone.`)) return;
+        window.clearTimeout(confirmDeleteTimer.current);
+        setConfirmDelete(null);
         void withAction(`del:${course.id}`, async () => {
             const api = window.electronAPI;
             if (!api || typeof api.coursesDeleteCourse !== 'function') return;
@@ -403,15 +436,47 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
         } else setNotice({ tone: 'err', text: res.error ?? t('Import failed') });
     });
 
-    // App card surface (the settings Card recipe); the tokens track the theme, so no light/dark split.
-    const rowTone = 'bg-bg-item-surface rounded-xl border border-border-subtle';
+    // Terminal-failure recovery, wired to the progress card's Retry / Dismiss actions.
+    const retryFailedRun = () => {
+        const url = runSourceUrlRef.current;
+        if (!url || submitting) return;
+        // startImport single-flights on both of these — clear them before re-arming a fresh run,
+        // or the second call would silently no-op.
+        window.clearTimeout(runEndTimer.current);
+        runRef.current = null;
+        setRun(null);
+        void startImport(url);
+    };
+
+    const dismissImportRun = () => {
+        window.clearTimeout(runEndTimer.current);
+        runSourceUrlRef.current = null;
+        setRun(null);
+        // The failed run may have left a partial course behind — re-read the list.
+        void refreshCourses();
+    };
+
+    // App card surface (the settings Card recipe); muted border stays visible in both themes.
+    const rowTone = 'bg-bg-item-surface rounded-xl border border-border-muted';
     // Ghost styling shared by the per-row P4 management buttons (settings button consts).
     const actionBtnClass = `${SETTINGS_BTN_BASE} ${SETTINGS_BTN_NEUTRAL}`;
+    // In-flight row action: border spinner + dimmed original label — never a bare "…".
+    const actionSpinner = (label: string) => (
+        <>
+            <span aria-hidden className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-current border-t-transparent motion-reduce:animate-none" />
+            <span className="opacity-60">{label}</span>
+        </>
+    );
 
     // URL input + actions, shared by the empty-state and list-view import forms.
     const importControls = (
         <>
+            {/* Only one import form renders at a time, so the static id is safe to share. */}
+            <label htmlFor="course-import-url" className="mb-1 block text-[11px] font-semibold uppercase tracking-wider text-text-secondary">
+                {t('Course URL')}
+            </label>
             <input
+                id="course-import-url"
                 type="text"
                 inputMode="url"
                 value={importUrl}
@@ -420,9 +485,14 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                     if (formError) setFormError(null);
                 }}
                 placeholder="https://learn.microsoft.com/en-us/credentials/certifications/..."
-                className={`w-full rounded-full bg-bg-input border border-border-subtle px-4 py-2 text-[13px] text-text-primary placeholder:text-text-secondary outline-none transition-colors focus:border-accent-secondary`}
+                className={`w-full rounded-full bg-bg-input border border-border-muted px-4 py-2 text-sm text-text-primary placeholder:text-text-secondary outline-none transition-colors focus:border-accent-secondary`}
             />
-            {formError && <p className="text-xs text-text-secondary">{formError}</p>}
+            {formError && (
+                <p role="alert" className={`mt-1 flex items-center gap-1.5 text-xs font-medium ${tones.text.danger}`}>
+                    <XCircle size={12} aria-hidden />
+                    <span className="min-w-0 truncate">{formError}</span>
+                </p>
+            )}
             <div className="flex items-center justify-end gap-2">
                 <button
                     type="button"
@@ -457,12 +527,18 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                             <button
                                 onClick={onBack}
                                 title={t('Back')}
-                                className={`p-2 -ml-2 text-text-secondary hover:text-text-primary rounded-full transition-colors ${isLight ? 'hover:bg-black/8' : 'hover:bg-white/10'}`}
+                                aria-label={t('Back')}
+                                className="p-2 -ml-2 text-text-secondary hover:text-text-primary rounded-full transition-colors hover:[background-color:var(--bg-row-hover)]"
                             >
                                 <ArrowLeft size={16} />
                             </button>
                         )}
-                        <h1 className="text-3xl font-celeb-light font-medium text-text-primary tracking-wide drop-shadow-sm">{t('Courses Studio')}</h1>
+                        <h1 className="font-celeb-light text-xl font-semibold tracking-wide text-text-primary">{t('Courses Studio')}</h1>
+                        {!loading && courses.length > 0 && (
+                            <span className="text-xs font-medium tabular-nums text-text-secondary">
+                                {courses.length} {t(courses.length === 1 ? 'course' : 'courses')}
+                            </span>
+                        )}
                     </div>
                 </div>
             </section>
@@ -473,8 +549,20 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                     // root `min-h-full` fills it and its inner columns own their scrolling.
                     <LessonReader courseId={openCourseId} onBack={() => setOpenCourseId(null)} />
                 ) : loading ? (
-                    <div className="px-8 py-10 text-center text-sm text-text-secondary">
-                        {t('Loading')}…
+                    // Skeleton rows shaped like course cards while the first list fetch is in flight.
+                    <div role="status" className="mx-auto w-full max-w-3xl px-8 py-6">
+                        <span className="sr-only">{t('Loading')}…</span>
+                        <div aria-hidden className="space-y-3">
+                            {['w-2/5', 'w-1/2', 'w-3/5'].map((titleW, i) => (
+                                <div key={i} className={`flex items-center gap-4 px-4 py-3 ${rowTone}`}>
+                                    <div className="min-w-0 flex-1 space-y-2">
+                                        <div className={`h-4 animate-pulse motion-reduce:animate-none [background-color:var(--mn-skel-strong)] ${titleW}`} />
+                                        <div className="h-3 w-3/5 animate-pulse motion-reduce:animate-none [background-color:var(--mn-skel-base)]" />
+                                    </div>
+                                    <div className="h-5 w-16 shrink-0 rounded-full animate-pulse motion-reduce:animate-none [background-color:var(--mn-skel-soft)]" />
+                                </div>
+                            ))}
+                        </div>
                     </div>
                 ) : disabled && !run ? (
                     /* Premium notice — same pill-button language as the launcher CTAs. */
@@ -488,19 +576,22 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                                 {t('Courses Studio is part of Natively Pro. Upgrade to import courses and build interview-ready material from them.')}
                             </p>
                             {onUpgrade && (
-                                <button
+                                <LiquidGlassButton
+                                    variant="clear"
                                     onClick={onUpgrade}
-                                    title={t('Plans & Billing')}
-                                    className="mt-5 px-4 py-2.5 rounded-full text-[13px] font-medium text-text-primary bg-bg-elevated/80 hover:bg-bg-elevated border border-border-muted backdrop-blur-xl transition-all duration-200 active:scale-[0.98]"
+                                    className="lg-sm mt-5 text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-focus"
                                 >
                                     {t('View plans')}
-                                </button>
+                                </LiquidGlassButton>
                             )}
                         </div>
                     </div>
                 ) : run && courses.length === 0 ? (
                     <div className="flex items-center justify-center px-8 pb-10 pt-6 min-h-full">
-                        <CourseProgressCard progress={run} isLight={isLight} />
+                        {/* Centered only in the empty state; the list view below uses the full-width banner. */}
+                        <div className="w-full max-w-md">
+                            <CourseProgressCard progress={run} isLight={isLight} onRetry={() => retryFailedRun()} onDismiss={() => dismissImportRun()} />
+                        </div>
                     </div>
                 ) : courses.length === 0 ? (
                     <div className="flex items-center justify-center px-8 pb-10 pt-6 min-h-full">
@@ -541,12 +632,17 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                 ) : (
                     <div className="max-w-3xl mx-auto px-8 py-6">
                         {run && (
-                            <div className="mb-4 flex justify-center">
-                                <CourseProgressCard progress={run} isLight={isLight} />
+                            <div className="mb-4">
+                                {/* Full-width banner while courses exist; the card splits stages/meter left, counters right. */}
+                                <CourseProgressCard progress={run} isLight={isLight} onRetry={() => retryFailedRun()} onDismiss={() => dismissImportRun()} />
                             </div>
                         )}
                         {!importOpen && !run && (
                             <div className="mb-4 flex items-center justify-end gap-2">
+                                {/* Course count anchors the row so the right-aligned actions aren't orphaned. */}
+                                <span className="mr-auto text-xs font-medium tabular-nums text-text-secondary">
+                                    {courses.length} {t(courses.length === 1 ? 'course' : 'courses')}
+                                </span>
                                 <LiquidGlassButton
                                     variant="clear"
                                     className="lg-sm text-text-primary"
@@ -605,8 +701,19 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                                 return (
                                     <li
                                         key={course.id}
+                                        role="button"
+                                        tabIndex={0}
+                                        aria-label={`${t('Open')}: ${course.name}`}
                                         onClick={() => setOpenCourseId(course.id)}
-                                        className={`flex cursor-pointer select-none items-center gap-4 rounded-xl border px-4 py-3 ${rowTone}`}
+                                        onKeyDown={(e) => {
+                                            // Only the row itself opens on Enter/Space — never a nested control.
+                                            if (e.target !== e.currentTarget) return;
+                                            if (e.key === 'Enter' || e.key === ' ') {
+                                                e.preventDefault();
+                                                setOpenCourseId(course.id);
+                                            }
+                                        }}
+                                        className={`group flex cursor-pointer select-none items-center gap-4 px-4 py-3 outline-none transition-colors hover:[background-color:var(--bg-row-hover)] focus-visible:ring-2 focus-visible:ring-accent-focus ${rowTone}`}
                                     >
                                         {/* Clicking the row opens the single-course reader (P3). */}
                                         <div className="min-w-0 flex-1">
@@ -616,14 +723,20 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                                                     <span className="truncate text-text-secondary">{t('Updated')} {updatedLabel}</span>
                                                 )}
                                                 {!noLessons ? (
-                                                    <span className="shrink-0 tabular-nums text-text-secondary">{lessonCount} {t('lessons')} · {course.chunkCount ?? 0} {t('chunks')}</span>
+                                                    <>
+                                                        {updatedLabel !== '' && <span aria-hidden className="shrink-0 text-text-tertiary">·</span>}
+                                                        <span className="shrink-0 tabular-nums text-text-secondary">{lessonCount} {t('lessons')} · {course.chunkCount ?? 0} {t('chunks')}</span>
+                                                    </>
                                                 ) : (
-                                                    <span className="shrink-0 text-text-tertiary">{t('No lessons yet')}</span>
+                                                    <>
+                                                        {updatedLabel !== '' && <span aria-hidden className="shrink-0 text-text-tertiary">·</span>}
+                                                        <span className="shrink-0 text-text-tertiary">{t('No lessons yet')}</span>
+                                                    </>
                                                 )}
                                             </div>
                                             {failuresPreview !== '' && (
                                                 <p
-                                                    className="mt-0.5 truncate text-[11px] text-amber-400/80"
+                                                    className={`mt-0.5 truncate text-xs ${tones.text.warn}`}
                                                     title={stats.failures.join('\n')}
                                                 >
                                                     {failuresPreview}
@@ -638,7 +751,7 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                                                             style={{ width: `${barPct}%` }}
                                                         />
                                                     </div>
-                                                    <span className="shrink-0 text-[11px] tabular-nums text-text-secondary">{barPct}%</span>
+                                                    <span className="shrink-0 text-xs tabular-nums text-text-secondary">{barPct}%</span>
                                                 </div>
                                             )}
                                         </div>
@@ -650,7 +763,8 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                                         ) : course.status === 'importing' ? (
                                             <AipBadge tone="info" busy label={t('Importing')} className="shrink-0" />
                                         ) : (
-                                            <span className="shrink-0 text-xs font-medium text-text-secondary">{statusLabel(t, course.status)}</span>
+                                            // Unknown wire status — same badge language as the known ones.
+                                            <AipBadge tone="neutral" label={statusLabel(t, course.status)} className="shrink-0" />
                                         )}
                                         {/* P4 management actions — ghost buttons that never open the reader. */}
                                         <div className="flex shrink-0 items-center gap-1">
@@ -658,27 +772,53 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                                                 type="button"
                                                 onClick={(e) => { e.stopPropagation(); void exportCourseBundle(course.id); }}
                                                 disabled={rowBusy || noLessons}
+                                                aria-busy={busyAction === expKey}
                                                 title={noLessons ? t('No lessons imported yet') : undefined}
                                                 className={actionBtnClass}
                                             >
-                                                {busyAction === expKey ? '…' : t('Export')}
+                                                {busyAction === expKey ? actionSpinner(t('Export')) : t('Export')}
                                             </button>
                                             <button
                                                 type="button"
                                                 onClick={(e) => { e.stopPropagation(); void reindexCourse(course.id); }}
                                                 disabled={rowBusy || noLessons}
+                                                aria-busy={busyAction === ridxKey}
                                                 title={noLessons ? t('No lessons imported yet') : undefined}
                                                 className={actionBtnClass}
                                             >
-                                                {busyAction === ridxKey ? '…' : t('Re-index')}
+                                                {busyAction === ridxKey ? actionSpinner(t('Re-index')) : t('Re-index')}
                                             </button>
-                                            <button
-                                                type="button"
-                                                onClick={(e) => { e.stopPropagation(); void deleteCourse(course); }}
-                                                className={actionBtnClass}
-                                            >
-                                                {busyAction === delKey ? '…' : t('Delete')}
-                                            </button>
+                                            {confirmDelete === course.id ? (
+                                                <>
+                                                    {/* Armed: Confirm runs the delete, Cancel (or timeout) disarms. */}
+                                                    <button
+                                                        type="button"
+                                                        onClick={(e) => { e.stopPropagation(); void deleteCourse(course); }}
+                                                        disabled={rowBusy}
+                                                        className={`${SETTINGS_BTN_BASE} ${tones.danger}`}
+                                                    >
+                                                        {t('Confirm')}
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        onClick={(e) => { e.stopPropagation(); cancelDeleteConfirm(); }}
+                                                        disabled={rowBusy}
+                                                        className={actionBtnClass}
+                                                    >
+                                                        {t('Cancel')}
+                                                    </button>
+                                                </>
+                                            ) : (
+                                                <button
+                                                    type="button"
+                                                    onClick={(e) => { e.stopPropagation(); armDeleteConfirm(course.id); }}
+                                                    disabled={rowBusy}
+                                                    aria-busy={busyAction === delKey}
+                                                    className={actionBtnClass}
+                                                >
+                                                    {busyAction === delKey ? actionSpinner(t('Delete')) : t('Delete')}
+                                                </button>
+                                            )}
                                         </div>
                                         {/* The settings switch; the span keeps a toggle click from opening the reader. */}
                                         <span
@@ -693,6 +833,8 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                                                 disabled={busy}
                                             />
                                         </span>
+                                        {/* Row affordance: revealed on hover and keyboard focus. */}
+                                        <ChevronRight size={14} aria-hidden className="shrink-0 text-text-tertiary opacity-0 transition-opacity motion-reduce:transition-none group-hover:opacity-100 group-focus-visible:opacity-100" />
                                     </li>
                                 );
                             })}
