@@ -46,6 +46,11 @@ import {
   type TextStreamProvider,
 } from "./llm/textStreamFallback"
 import { isPermanentKeyError } from "./llm/providerErrorClassifier"
+import {
+  resolveLoopbackOrigin,
+  waitForLocalProviderReady,
+  isNotReadyProviderFailure,
+} from './llm/localProviderReadiness'
 import { telemetryService } from "./services/telemetry/TelemetryService"
 import {
   ollamaVisionFromShow,
@@ -435,6 +440,13 @@ const INTERACTIVE_CONNECT_TIMEOUT_MS = 4_000;
 // connection still ends promptly with a specific error.
 const DIRECT_ASSIST_CONNECT_TIMEOUT_MS = 15_000;
 const DIRECT_ASSIST_VISION_CONNECT_TIMEOUT_MS = 30_000;
+
+// LM Studio / Ollama & co. are routinely slow to report a freshly-loaded model as available after
+// their first request woke the process up: they answer while still loading, then 503 or refuse the
+// chat endpoint for as long as VRAM is warming. When we can prove (via GET {origin}/models) that
+// the server is ready BEFORE issuing such a chat/stream call to a loopback custom provider, that
+// failure class disappears at the source instead of being retried blindly.
+const CUSTOM_LOCAL_READY_WAIT_MS = 60_000;
 
 // First-useful-token budget for the Natively gateway on the TEXT path. Larger than
 // the shared 2.5s text default because the gateway's server-side fallback chain can
@@ -13440,6 +13452,49 @@ let isMultimodal = !!(imagePaths?.length);
       body.stream = true;
     }
 
+    // Cold start for LOOPBACK endpoints (LM Studio & co. still loading their model): if an attempt
+    // fails in a "not ready" shape — no HTTP status at all, or 408/502/503/504 — before it has
+    // yielded anything, wait for {origin}/models to come up (bounded by CUSTOM_LOCAL_READY_WAIT_MS)
+    // and re-run the SAME request path once more. Remote endpoints never enter this wait; every
+    // other failure keeps today's handling byte-for-byte, including _streamChatInner's errors.
+    const coldStartOrigin = resolveLoopbackOrigin(url);
+    let requestedModelId = '';
+    try {
+      const parsedBody: unknown = typeof body === 'string' ? JSON.parse(body) : body;
+      const maybeModel = parsedBody && typeof parsedBody === 'object' ? (parsedBody as { model?: unknown }).model : undefined;
+      if (typeof maybeModel === 'string') requestedModelId = maybeModel;
+    } catch { /* non-JSON request body — the readiness probe skips the exact-model check. */ }
+
+    for (let coldStartAttempt = 0; coldStartAttempt < 2; coldStartAttempt++) {
+      // outputStreamed stops a mid-stream drop from triggering the retry: re-running such an attempt would duplicate content already delivered to the caller.
+      const attemptState = { outputStreamed: false };
+      try {
+        yield* this.streamCustomAttempt(url, headers, body, requestConfig.method || 'POST', strictErrors, abortSignal, imagePaths, attemptState);
+        // Normal completion — or a silent end on caller cancel; the stream is over either way.
+        return;
+      } catch (e: any) {
+        if (coldStartAttempt === 0 && coldStartOrigin !== null && !attemptState.outputStreamed && isNotReadyProviderFailure(e)) {
+          await waitForLocalProviderReady({ origin: coldStartOrigin, modelId: requestedModelId, headers, abortSignal, waitBudgetMs: CUSTOM_LOCAL_READY_WAIT_MS });
+          continue; // one final attempt regardless of whether readiness was reached.
+        }
+        throw e;
+      }
+    }
+  }
+
+  // One fetch-and-parse pass for a custom provider endpoint; streamWithCustom drives it through
+  // yield* and calls it at most twice (the loopback cold-start retry). Each attempt gets its own
+  // connect controller/budget, so a second pass is fresh. All SSE/JSON parsing happens only in here.
+  private async * streamCustomAttempt(
+    url: string,
+    headers: Record<string, string>,
+    body: unknown,
+    requestMethod: string,
+    strictErrors: boolean,
+    abortSignal: AbortSignal | undefined,
+    imagePaths: string[] | undefined,
+    attemptState: { outputStreamed: boolean },
+  ): AsyncGenerator<string, void, unknown> {
     // Generous timeout for local models: model loading + prompt processing +
     // first-token latency can easily exceed 30s (e.g. quantized 27B model
     // loading into VRAM). Use 5 minutes to match typical local model behavior.
@@ -13479,7 +13534,7 @@ let isMultimodal = !!(imagePaths?.length);
     const customConnectStartedAt = Date.now();
     try {
       const response = await fetch(url, {
-        method: requestConfig.method || 'POST',
+        method: requestMethod,
         headers: headers,
         body: JSON.stringify(body),
         signal: streamAbort.signal,
@@ -13587,6 +13642,7 @@ let isMultimodal = !!(imagePaths?.length);
           if (items) {
             yield items;
             yieldedAny = true;
+            attemptState.outputStreamed = true;
           }
         }
         // Some legacy custom endpoints use each HTTP chunk as the frame and
@@ -13598,6 +13654,7 @@ let isMultimodal = !!(imagePaths?.length);
           if (chunkFrame.item) {
             yield chunkFrame.item;
             yieldedAny = true;
+            attemptState.outputStreamed = true;
           }
         }
       }
@@ -13613,6 +13670,7 @@ let isMultimodal = !!(imagePaths?.length);
         if (item) {
           yield item;
           yieldedAny = true;
+          attemptState.outputStreamed = true;
         }
       }
 
@@ -13626,10 +13684,16 @@ let isMultimodal = !!(imagePaths?.length);
           // shape heuristics: a responsePath aimed at a complete response body
           // does not resolve against an SSE delta chunk.
           const extracted = this.extractCustomAnswer(data, this.customProvider?.responsePath);
-          if (extracted) yield extracted;
+          if (extracted) {
+            yield extracted;
+            attemptState.outputStreamed = true;
+          }
         } catch {
           // Not JSON, yield raw text if it's not looking like garbage
-          if (fullBody.length < 5000) yield fullBody.trim();
+          if (fullBody.length < 5000) {
+            yield fullBody.trim();
+            attemptState.outputStreamed = true;
+          }
         }
       }
 
