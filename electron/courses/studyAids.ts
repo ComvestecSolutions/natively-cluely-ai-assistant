@@ -265,8 +265,19 @@ export async function generateStudyAid(
   let raw: string;
   try {
     raw = await input.llm(buildPrompt(input.type, prepared));
-  } catch {
-    return { ok: false, error: 'model request failed' };
+  } catch (e) {
+    const reason = e instanceof Error && typeof e.message === 'string' && e.message.trim() !== '' ? e.message : 'unknown model error';
+    return { ok: false, error: `model request failed: ${reason}` };
+  }
+
+  // Provider failures can still arrive as plain text (the LLM helper yields them as stream
+  // content); never report one as bad model output — and never cache it under a summary key.
+  const prose = raw.trim();
+  if (/^Error: Custom Provider returned HTTP \d{3}\b/.test(prose)) {
+    return { ok: false, error: `model request failed: ${prose.replace(/^Error:\s*/, '').toLowerCase()}` };
+  }
+  if (prose.startsWith('Error streaming from custom provider')) {
+    return { ok: false, error: 'model request failed: the model endpoint could not answer' };
   }
 
   if (input.type === 'summary') {

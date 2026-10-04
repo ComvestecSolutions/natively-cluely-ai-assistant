@@ -15166,15 +15166,50 @@ export function initializeIpcHandlers(appState: AppState): void {
 
       const helper = appState.processingHelper?.getLLMHelper?.();
       if (!helper) return { ok: false, error: 'no language model configured' };
-      // chat() is the buffered universal completion (cloud or local provider); a truncated
-      // stream throws inside it and lands in the catch below as {ok:false,error}.
+      // Batch turn over a synthetic self-contained prompt (not a live chat question): fit the whole
+      // thing to the current model's budget like AnswerLLM does, and stand down every live-turn
+      // interceptor with the same owned-turn flags.
+      const runBatchCompletion = async (prompt: string): Promise<string> => {
+        const fitted = helper.fitContextForCurrentModel(prompt);
+        const { stream, outcome } = helper.streamChatLongForm(
+          fitted,
+          undefined,
+          undefined,
+          'You generate course study material from the provided lesson text only. Follow the task exactly; when it specifies a format (Markdown or strict JSON), output exactly that - no preambles, commentary, or code fences.',
+          true,
+          true,
+          [],
+          undefined,
+          undefined,
+          { v3Owned: true },
+        );
+        let full = '';
+        for await (const chunk of stream) full += chunk;
+        if (outcome.truncated || outcome.reason === 'provider_failed_after_first_token') {
+          throw new Error(
+            outcome.reason === 'output_cap_reached'
+              ? 'model output was cut off by the output cap before it completed'
+              : 'the model connection dropped mid-answer',
+          );
+        }
+        // _streamChatInner yields pre-first-token provider failures as plain text, not exceptions:
+        // surface them as real errors so the user sees the reason instead of bad-output noise.
+        const t = full.trim();
+        if (/^Error: Custom Provider returned HTTP \d{3}\b/.test(t)) {
+          throw new Error(t.replace(/^Error:\s*/, ''));
+        }
+        if (t.startsWith('Error streaming from custom provider')) {
+          throw new Error('custom provider request failed');
+        }
+        return full;
+      };
       const result = await generateStudyAid({
         rootDir: path.join(app.getPath('userData'), 'courses'),
         courseId,
         type,
         sources,
         force: payload?.force === true,
-        llm: (prompt) => helper.chat(prompt),
+        llm: runBatchCompletion,
       });
       return result;
     } catch (e: any) {
