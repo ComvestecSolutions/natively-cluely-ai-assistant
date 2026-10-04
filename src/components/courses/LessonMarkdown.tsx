@@ -192,7 +192,7 @@ export default function LessonMarkdown({ courseId, content, lessonUrls, onNaviga
           // where it matters (bottom breathing); inner <code> is reset because the `code` override
           // below styles inline chips.
           pre: ({ children }) => (
-            <pre className="my-4 overflow-x-auto rounded-md border border-border-muted bg-bg-input p-3 font-mono text-[12.5px] leading-relaxed text-text-primary [&>code]:bg-transparent [&>code]:p-0 [&>code]:text-[12.5px]">
+            <pre className="my-4 overflow-x-auto rounded-md border border-border-muted bg-bg-input p-3 font-mono text-[13px] leading-relaxed text-text-primary [&>code]:bg-transparent [&>code]:p-0 [&>code]:text-[13px]">
               {children}
             </pre>
           ),
@@ -238,7 +238,7 @@ export default function LessonMarkdown({ courseId, content, lessonUrls, onNaviga
           ),
 
           h3: ({ children }) => (
-            <h3 className="scroll-mt-24 pt-4 text-[15.5px] font-medium leading-snug text-text-primary">{children}</h3>
+            <h3 className="scroll-mt-24 pt-4 text-[15px] font-medium leading-snug text-text-primary">{children}</h3>
           ),
 
           hr: () => <hr className="my-6 border-border-muted" />,

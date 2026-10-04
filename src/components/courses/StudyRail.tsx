@@ -93,9 +93,9 @@ function parseFlashcards(data: unknown): FlashcardPair[] | null {
 function ResultCard({ title, onRegenerate, children }: { title: string; onRegenerate: () => void; children: React.ReactNode }) {
     return (
         // Inset one step inside the muted card: a hairline + lighter fill keeps the result distinct from its shell.
-        <div className="mt-2 rounded-lg border border-border-subtle bg-bg-elevated/50 p-3">
+        <div className="mt-2 rounded-lg border border-border-subtle bg-bg-elevated p-3">
             <div className="mb-2 flex items-center justify-between gap-2">
-                <p className="truncate text-[11px] font-semibold uppercase tracking-wide text-text-secondary">{title}</p>
+                <p className="truncate text-xs font-semibold uppercase tracking-wide text-text-secondary">{title}</p>
                 <LiquidGlassButton type="button" variant="clear" className="lg-sm shrink-0 text-text-secondary" onClick={onRegenerate} title="Regenerate with a fresh pass" aria-label={`Regenerate ${title}`}>
                     <RotateCcw size={12} />
                 </LiquidGlassButton>
@@ -203,7 +203,7 @@ const StudyRail: React.FC<StudyRailProps> = ({ courseId, scopeLessons, progress,
             <section className={CARD}>
                 {/* Course-wide completion; the only inline style in this file is the dynamic fill width. */}
                 <SectionLabel>Progress</SectionLabel>
-                <p className="text-[13px] tabular-nums text-text-secondary">{done} of {total} lessons · {pct}%</p>
+                <p className="text-xs tabular-nums text-text-secondary">{done} of {total} lessons · {pct}%</p>
                 <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-bg-elevated">
                     <div className="h-full rounded-full bg-accent-primary transition-all" style={{ width: `${pct}%` }} />
                 </div>
@@ -216,7 +216,7 @@ const StudyRail: React.FC<StudyRailProps> = ({ courseId, scopeLessons, progress,
                     <div className="space-y-1.5">
                         {externalLinks.map((link, i) => (
                             <div key={`${link.url}-${i}`} className="flex items-center gap-2 rounded-lg px-2.5 py-1.5 transition-colors hover:[background-color:var(--bg-row-hover)]">
-                                <span className="min-w-0 flex-1 truncate text-[13px] text-text-primary" title={link.title}>{link.title}</span>
+                                <span className="min-w-0 flex-1 truncate text-xs text-text-primary" title={link.title}>{link.title}</span>
                                 <LiquidGlassButton type="button" variant="clear" className="lg-sm shrink-0 text-text-secondary" onClick={() => openLink(link.url)} title={`Open ${link.title} in the browser`} aria-label={`Open ${link.title} in the browser`}>
                                     <ExternalLink size={12} />
                                 </LiquidGlassButton>
@@ -233,7 +233,7 @@ const StudyRail: React.FC<StudyRailProps> = ({ courseId, scopeLessons, progress,
                     {AID_TYPES.map((type) => (
                         <button key={type} type="button" disabled={!canGenerate} onClick={() => generate(type, false)} aria-busy={busy === type}
                             title={`${AID_LABELS[type]} from ${lessonCountLabel(scopeLessons.length)}`}
-                            className={`${SETTINGS_BTN_BASE} disabled:cursor-not-allowed ${hasResult(type) && busy !== type ? 'border-accent-secondary bg-accent-secondary/10 text-accent-primary' : SETTINGS_BTN_NEUTRAL}`}>
+                            className={`${SETTINGS_BTN_BASE} disabled:cursor-not-allowed ${hasResult(type) && busy !== type ? 'border-accent-secondary bg-accent-subtle text-accent-primary' : SETTINGS_BTN_NEUTRAL}`}>
                             {busy === type ? (
                                 <>
                                     {/* House spinner idiom (CoursesHome): a currentColor ring, halted for reduced motion. */}
@@ -266,7 +266,7 @@ const StudyRail: React.FC<StudyRailProps> = ({ courseId, scopeLessons, progress,
                     <ResultCard title={`Glossary · ${results.glossary.entries.length}`} onRegenerate={() => generate('glossary', true)}>
                         {/* One compact row per term — the rail is too narrow for stacked dt/dd detail. */}
                         <div className="space-y-2">{results.glossary.entries.map((entry) => (
-                            <p key={entry.term} className="text-[13px] leading-relaxed text-text-secondary"><span className="font-medium text-text-primary">{entry.term}</span> — {entry.definition}</p>
+                            <p key={entry.term} className="text-xs leading-relaxed text-text-secondary"><span className="font-medium text-text-primary">{entry.term}</span> — {entry.definition}</p>
                         ))}</div>
                     </ResultCard>
                 )}
@@ -301,7 +301,7 @@ const StudyRail: React.FC<StudyRailProps> = ({ courseId, scopeLessons, progress,
                             className="flex max-h-[86vh] w-[min(560px,94vw)] flex-col overflow-y-auto rounded-xl border border-border-muted bg-bg-elevated p-5">
                             <Flashcards cards={flashCards} />
                             <button type="button" onClick={() => setPanel(null)} title="Close flashcards"
-                                className="mt-3 shrink-0 self-center rounded-full border border-border-muted bg-bg-input px-4 py-2 text-[13px] font-medium text-text-primary transition-all active:scale-[0.98] focus-visible:ring-2 focus-visible:ring-accent-primary/40">Close</button>
+                                className="mt-3 shrink-0 self-center rounded-full border border-border-muted bg-bg-input px-4 py-2 text-xs font-medium text-text-primary transition-all active:scale-[0.98] focus-visible:ring-2 focus-visible:ring-accent-focus">Close</button>
                         </motion.div>
                     </motion.div>
                 )}

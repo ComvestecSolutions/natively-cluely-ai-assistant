@@ -81,14 +81,15 @@ function Notice({ title, body, onBack }: { title: string; body?: string; onBack:
         <div className="min-h-full flex items-center justify-center px-6 py-8">
             <div className="w-full max-w-md rounded-2xl border border-border-muted bg-bg-item-surface p-8 text-center">
                 <h2 className="text-lg font-medium text-text-primary">{title}</h2>
-                {body ? <p className="mt-2 text-[13px] leading-relaxed text-text-secondary">{body}</p> : null}
+                {body ? <p className="mt-2 text-xs leading-relaxed text-text-secondary">{body}</p> : null}
                 <button
                     type="button"
                     onClick={onBack}
                     title="Back"
-                    className="mt-5 px-4 py-2.5 rounded-full text-[13px] font-medium text-text-primary bg-bg-elevated/80 hover:bg-bg-elevated border border-border-muted backdrop-blur-xl transition-all duration-200 active:scale-[0.98]"
+                    className="mt-5 inline-flex items-center gap-1.5 px-4 py-2.5 rounded-full text-xs font-medium text-text-primary bg-bg-elevated border border-border-muted backdrop-blur-xl transition-all duration-200 active:scale-[0.98]"
                 >
-                    ← Back to courses
+                    <ArrowLeft size={14} />
+                    Back to courses
                 </button>
             </div>
         </div>
@@ -267,14 +268,14 @@ const LessonReader: React.FC<LessonReaderProps> = ({ courseId, initialLessonId, 
     return (
         <div className="min-h-full w-full flex flex-col bg-bg-primary text-text-primary">
             {/* Header — back / title, prev-next + completion on the right */}
-            <div className="shrink-0 border-b border-border-muted bg-bg-secondary/60 px-4 py-2.5">
+            <div className="shrink-0 border-b border-border-muted bg-bg-secondary px-4 py-2.5">
                 <div className="flex items-center gap-3">
                     <LiquidGlassButton type="button" variant="clear" className="-ml-1 lg-sm shrink-0 text-text-secondary" onClick={onBack} title="Back to courses" aria-label="Back to courses">
                         <ArrowLeft size={14} />
                     </LiquidGlassButton>
                     <div className="min-w-0 flex-1 leading-tight">
                         <p className="truncate text-[12px] text-text-secondary">{course.name}</p>
-                        <h1 className="truncate text-[15px] font-medium text-text-primary" title={current.title}>{current.title}</h1>
+                        <h1 className="truncate text-sm font-medium text-text-primary" title={current.title}>{current.title}</h1>
                     </div>
 
                     <span className="hidden shrink-0 whitespace-nowrap text-xs tabular-nums text-text-secondary sm:inline">
@@ -294,7 +295,7 @@ const LessonReader: React.FC<LessonReaderProps> = ({ courseId, initialLessonId, 
                         Open original
                     </LiquidGlassButton>
                     <button type="button" onClick={toggleComplete} aria-pressed={!!current.completedAt} title={current.completedAt ? 'Mark as not complete' : 'Mark as complete'}
-                        className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full border transition-colors focus-visible:ring-2 focus-visible:ring-accent-primary/40 ${current.completedAt ? 'border-accent-primary bg-accent-primary/15 text-accent-primary' : 'border-border-muted text-text-secondary hover:bg-bg-elevated hover:text-text-primary'}`}>
+                        className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full border transition-colors focus-visible:ring-2 focus-visible:ring-accent-focus ${current.completedAt ? 'border-accent-primary bg-accent-subtle text-accent-primary' : 'border-border-muted text-text-secondary hover:bg-bg-elevated hover:text-text-primary'}`}>
                         <Check size={13} strokeWidth={2.5} />
                     </button>
                 </div>
@@ -302,20 +303,20 @@ const LessonReader: React.FC<LessonReaderProps> = ({ courseId, initialLessonId, 
 
             {/* Body — left rail + center reading column */}
             <div className="flex min-h-0 flex-1">
-                <aside className="w-60 shrink-0 border-r border-border-muted bg-bg-secondary/40 overflow-y-auto px-3 py-3">
+                <aside className="w-60 shrink-0 border-r border-border-muted bg-bg-secondary overflow-y-auto px-3 py-3">
                     <input type="text" value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter lessons…"
-                        aria-label="Filter lessons" className="mb-2 w-full rounded-lg border border-border-subtle bg-bg-input px-2.5 py-1.5 text-[13px] text-text-primary placeholder:text-text-secondary outline-none focus:border-accent-secondary" />
+                        aria-label="Filter lessons" className="mb-2 w-full rounded-lg border border-border-subtle bg-bg-input px-2.5 py-1.5 text-xs text-text-primary placeholder:text-text-secondary outline-none focus:border-accent-secondary" />
                     {visibleLessons.length === 0 ? (
                         <p className="px-1 pb-2 pt-6 text-center text-xs text-text-secondary">No lessons match.</p>
                     ) : visibleLessons.map((l) => {
                         const active = l.id === activeId;
                         return (
                             <button key={l.id} type="button" onClick={() => setActiveId(l.id)} title={l.title}
-                                className={`mb-0.5 flex w-full items-center gap-1.5 rounded-lg py-1.5 pr-2 text-left transition-colors ${DEPTH_PL[depthOf(l.tocPath)]} ${active ? 'bg-bg-elevated/80' : 'hover:bg-bg-elevated/40'}`}>
-                                <span className={`flex shrink-0 items-center text-[11px] ${l.completedAt ? 'text-accent-primary' : 'text-transparent select-none'}`}><Check size={12} strokeWidth={3} /></span>
-                                <span className={`min-w-0 flex-1 truncate text-[13px] ${active ? 'font-medium text-text-primary' : 'text-text-secondary'}`}>{l.title}</span>
+                                className={`mb-0.5 flex w-full items-center gap-1.5 rounded-lg py-1.5 pr-2 text-left transition-colors ${DEPTH_PL[depthOf(l.tocPath)]} ${active ? 'bg-bg-elevated' : 'hover:bg-bg-elevated'}`}>
+                                <span className={`flex shrink-0 items-center ${l.completedAt ? 'text-accent-primary' : 'text-transparent select-none'}`}><Check size={12} strokeWidth={3} /></span>
+                                <span className={`min-w-0 flex-1 truncate text-xs ${active ? 'font-medium text-text-primary' : 'text-text-secondary'}`}>{l.title}</span>
                                 {l.kind !== 'lesson' && (
-                                    <span className="shrink-0 rounded-full border border-border-subtle bg-bg-elevated/60 px-1.5 py-0.5 text-[10px] uppercase tracking-wide leading-none text-text-secondary">{l.kind}</span>
+                                    <span className="shrink-0 rounded-full border border-border-subtle bg-bg-elevated px-1.5 py-0.5 text-[10px] uppercase tracking-wide leading-none text-text-secondary">{l.kind}</span>
                                 )}
                             </button>
                         );
@@ -323,7 +324,7 @@ const LessonReader: React.FC<LessonReaderProps> = ({ courseId, initialLessonId, 
                 </aside>
 
                 {/* Study rail — xl+ only; scope, progress and links computed above from the lesson list. */}
-                <div className="hidden xl:flex w-72 shrink-0 flex-col overflow-y-auto border-l border-border-muted bg-bg-secondary/40 p-3">
+                <div className="hidden xl:flex w-72 shrink-0 flex-col overflow-y-auto border-l border-border-muted bg-bg-secondary p-3">
                     <StudyRail courseId={courseId} scopeLessons={scopeLessons} progress={progress} externalLinks={externalLinks} />
                 </div>
 

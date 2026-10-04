@@ -99,7 +99,7 @@ function QuizPlayer({ questions, onExit }: QuizPlayerProps) {
             <div className="flex min-h-full w-full animate-fade-in-up motion-reduce:animate-none flex-col bg-bg-primary text-text-primary">
                 <div className="flex-1 overflow-y-auto px-5 py-6">
                     <h2 className="text-[15px] font-medium text-text-primary">Quiz results</h2>
-                    <p className="mt-3 text-[30px] font-semibold leading-none tabular-nums text-text-primary">{correctCount}/{runTotal} · {pct}%</p>
+                    <p className="mt-3 text-3xl font-semibold leading-none tabular-nums text-text-primary">{correctCount}/{runTotal} · {pct}%</p>
 
                     {missedEntries.length > 0 ? (
                         <div className="mt-5 space-y-2">

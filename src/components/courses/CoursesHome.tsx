@@ -472,7 +472,7 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
     const importControls = (
         <>
             {/* Only one import form renders at a time, so the static id is safe to share. */}
-            <label htmlFor="course-import-url" className="mb-1 block text-[11px] font-semibold uppercase tracking-wider text-text-secondary">
+            <label htmlFor="course-import-url" className="mb-1 block text-xs font-semibold uppercase tracking-wider text-text-secondary">
                 {t('Course URL')}
             </label>
             <input
@@ -518,7 +518,7 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
     );
 
     return (
-        <div className="h-full w-full flex flex-col bg-bg-primary text-text-primary font-sans overflow-hidden selection:bg-accent-secondary/30">
+        <div className="h-full w-full flex flex-col bg-bg-primary text-text-primary font-sans overflow-hidden selection:bg-accent-subtle">
             {/* Header (back + title) */}
             <section className={`${isLight ? 'bg-bg-secondary' : 'bg-bg-elevated'} px-8 pt-5 pb-6 border-b border-border-subtle shrink-0`}>
                 <div className="max-w-3xl mx-auto">
@@ -568,7 +568,7 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                     /* Premium notice — same pill-button language as the launcher CTAs. */
                     <div className="flex items-center justify-center px-8 pb-10 pt-6 min-h-full">
                         <div className={`w-full max-w-md rounded-2xl border p-8 text-center ${rowTone}`}>
-                            <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-accent-secondary/20">
+                            <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-accent-subtle">
                                 <GraduationCap size={22} className="text-text-primary" />
                             </div>
                             <h2 className="font-celeb text-xl font-medium text-text-primary">{t('Premium required')}</h2>
@@ -596,7 +596,7 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                 ) : courses.length === 0 ? (
                     <div className="flex items-center justify-center px-8 pb-10 pt-6 min-h-full">
                         <div className="w-full max-w-sm text-center">
-                            <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-accent-secondary/20">
+                            <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-accent-subtle">
                                 <GraduationCap size={22} className="text-text-primary" />
                             </div>
                             <p className="mt-3 text-sm leading-relaxed text-text-secondary">
