@@ -3470,6 +3470,9 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
     // 'auto' = detect vision support from the template; 'on'/'off' = explicit override.
     const [customVision, setCustomVision] = useState<'auto' | 'on' | 'off'>('auto');
     const [curlError, setCurlError] = useState<string | null>(null);
+    const [customBusy, setCustomBusy] = useState<'save' | 'delete' | null>(null);
+    const customMutationInFlight = useRef(false);
+    const customDraftId = useRef<string | null>(null);
 
     // --- Local (Ollama) ---
     const [ollamaModels, setOllamaModels] = useState<string[]>([]);
@@ -5122,6 +5125,8 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
     // --- Custom Provider Handlers ---
 
     const handleEditProvider = (provider: CustomProvider) => {
+        if (customMutationInFlight.current) return;
+        customDraftId.current = provider.id;
         setEditingProvider(provider);
         setCustomName(provider.name);
         setCustomCurl(provider.curlCommand);
@@ -5132,6 +5137,8 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
     };
 
     const handleNewProvider = () => {
+        if (customMutationInFlight.current) return;
+        customDraftId.current = null;
         setEditingProvider(null);
         setCustomName('');
         setCustomCurl('');
@@ -5141,58 +5148,94 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
         setCurlError(null);
     };
 
+    const customWriteFailureText = (result: { error?: string; message?: string } | null | undefined, action: 'save' | 'delete'): string =>
+        result?.error === 'credential_store_degraded'
+            ? (action === 'save'
+                ? t('Could not save the provider: your credential store is unavailable this session. Restart Natively and try again.')
+                : t('Could not delete the provider: your credential store is unavailable this session. Restart Natively and try again.'))
+            : (result?.message || result?.error || (action === 'save' ? t('Could not save the provider. Try again.') : t('Could not delete the provider. Try again.')));
+
     const handleSaveCustom = async () => {
+        if (customMutationInFlight.current) return;
+        customMutationInFlight.current = true;
+        setCustomBusy('save');
         setCurlError(null);
-        if (!customName.trim()) {
-            setCurlError(t("Provider Name is required."));
-            return;
-        }
-
-        const validation = validateCurl(customCurl);
-        if (!validation.isValid) {
-            setCurlError(validation.message || t("Invalid cURL command."));
-            return;
-        }
-
-        const newProvider: CustomProvider = {
-            id: editingProvider ? editingProvider.id : crypto.randomUUID(),
-            name: customName,
-            curlCommand: customCurl,
-            responsePath: customResponsePath,
-            // 'auto' → omit the flag so the backend auto-detects from the template.
-            ...(customVision === 'on' ? { multimodal: true } : customVision === 'off' ? { multimodal: false } : {}),
-        };
-
         try {
-            // @ts-ignore
-            const result = await window.electronAPI.saveCustomProvider(newProvider);
-            if (result.success) {
-                // Refresh list
-                // @ts-ignore
-                const updated = await window.electronAPI.getCustomProviders();
-                setCustomProviders(updated);
-                setIsEditingCustom(false);
-            } else {
-                setCurlError(result.error ?? null);
+            if (!customName.trim()) {
+                setCurlError(t("Provider Name is required."));
+                return;
             }
-        } catch (e: any) {
-            setCurlError(e.message);
+
+            const validation = validateCurl(customCurl);
+            if (!validation.isValid) {
+                setCurlError(validation.message || t("Invalid cURL command."));
+                return;
+            }
+
+            // Keep the same ID on retry if saving succeeded but refreshing failed.
+            const id = customDraftId.current ?? editingProvider?.id ?? crypto.randomUUID();
+            customDraftId.current = id;
+            const newProvider: CustomProvider = {
+                id,
+                name: customName.trim(),
+                curlCommand: customCurl,
+                responsePath: customResponsePath,
+                // 'auto' → omit the flag so the backend auto-detects from the template.
+                ...(customVision === 'on' ? { multimodal: true } : customVision === 'off' ? { multimodal: false } : {}),
+            };
+
+            const result = await window.electronAPI.saveCustomProvider(newProvider);
+            if (result?.success !== true) {
+                setCurlError(customWriteFailureText(result, 'save'));
+                return;
+            }
+            const updated = await window.electronAPI.getCustomProviders();
+            // Main can acknowledge even a credential-store refusal.
+            // Read-back catches unapplied writes, but cannot prove disk durability.
+            const saved = Array.isArray(updated) ? updated.find(p => p.id === id) : null;
+            if (!saved || saved.name !== newProvider.name || saved.curlCommand !== newProvider.curlCommand
+                || (saved.responsePath || '') !== newProvider.responsePath || saved.multimodal !== newProvider.multimodal) {
+                setCurlError(t('Could not confirm that the provider was saved. Your draft is still here. Check your credential store and try again.'));
+                return;
+            }
+            setCustomProviders(updated);
+            setIsEditingCustom(false);
+        } catch (e: unknown) {
+            setCurlError((e instanceof Error && e.message) || t('Could not save the provider. Try again.'));
+        } finally {
+            customMutationInFlight.current = false;
+            setCustomBusy(null);
         }
     };
 
-    const handleDeleteCustom = (id: string) => setPendingConfirm({ kind: 'customProvider', id });
+    const handleDeleteCustom = (id: string) => {
+        if (customMutationInFlight.current) return;
+        setCurlError(null);
+        setPendingConfirm({ kind: 'customProvider', id });
+    };
 
     const performDeleteCustom = async (id: string) => {
+        if (customMutationInFlight.current) return;
+        customMutationInFlight.current = true;
+        setCustomBusy('delete');
+        setCurlError(null);
         try {
-            // @ts-ignore
             const result = await window.electronAPI.deleteCustomProvider(id);
-            if (result.success) {
-                // @ts-ignore
-                const updated = await window.electronAPI.getCustomProviders();
-                setCustomProviders(updated);
+            if (result?.success !== true) {
+                setCurlError(customWriteFailureText(result, 'delete'));
+                return;
             }
-        } catch (e) {
-            console.error("Failed to delete provider:", e);
+            const updated = await window.electronAPI.getCustomProviders();
+            if (!Array.isArray(updated) || updated.some(p => p.id === id)) {
+                setCurlError(t('Could not confirm that the provider was deleted. Check your credential store and try again.'));
+                return;
+            }
+            setCustomProviders(updated);
+        } catch (e: unknown) {
+            setCurlError((e instanceof Error && e.message) || t('Could not delete the provider. Try again.'));
+        } finally {
+            customMutationInFlight.current = false;
+            setCustomBusy(null);
         }
     };
 
@@ -6560,14 +6603,14 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                     <div>
                         <div className="flex items-center gap-2 mb-1">
                             <h3 className="text-sm font-bold aip-hero">{t('Custom Providers')}</h3>
-                            <AipBadge tone="warn" label={t('Experimental')} />
                         </div>
-                        <p className="text-xs aip-muted">{t('Add your own AI endpoints via cURL.')}</p>
+                        <p className="text-xs aip-muted">{t('Connect LM Studio, other local servers, or OpenAI-compatible endpoints using a cURL template.')}</p>
                     </div>
                     <div className="flex items-center gap-2 shrink-0">
                         {!isEditingCustom && (
                             <button
                                 onClick={handleNewProvider}
+                                disabled={customBusy !== null}
                                 className="aip-btn"
                             >
                                 <Plus size={14} strokeWidth={1.75} /> {t('Add Provider')}
@@ -6584,8 +6627,19 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                     </div>
                 </div>
 
+                {curlError && (
+                    <div
+                        role="alert"
+                        className="flex items-start gap-2 p-3 rounded-lg text-xs aip-danger-fg"
+                        style={{ background: 'var(--aip-danger-bg)', border: '1px solid var(--aip-danger-border)' }}
+                    >
+                        <AlertCircle size={14} strokeWidth={1.75} className="shrink-0 mt-0.5" />
+                        <span>{curlError}</span>
+                    </div>
+                )}
+
                 {isEditingCustom ? (
-                    <div className="aip-card p-5 aip-panel-fade">
+                    <div className="aip-card p-5 aip-panel-fade" aria-busy={customBusy === 'save'}>
                         <h4 className="text-sm font-bold aip-hero mb-4">{editingProvider ? t('Edit Provider') : t('New Provider')}</h4>
 
                         <div className="space-y-4">
@@ -6594,6 +6648,7 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                                 <input
                                     type="text"
                                     value={customName}
+                                    disabled={customBusy !== null}
                                     onChange={(e) => setCustomName(e.target.value)}
                                     placeholder={t("My Custom LLM")}
                                     className="aip-input"
@@ -6605,6 +6660,7 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                                 <div className="relative">
                                     <textarea
                                         value={customCurl}
+                                        disabled={customBusy !== null}
                                         onChange={(e) => setCustomCurl(e.target.value)}
                                         placeholder={`curl https://api.openai.com/v1/chat/completions ... "content": "{{TEXT}}"`}
                                         data-mono="true"
@@ -6621,13 +6677,14 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                                 <input
                                     type="text"
                                     value={customResponsePath}
+                                    disabled={customBusy !== null}
                                     onChange={(e) => setCustomResponsePath(e.target.value)}
                                     placeholder={t("e.g. choices[0].message.content")}
                                     data-mono="true"
                                     className="aip-input"
                                 />
                                 <p className="text-[10px] aip-muted mt-1">
-                                    {t('Dot notation path to the answer text in the JSON response. If empty, the full JSON is returned.')}
+                                    {t('Dot notation path to the answer text in the JSON response. Leave empty to auto-detect common formats, including OpenAI-compatible and Ollama responses.')}
                                 </p>
                             </div>
 
@@ -6641,6 +6698,7 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                                     Undetectable was on. */}
                                 <AipSelect
                                     value={customVision}
+                                    disabled={customBusy !== null}
                                     onChange={(v) => setCustomVision(v as 'auto' | 'on' | 'off')}
                                     label={t('Screenshot / Vision Support')}
                                     options={[
@@ -6689,6 +6747,20 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                                                 </div>
                                             </div>
 
+                                            <div className="min-w-0">
+                                                <div className="aip-label mb-1.5">{t('Local (LM Studio / OpenAI-compatible)')}</div>
+                                                <p className="text-[10px] aip-muted mb-2">
+                                                    {t('Start the local server and replace local-model with the model loaded in your server. Adjust the URL and authentication headers for your endpoint.')}
+                                                </p>
+                                                <div className="aip-well aip-scroll-x p-2.5 min-w-0">
+                                                    <code className="aip-mono whitespace-pre block">
+                                                        {`curl http://localhost:1234/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"local-model","messages":[{"role":"user","content":"{{TEXT}}"}]}'`}
+                                                    </code>
+                                                </div>
+                                            </div>
+
                                             {/* OpenAI Example */}
                                             <div className="min-w-0">
                                                 <div className="aip-label mb-1.5">{t('OpenAI Compatible')}</div>
@@ -6713,19 +6785,14 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                                 </div>
                             </div>
 
-                            {curlError && (
-                                <div
-                                    className="flex items-start gap-2 p-3 rounded-lg text-xs aip-danger-fg"
-                                    style={{ background: 'var(--aip-danger-bg)', border: '1px solid var(--aip-danger-border)' }}
-                                >
-                                    <AlertCircle size={14} strokeWidth={1.75} className="shrink-0 mt-0.5" />
-                                    <span>{curlError}</span>
-                                </div>
-                            )}
-
                             <div className="flex justify-end gap-2 pt-2">
                                 <button
-                                    onClick={() => setIsEditingCustom(false)}
+                                    onClick={() => {
+                                        if (customMutationInFlight.current) return;
+                                        setIsEditingCustom(false);
+                                        setCurlError(null);
+                                    }}
+                                    disabled={customBusy !== null}
                                     className="aip-btn"
                                     data-variant="ghost"
                                 >
@@ -6733,10 +6800,12 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                                 </button>
                                 <button
                                     onClick={handleSaveCustom}
+                                    disabled={customBusy !== null}
                                     className="aip-btn"
                                     data-variant="accent"
                                 >
-                                    <Save size={14} strokeWidth={1.75} /> {t('Save Provider')}
+                                    {customBusy === 'save' ? <Loader2 size={14} strokeWidth={1.75} className="animate-spin" /> : <Save size={14} strokeWidth={1.75} />}
+                                    {customBusy === 'save' ? t('Saving…') : t('Save Provider')}
                                 </button>
                             </div>
                         </div>
@@ -6757,7 +6826,7 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                                         <div className="min-w-0">
                                             <h4 className="aip-card-title truncate">{provider.name}</h4>
                                             <p className="aip-mono aip-muted truncate max-w-[240px]">
-                                                {provider.curlCommand.substring(0, 30)}...
+                                                {t('cURL command hidden (may contain credentials)')}
                                             </p>
                                             {provider.responsePath && (
                                                 <p className="aip-meta truncate mt-0.5">
@@ -6771,6 +6840,7 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                                     <div className="aip-row-actions flex items-center gap-1 shrink-0">
                                         <button
                                             onClick={() => handleEditProvider(provider)}
+                                            disabled={customBusy !== null}
                                             className="aip-btn"
                                             data-icon="true"
                                             data-variant="ghost"
@@ -6780,6 +6850,7 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                                         </button>
                                         <button
                                             onClick={() => handleDeleteCustom(provider.id)}
+                                            disabled={customBusy !== null}
                                             className="aip-btn"
                                             data-icon="true"
                                             data-variant="danger-ghost"

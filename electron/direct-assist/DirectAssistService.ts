@@ -9,6 +9,7 @@ import {
 import { prepareDirectAssistPrompt } from './requestBuilder';
 import type { FallbackConfig, HealthEntry, StreamProvider } from '../llm/streamFallbackEngine';
 import { runStreamingFallback } from '../llm/streamFallbackEngine';
+import { providerStreamPolicy, type ProviderStreamPolicy } from '../llm/providerStreamPolicy';
 import { DIRECT_ASSIST_LADDER_INELIGIBLE_PROVIDERS } from './types';
 import type {
   DirectAssistAttemptFailure,
@@ -31,10 +32,11 @@ export interface DirectAssistTimerScheduler {
 }
 
 export interface DirectAssistServiceOptions {
+  /** An explicit caller silence budget takes precedence over provider activity. */
   readonly streamIdleTimeoutMs?: number;
   /** Injectable only so timeout/reset behavior can be tested without real sleeps. */
   readonly timerScheduler?: DirectAssistTimerScheduler;
-  /** Injectable clock for the whole-ladder budget. */
+  /** Injectable clock for the ladder budget and provider activity watchdog. */
   readonly now?: () => number;
   /** Injectable backoff sleeper, handed straight to the engine. */
   readonly sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
@@ -42,7 +44,8 @@ export interface DirectAssistServiceOptions {
    * Engine tuning overrides. Injectable ONLY so a test can drive the engine's
    * own per-attempt guards (ttftTimeoutMs, interChunkTimeoutMs, cleanupTimeoutMs)
    * without waiting 35 real seconds. Production passes nothing and gets
-   * DEFAULT_DIRECT_ASSIST_FALLBACK_CONFIG. `rethrowAfterCommit` and
+   * DEFAULT_DIRECT_ASSIST_FALLBACK_CONFIG unless the stream publishes local
+   * timing. Explicit guard overrides still take precedence. `rethrowAfterCommit` and
    * `hedgeEnabled` are pinned after this spread and cannot be overridden — they
    * are this feature's contract, not tuning.
    */
@@ -74,6 +77,7 @@ const rungIdOf = (rung: DirectAssistRung): string => `${rung.provider}:${rung.mo
  */
 export class DirectAssistService {
   private readonly streamIdleTimeoutMs: number;
+  private readonly callerIdleBudget: boolean;
   private readonly timerScheduler: DirectAssistTimerScheduler;
   private readonly now: () => number;
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
@@ -112,7 +116,8 @@ export class DirectAssistService {
     options: DirectAssistServiceOptions = {},
   ) {
     const configuredTimeout = options.streamIdleTimeoutMs;
-    this.streamIdleTimeoutMs = Number.isFinite(configuredTimeout) && Number(configuredTimeout) > 0
+    this.callerIdleBudget = Number.isFinite(configuredTimeout) && Number(configuredTimeout) > 0;
+    this.streamIdleTimeoutMs = this.callerIdleBudget
       ? Math.floor(Number(configuredTimeout))
       : DEFAULT_DIRECT_ASSIST_STREAM_IDLE_TIMEOUT_MS;
     this.timerScheduler = options.timerScheduler ?? SYSTEM_TIMER_SCHEDULER;
@@ -132,6 +137,10 @@ export class DirectAssistService {
     let providerIterator: AsyncIterator<string, void, unknown> | null = null;
     let idleTimer: unknown;
     let idleTimedOut = false;
+    let activePolicy: ProviderStreamPolicy | undefined;
+    let attemptStartedAt = 0;
+    let lastVisibleAt: number | undefined;
+    let localProviderError: unknown;
     let onExternalAbort: (() => void) | null = null;
     let onDispatchAbort: (() => void) | null = null;
     // Hoisted: the catch has to distinguish an exhausted ladder budget from an
@@ -187,18 +196,46 @@ export class DirectAssistService {
         'The selected provider stopped returning data before the answer completed.',
         true,
       );
+      let watchdogError = idleError;
       let idlePromise: Promise<never>;
+      const localRemaining = () => {
+        if (!activePolicy) return this.streamIdleTimeoutMs;
+        const now = this.now();
+        const total = activePolicy.firstUsefulDeadlineMs - (now - attemptStartedAt);
+        // A caller's explicit silence budget remains based on visible deltas.
+        // Otherwise provider activity includes hidden reasoning, never answer text.
+        const activityAt = this.callerIdleBudget
+          ? lastVisibleAt ?? attemptStartedAt
+          : Math.max(lastVisibleAt ?? -Infinity, activePolicy.lastActivityAt ?? -Infinity);
+        const idle = Number.isFinite(activityAt)
+          ? (this.callerIdleBudget ? this.streamIdleTimeoutMs : activePolicy.interTokenStallMs) - (now - activityAt)
+          : total; // no first byte yet: bounded local model warmup
+        return Math.min(total, idle);
+      };
       const armIdleWatchdog = () => {
         if (idleTimer !== undefined) this.timerScheduler.clear(idleTimer);
         idlePromise = new Promise<never>((_resolve, reject) => {
-          idleTimer = this.timerScheduler.set(() => {
+          const check = () => {
+            const remaining = activePolicy ? localRemaining() : 0;
+            if (activePolicy && remaining > 0) {
+              // Activity can advance while the SAME next() is pending. Check
+              // without issuing another read or restarting the provider request.
+              idleTimer = this.timerScheduler.set(check, Math.min(remaining, activePolicy.interTokenStallMs));
+              return;
+            }
+            if (activePolicy && this.now() - attemptStartedAt >= activePolicy.firstUsefulDeadlineMs) {
+              watchdogError = new DirectAssistError('CONNECT_TIMEOUT', 'The selected provider did not complete the answer within its time limit.', true);
+            }
             idleTimedOut = true;
-            // Reject the local race even if an adapter ignores AbortSignal, and
-            // abort the in-flight provider request so cooperative adapters
-            // release their socket/process immediately.
-            reject(idleError);
-            if (!dispatchController?.signal.aborted) dispatchController?.abort(idleError);
-          }, this.streamIdleTimeoutMs);
+            // Reject even if an adapter ignores AbortSignal, then release the
+            // cooperative adapter's socket/process immediately.
+            reject(watchdogError);
+            if (!dispatchController?.signal.aborted) dispatchController?.abort(watchdogError);
+          };
+          const delay = activePolicy
+            ? Math.min(localRemaining(), activePolicy.interTokenStallMs)
+            : this.streamIdleTimeoutMs;
+          idleTimer = this.timerScheduler.set(check, Math.max(1, delay));
         });
         // DEFUSE. A re-arm now happens mid-await (on rung open), so the read
         // loop's in-flight race may still be holding the PREVIOUS promise when
@@ -280,6 +317,10 @@ export class DirectAssistService {
         ...this.fallbackConfigOverrides,
         hedgeEnabled: false,
         rethrowAfterCommit: true,
+        // An accepted selected-local generation is never replayed or rescued
+        // through another provider, including when it fails before visible text.
+        stopChainOnError: (error, kind) => Boolean(activePolicy)
+          || Boolean(this.fallbackConfigOverrides.stopChainOnError?.(error, kind)),
       };
 
       // The whole-ladder ceiling, expressed as a signal so the engine — which
@@ -332,7 +373,7 @@ export class DirectAssistService {
         maxAttempts: rung.isFallback || DIRECT_ASSIST_LADDER_INELIGIBLE_PROVIDERS.includes(rung.provider)
           ? DIRECT_ASSIST_FALLBACK_MAX_ATTEMPTS
           : DIRECT_ASSIST_SELECTED_MAX_ATTEMPTS,
-        open: async function* (signal: AbortSignal): AsyncGenerator<string, void, unknown> {
+        open: (signal: AbortSignal): AsyncGenerator<string, void, unknown> => {
           if (budgetExhausted()) {
             // The engine sees its abortSignal aborted and ends the ladder
             // quietly rather than classifying this as a provider failure.
@@ -344,43 +385,60 @@ export class DirectAssistService {
           reasonFromThrow = null;
           failureFromThrow = null;
           lastAttemptSignal = signal;
-          // Re-arm the outer silence guard on every rung AND every retry. It is
-          // armed once before the ladder starts, and re-arming only on a delta
-          // made it cap the whole pre-first-token WALK rather than one attempt:
-          // two 30s vision connect ceilings exceed the 45s window, so it fired
-          // and the ladder never opened rung 1 — inert for precisely the case
-          // fallbackConfig.ts says this feature exists to fix. Pre-commit
-          // silence is the engine's ttftTimeoutMs (35s); this is the 45s
-          // post-commit silence guard the deadline hierarchy intends.
-          armIdleWatchdog();
-          let delivered = false;
+          activePolicy = undefined;
+          localProviderError = undefined;
+          attemptStartedAt = this.now();
+          lastVisibleAt = undefined;
+          let upstream: AsyncGenerator<string, void, unknown>;
           try {
-            for await (const chunk of transport.streamDirectAssist(dispatchRequest, signal, rung)) {
-              if (typeof chunk === 'string' && chunk.length > 0) delivered = true;
-              yield chunk;
-            }
-            if (!delivered) {
-              // Raise the service's own INCOMPLETE_STREAM rather than letting
-              // the engine's internal `empty-stream` sentinel reach the user as
-              // a generic PROVIDER_ERROR. Thrown, not returned, so an empty rung
-              // is retried and walked past like any other pre-commit failure.
-              throw new DirectAssistError(
-                'INCOMPLETE_STREAM',
-                'The selected provider ended the stream without returning an answer.',
-                true,
-              );
-            }
+            upstream = transport.streamDirectAssist(dispatchRequest, signal, rung);
+            const policy = providerStreamPolicy(upstream);
+            if (policy && Number.isFinite(policy.firstUsefulDeadlineMs) && policy.firstUsefulDeadlineMs > 0
+              && Number.isFinite(policy.interTokenStallMs) && policy.interTokenStallMs > 0) activePolicy = policy;
           } catch (error) {
-            // An ABORTED attempt was ended by the engine's own per-attempt
-            // guard, not by the provider, and whatever the generator throws on
-            // its way out of that abort is debris. Leave those to
-            // switchReason(), which reads the signal instead.
-            if (!signal.aborted) {
-              reasonFromThrow = normalizeDirectAssistError(error).code;
-              failureFromThrow = describeDirectAssistFailure(error, { echoOf });
-            }
-            throw error;
+            // Keep synchronous open failures inside the engine's normal
+            // classification/retry path, just like iterator failures.
+            upstream = (async function* () { throw error; })();
           }
+          // open() is synchronous: publish timing BEFORE the engine arms TTFT.
+          // Only one attempt is live (hedging is pinned off). Restore defaults
+          // per rung so a local policy cannot leak into a later cloud attempt.
+          engineConfig.ttftTimeoutMs = activePolicy
+            ? Math.min(activePolicy.firstUsefulDeadlineMs, this.fallbackConfigOverrides.ttftTimeoutMs ?? activePolicy.firstUsefulDeadlineMs)
+            : this.fallbackConfigOverrides.ttftTimeoutMs ?? DEFAULT_DIRECT_ASSIST_FALLBACK_CONFIG.ttftTimeoutMs;
+          engineConfig.interChunkTimeoutMs = activePolicy
+            ? Math.min(activePolicy.firstUsefulDeadlineMs, this.fallbackConfigOverrides.interChunkTimeoutMs ?? activePolicy.firstUsefulDeadlineMs)
+            : this.fallbackConfigOverrides.interChunkTimeoutMs ?? DEFAULT_DIRECT_ASSIST_FALLBACK_CONFIG.interChunkTimeoutMs;
+          // Local activity/total ceilings are owned by the watchdog, not the
+          // engine's visible-only stall guard. Explicit engine budgets still win.
+          armIdleWatchdog();
+          return (async function* () {
+            let delivered = false;
+            try {
+              for await (const chunk of upstream) {
+                if (typeof chunk === 'string' && chunk.length > 0) delivered = true;
+                yield chunk;
+              }
+              if (!delivered) {
+                // Raise the service's own INCOMPLETE_STREAM rather than letting
+                // the engine's internal `empty-stream` sentinel reach the user.
+                throw new DirectAssistError(
+                  'INCOMPLETE_STREAM',
+                  'The selected provider ended the stream without returning an answer.',
+                  true,
+                );
+              }
+            } catch (error) {
+              // An aborted attempt was ended by a guard; errors on its way out
+              // are debris. switchReason() reads that signal instead.
+              if (!signal.aborted) {
+                reasonFromThrow = normalizeDirectAssistError(error).code;
+                failureFromThrow = describeDirectAssistFailure(error, { echoOf });
+                if (activePolicy) localProviderError = error;
+              }
+              throw error;
+            }
+          })();
         },
       }));
 
@@ -440,7 +498,7 @@ export class DirectAssistService {
       providerIterator = providerStream[Symbol.asyncIterator]();
 
       while (true) {
-        if (idleTimedOut) throw idleError;
+        if (idleTimedOut) throw watchdogError;
         if (abortSignal?.aborted) break;
         let item: IteratorResult<string, void>;
         try {
@@ -457,7 +515,7 @@ export class DirectAssistService {
             dispatchAbortPromise,
           ]);
         } catch (error) {
-          if (idleTimedOut) throw idleError;
+          if (idleTimedOut) throw watchdogError;
           throw error;
         }
         if (item.done) break;
@@ -472,8 +530,9 @@ export class DirectAssistService {
           yield switchEvent;
         }
         sequence += 1;
-        // A useful provider delta is the sole heartbeat. Empty chunks do not
-        // extend a stream indefinitely.
+        // Cloud/default streams still heartbeat only on useful deltas; local
+        // streams also expose hidden activity but retain a fixed total ceiling.
+        lastVisibleAt = this.now();
         armIdleWatchdog();
         yield Object.freeze({
           type: 'delta',
@@ -527,7 +586,7 @@ export class DirectAssistService {
       const outOfTime = budgetExpired && sequence === 0;
       const normalized = outOfTime
         ? new DirectAssistError('CONNECT_TIMEOUT', 'No provider answered in time.', true)
-        : normalizeDirectAssistError(error);
+        : normalizeDirectAssistError(localProviderError ?? error);
       if (normalized.code === 'CANCELLED') {
         yield Object.freeze({ type: 'cancel', requestId, sequence });
         return Object.freeze({ state: 'cancelled', chunks: sequence });
@@ -539,12 +598,12 @@ export class DirectAssistService {
       // one provider, say what each of them did. One provider is the error
       // itself; a cut-off answer already announced its switches.
       const lastRung = sequence === 0
-        ? describeActiveRung?.(idleTimedOut ? 'STREAM_IDLE_TIMEOUT' : undefined) ?? null
+        ? describeActiveRung?.(idleTimedOut ? normalizeDirectAssistError(error).code : undefined) ?? null
         : null;
       const attempts = sequence === 0 ? [...abandonedRungs, ...(lastRung ? [lastRung] : [])] : [];
       const payload: DirectAssistErrorPayload = Object.freeze({
         ...normalized.toPayload(),
-        ...(outOfTime || idleTimedOut ? {} : describeDirectAssistFailure(error, { echoOf })),
+        ...(outOfTime || idleTimedOut ? {} : describeDirectAssistFailure(localProviderError ?? error, { echoOf })),
         ...(attempts.length > 1 ? { attempts: Object.freeze(attempts) } : {}),
       });
       yield Object.freeze({

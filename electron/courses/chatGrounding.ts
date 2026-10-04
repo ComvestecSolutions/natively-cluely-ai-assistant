@@ -22,7 +22,7 @@ export interface CourseSqlDb {
 
 /** Structural view of CourseStore — only what candidate selection reads. */
 export interface CourseStoreLike {
-  listCourses(): Array<{ id: string; enabled: boolean }>;
+  listCourses(): Array<{ id: string; enabled: boolean; name?: string; sourceUrl?: string; status?: string }>;
 }
 
 // vector floor; see plan §auto-grounding
@@ -105,6 +105,13 @@ export function createCourseVectorSearch(
   };
 }
 
+/** Use the existing reference-file privacy/scrubbing contract on every chat path. */
+export function courseGroundingAsReference(block: string | null): string | null {
+  if (!block) return null;
+  const escaped = block.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return `<reference_file source="courses">\n${escaped}\n</reference_file>`;
+}
+
 const GROUNDING_HEADER =
   'RELATED COURSE MATERIAL — ground truth for this conversation (prefer these over model memory; cite the Source URLs when answering)';
 
@@ -116,13 +123,15 @@ export async function buildCourseGroundedBlock(opts: {
   pipeline?: PipelineLike | null;
 }): Promise<string | null> {
   try {
+    const courses = opts.storeLike.listCourses();
+    const byId = new Map(courses.map((course) => [course.id, course]));
     const seen = new Set<string>();
     const candidates: string[] = [];
     for (const id of [
       ...(opts.pinnedCourseIds ?? []),
-      ...opts.storeLike.listCourses().filter((course) => course.enabled).map((course) => course.id),
+      ...courses.filter((course) => course.enabled).map((course) => course.id),
     ]) {
-      if (!seen.has(id)) {
+      if (byId.has(id) && !seen.has(id)) {
         seen.add(id);
         candidates.push(id);
       }
@@ -133,7 +142,7 @@ export async function buildCourseGroundedBlock(opts: {
       ? await opts.pipeline.getEmbeddingForQuery(opts.message, { retryBudgetMs: 250 }).catch(() => null)
       : null;
 
-    let rows: CourseEvidence[];
+    let rows: CourseEvidence[] = [];
     try {
       const searchOptions: SearchCoursesOptions = {
         db: opts.db as SearchCoursesOptions['db'], // structural handle; runtime value is the real Database.
@@ -147,10 +156,34 @@ export async function buildCourseGroundedBlock(opts: {
       }
       rows = await searchCourses(searchOptions);
     } catch {
-      return null;
+      // A missing/broken index must not make a pinned course disappear.
     }
-    if (rows.length === 0) return null;
 
+    // Reserve identity for each candidate BEFORE excerpts can consume the budget.
+    // No lexical/vector hit is not evidence of an empty course. Keep its citation
+    // and explicitly name the gap instead of dumping unrelated lesson bodies.
+    const withinBudget = (text: string): boolean =>
+      estimateTokens(courseGroundingAsReference(text) ?? '') <= COURSE_GROUNDED_TOKEN_BUDGET;
+    let acc = GROUNDING_HEADER;
+    for (const id of candidates) {
+      const course = byId.get(id)!;
+      const metadata = [
+        `### Course: ${(course.name || id).slice(0, 160)}`,
+        ...(course.sourceUrl && course.sourceUrl.length <= 2048
+          ? [`Source URL: ${course.sourceUrl}`]
+          : course.sourceUrl ? ['Source URL omitted: exceeds context budget.'] : []),
+        ...(course.status ? [`Import status: ${course.status.slice(0, 40)}`] : []),
+        ...(!rows.some((row) => row.courseId === id)
+          ? ['No matching lesson excerpt for this question; do not infer lesson facts from course metadata.']
+          : []),
+      ].join('\n');
+      const next = `${acc}\n\n${metadata}`;
+      if (!withinBudget(next)) break;
+      acc = next;
+    }
+
+    // Prioritize pinned courses while retaining query-ranked excerpts within each course.
+    rows.sort((a, b) => candidates.indexOf(a.courseId) - candidates.indexOf(b.courseId));
     // CourseEvidence carries no course title (retrieval.ts), so headings use lesson + path only.
     const sections: Array<{ head: string; bodyLines: string[] }> = rows.map((row) => ({
       head: [
@@ -160,34 +193,27 @@ export async function buildCourseGroundedBlock(opts: {
       bodyLines: row.text.split('\n'),
     }));
 
-    // Budget: whole sections while they fit; on first overflow cut that section's text at the last
-    // newline inside budget, append …, and skip everything after it. Nothing fits → null.
-    let acc = GROUNDING_HEADER;
+    // Include whole relevant sections where possible. Fit even a single long line
+    // on overflow, reserving the ellipsis inside the same strict token ceiling.
     for (let i = 0; i < sections.length; i++) {
       const section = sections[i];
       const fullBody = section.bodyLines.join('\n');
       const candidate = `${acc}\n\n${section.head}\n${fullBody}`;
-      if (estimateTokens(candidate) <= COURSE_GROUNDED_TOKEN_BUDGET) {
+      if (withinBudget(candidate)) {
         acc = candidate;
         continue;
       }
 
-      let current = `${acc}\n\n${section.head}`;
-      if (estimateTokens(current) > COURSE_GROUNDED_TOKEN_BUDGET) {
-        if (i === 0) return null; // nothing fits under header + budget
-        break;
+      const prefix = `${acc}\n\n${section.head}\n`;
+      if (!withinBudget(`${prefix}…`)) break;
+      let low = 0;
+      let high = fullBody.length;
+      while (low < high) {
+        const mid = Math.ceil((low + high) / 2);
+        if (withinBudget(`${prefix}${fullBody.slice(0, mid)}…`)) low = mid;
+        else high = mid - 1;
       }
-      for (const line of section.bodyLines) {
-        const next = `${current}\n${line}`;
-        if (estimateTokens(next) > COURSE_GROUNDED_TOKEN_BUDGET) break;
-        current = next;
-      }
-      if (current !== `${acc}\n\n${section.head}` || i > 0) {
-        // Heading-only still counts as the truncated section: append … and stop.
-        acc = `${current}…`;
-      } else {
-        return null; // first section overflows with not even one line of chunk text
-      }
+      acc = `${prefix}${fullBody.slice(0, low)}…`;
       break;
     }
 

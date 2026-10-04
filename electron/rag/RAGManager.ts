@@ -4,6 +4,8 @@
 
 import Database from 'better-sqlite3';
 import { LLMHelper } from '../LLMHelper';
+import { courseGroundingAsReference } from '../courses/chatGrounding';
+import { providerStreamPolicy, type ProviderStreamPolicy } from '../llm/providerStreamPolicy';
 import { preprocessTranscript, RawSegment } from './TranscriptPreprocessor';
 import { chunkTranscript } from './SemanticChunker';
 import { VectorStore } from './VectorStore';
@@ -38,39 +40,72 @@ const RAG_STREAM_STALL_MS = 15_000;
  */
 export const RAG_STREAM_INCOMPLETE_CODA = '\n\n_(Answer incomplete — the model stream ended early.)_';
 
-async function* raceGeneratorWithDeadline(
+export async function* raceGeneratorWithDeadline(
     stream: AsyncGenerator<string, void, unknown>,
     stallMs: number,
+    controller: AbortController,
+    abortSignal?: AbortSignal,
+    onProviderPolicy?: (policy: ProviderStreamPolicy) => void,
 ): AsyncGenerator<string, void, unknown> {
+    const policy = providerStreamPolicy(stream);
+    const startedAt = Date.now();
+    const totalMs = policy ? Math.min(policy.firstUsefulDeadlineMs, 300_000) : undefined;
+    let lastTokenAt = startedAt;
+    let useful = false;
+    let completed = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const DEADLINE = Symbol('rag-stream-deadline');
+    const ABORTED = Symbol('rag-stream-aborted');
+    let cancel!: () => void;
+    const cancelled = new Promise<typeof ABORTED>(resolve => { cancel = () => resolve(ABORTED); });
+    const signals = [...new Set([abortSignal, policy?.signal, controller.signal].filter((s): s is AbortSignal => !!s))];
+    const onAbort = () => { controller.abort(); cancel(); };
+    for (const signal of signals) signal.addEventListener('abort', onAbort, { once: true });
     try {
+        if (signals.some(signal => signal.aborted)) onAbort();
+        if (!controller.signal.aborted && policy) onProviderPolicy?.(policy);
         while (true) {
-            let timer: ReturnType<typeof setTimeout> | undefined;
-            const deadline = new Promise<typeof DEADLINE>((resolve) => {
-                timer = setTimeout(() => resolve(DEADLINE), stallMs);
+            if (controller.signal.aborted) throw Object.assign(new Error('Query cancelled'), { name: 'AbortError' });
+            const pullStartedAt = Date.now();
+            const remaining = () => {
+                if (!policy) return stallMs - (Date.now() - pullStartedAt);
+                const totalRemaining = totalMs! - (Date.now() - startedAt);
+                if (!useful) return totalRemaining;
+                const activityAt = Math.max(lastTokenAt, policy.lastActivityAt ?? lastTokenAt);
+                return Math.min(totalRemaining, policy.interTokenStallMs - (Date.now() - activityAt));
+            };
+            const deadline = new Promise<typeof DEADLINE>(resolve => {
+                const check = () => {
+                    const ms = remaining();
+                    if (ms <= 0) resolve(DEADLINE);
+                    else timer = setTimeout(check, ms);
+                };
+                check();
             });
+            // Activity may re-arm the timer, but must never issue a second pull.
             const nextP = stream.next();
-            // Defuse: if the deadline wins, nextP is still pending and unobserved —
-            // when the hung provider's request later settles it must not surface as
-            // an unhandledRejection (fatal in Electron main).
-            nextP.catch(() => { /* loser of the race — defused */ });
-            const res = await Promise.race([nextP, deadline]);
-            if (timer) clearTimeout(timer);
+            nextP.catch(() => { /* defuse the losing, still-pending pull */ });
+            let res: IteratorResult<string, void> | typeof DEADLINE | typeof ABORTED;
+            try { res = await Promise.race([nextP, deadline, cancelled]); }
+            finally { if (timer !== undefined) clearTimeout(timer); timer = undefined; }
+            if (res === ABORTED) throw Object.assign(new Error('Query cancelled'), { name: 'AbortError' });
             if (res === DEADLINE) {
-                console.warn(`[RAGManager] Stream stalled for ${stallMs}ms — aborting.`);
-                try { const p = stream.return?.(undefined); if (p && typeof (p as any).then === 'function') (p as Promise<unknown>).catch(() => {}); } catch { /* already closed */ }
-                return;
+                const totalExpired = totalMs !== undefined && Date.now() - startedAt >= totalMs;
+                throw new Error(totalExpired ? `Model request timed out after ${totalMs}ms` : 'Model stream stalled — please try again.');
             }
-            if (res.done) return;
-            // TS cannot discriminate the IteratorResult union through the
-            // Promise.race with the DEADLINE symbol, so `res.value` widens to
-            // `string | void` despite the `done` check above. The check makes
-            // the cast sound: a non-done result's value is the yielded string.
-            yield res.value as string;
+            if (res.done) { completed = true; return; }
+            lastTokenAt = Date.now();
+            if (res.value.trim()) useful = true;
+            yield res.value;
         }
-    } catch (e) {
-        try { const p = stream.return?.(undefined); if (p && typeof (p as any).then === 'function') (p as Promise<unknown>).catch(() => {}); } catch { /* already closed */ }
-        throw e;
+    } finally {
+        if (timer !== undefined) clearTimeout(timer);
+        for (const signal of signals) signal.removeEventListener('abort', onAbort);
+        if (!completed) {
+            // return() alone cannot interrupt a generator parked in fetch/read.
+            controller.abort();
+            try { stream.return?.(undefined)?.catch(() => {}); } catch { /* already closed */ }
+        }
     }
 }
 
@@ -294,11 +329,15 @@ export class RAGManager {
     async *queryMeeting(
         meetingId: string,
         query: string,
-        abortSignal?: AbortSignal
+        abortSignal?: AbortSignal,
+        courseGrounding?: string | null,
+        onProviderPolicy?: (policy: ProviderStreamPolicy) => void,
     ): AsyncGenerator<string, void, unknown> {
         if (!this.llmHelper) {
             throw new Error('LLM helper not initialized');
         }
+
+        if (abortSignal?.aborted) return;
 
         // Check if meeting has embeddings (post-meeting RAG)
         const hasEmbeddings = this.vectorStore.hasEmbeddings(meetingId);
@@ -317,6 +356,7 @@ export class RAGManager {
 
         // Retrieve relevant context
         const context = await this.retriever.retrieve(query, { meetingId });
+        if (abortSignal?.aborted) return;
 
         if (context.chunks.length === 0) {
             // No context relevant to query - trigger wrapper fallback to use context window
@@ -324,13 +364,20 @@ export class RAGManager {
         }
 
         // Build prompt with intent hint
-        const prompt = buildRAGPrompt(query, context.formattedContext, 'meeting', context.intent);
+        const prompt = buildRAGPrompt(query, 'Read the meeting excerpts supplied in CONTEXT, along with any course ground truth.', 'meeting', context.intent)
+            + (courseGrounding ? '\nCourse ground truth is also authoritative evidence. Prefer it over model memory and cite its Source URLs; never attribute course facts to the meeting.' : '');
+        const evidence = [context.formattedContext, courseGroundingAsReference(courseGrounding ?? null)].filter(Boolean).join('\n\n');
 
-        // Stream response
-        const streamOutcome: { incomplete?: boolean } = {};
-        const stream = this.llmHelper.streamChatWithGemini(prompt, undefined, undefined, true, undefined, streamOutcome);
+        // Snapshot the selected model, without Background Model or tier routing.
+        // Keep evidence out of the system prompt for the shared privacy gate.
+        const controller = new AbortController();
+        const { stream, outcome: streamOutcome } = this.llmHelper.streamRAGAnswer(
+            query, undefined, evidence, prompt, true, true,
+            courseGrounding ? ['transcript', 'reference_files'] : ['transcript'],
+            controller.signal, undefined, { v3Owned: true },
+        );
 
-        for await (const chunk of raceGeneratorWithDeadline(stream, RAG_STREAM_STALL_MS)) {
+        for await (const chunk of raceGeneratorWithDeadline(stream, RAG_STREAM_STALL_MS, controller, abortSignal, onProviderPolicy)) {
             if (abortSignal?.aborted) break;
             yield chunk;
         }
@@ -341,7 +388,7 @@ export class RAGManager {
         // entered conversation state. The coda makes the truncation VISIBLE
         // in the rendered/persisted answer (skipped on user abort — that is
         // a cancellation, not a truncation).
-        if (streamOutcome.incomplete && !abortSignal?.aborted) {
+        if (streamOutcome.truncated && !abortSignal?.aborted) {
             yield RAG_STREAM_INCOMPLETE_CODA;
         }
     }
@@ -351,14 +398,18 @@ export class RAGManager {
      */
     async *queryGlobal(
         query: string,
-        abortSignal?: AbortSignal
+        abortSignal?: AbortSignal,
+        courseGrounding?: string | null,
+        onProviderPolicy?: (policy: ProviderStreamPolicy) => void,
     ): AsyncGenerator<string, void, unknown> {
         if (!this.llmHelper) {
             throw new Error('LLM helper not initialized');
         }
 
+        if (abortSignal?.aborted) return;
         // Retrieve from all meetings
         const context = await this.retriever.retrieveGlobal(query);
+        if (abortSignal?.aborted) return;
 
         // ALWAYS ANSWER (2026-09-07, owner's direction): an empty global search
         // used to yield NO_GLOBAL_CONTEXT_FALLBACK with no model call — the
@@ -370,13 +421,19 @@ export class RAGManager {
             : context.formattedContext;
 
         // Build prompt with intent hint
-        const prompt = buildRAGPrompt(query, formatted, 'global', context.intent);
+        const prompt = buildRAGPrompt(query, 'Read meeting excerpts supplied in CONTEXT. Prefer supplied course ground truth over model memory and cite its Source URLs; never attribute course facts to a meeting.', 'global', context.intent);
+        const evidence = [formatted, courseGroundingAsReference(courseGrounding ?? null)].filter(Boolean).join('\n\n');
 
-        // Stream response
-        const streamOutcome: { incomplete?: boolean } = {};
-        const stream = this.llmHelper.streamChatWithGemini(prompt, undefined, undefined, true, undefined, streamOutcome);
+        // Use the selected model, not the legacy Gemini tier list or Background
+        // Model. The helper retains chat's scope gates, filters and outcome.
+        const controller = new AbortController();
+        const { stream, outcome: streamOutcome } = this.llmHelper.streamRAGAnswer(
+            query, undefined, evidence, prompt, true, true,
+            courseGrounding ? ['transcript', 'reference_files'] : ['transcript'],
+            controller.signal, undefined, { v3Owned: true },
+        );
 
-        for await (const chunk of raceGeneratorWithDeadline(stream, RAG_STREAM_STALL_MS)) {
+        for await (const chunk of raceGeneratorWithDeadline(stream, RAG_STREAM_STALL_MS, controller, abortSignal, onProviderPolicy)) {
             if (abortSignal?.aborted) break;
             yield chunk;
         }
@@ -387,7 +444,7 @@ export class RAGManager {
         // entered conversation state. The coda makes the truncation VISIBLE
         // in the rendered/persisted answer (skipped on user abort — that is
         // a cancellation, not a truncation).
-        if (streamOutcome.incomplete && !abortSignal?.aborted) {
+        if (streamOutcome.truncated && !abortSignal?.aborted) {
             yield RAG_STREAM_INCOMPLETE_CODA;
         }
     }

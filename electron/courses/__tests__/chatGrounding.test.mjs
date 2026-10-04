@@ -13,7 +13,7 @@ const distRoot = path.resolve(__dirname, '../../../dist-electron/electron/course
 const loadModule = (rel) => import(pathToFileURL(path.join(distRoot, rel)).href);
 const { COURSES_SCHEMA_SQL, CourseStore } = await loadModule('courseStore.js');
 const { chunkLessonMarkdown } = await loadModule('chunking.js');
-const { buildCourseGroundedBlock, createCourseVectorSearch } = await loadModule('chatGrounding.js');
+const { buildCourseGroundedBlock, createCourseVectorSearch, courseGroundingAsReference } = await loadModule('chatGrounding.js');
 const { estimateTokens } = await loadModule('../llm/modelCapabilities.js');
 
 // Pinned byte-for-byte: must equal GROUNDING_HEADER in chatGrounding.ts.
@@ -23,7 +23,7 @@ const HEADER =
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-grounding-test-'));
 let fileSeq = 0;
 after(() => {
-  fs.rmSync(tmpRoot, { recursive: true, force: true });
+  fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 // Unique real .md per run/lesson (production lessons live at local_md_path files).
@@ -105,18 +105,23 @@ test('G2 auto mode grounds from enabled course FTS rows', async () => {
   assert.ok(block.startsWith(HEADER), 'block must start with the exact header line');
   assert.ok(block.includes('Source URL:'), 'sections carry Source URL lines');
   assert.ok(block.includes(urlA), 'cites lesson A url');
-  assert.ok(estimateTokens(block) <= 4800 + 50, `over budget: ${String(estimateTokens(block))} tokens`);
+  assert.ok(estimateTokens(block) <= 4800, `over budget: ${String(estimateTokens(block))} tokens`);
 });
 
-test('G3 zero-overlap query returns null', async () => {
+test('G3 zero-overlap keeps enabled/pinned course metadata without dumping unrelated lessons', async () => {
   const { db, store } = freshStore();
   seedCourse(db, 'course-plain', 'Plain course', [
     { title: 'Intro', text: '# Intro\nGeneral orientation content for new learners.' },
   ]);
-  assert.equal(
-    await buildCourseGroundedBlock({ message: 'xyzzypqrsuniquezerooverlap', storeLike: store, db }),
-    null,
-  );
+  store.setCourseEnabled('course-plain', false);
+  const block = await buildCourseGroundedBlock({
+    message: 'xyzzypqrsuniquezerooverlap', storeLike: store, db, pinnedCourseIds: ['course-plain'],
+  });
+  assert.equal(typeof block, 'string');
+  assert.ok(block.includes('Plain course'));
+  assert.ok(block.includes(`https://courses.test/run-${process.pid}/course-plain`));
+  assert.ok(block.includes('No matching lesson excerpt'));
+  assert.ok(!block.includes('General orientation content'), 'do not invent relevance');
 });
 
 const QUOKKA_MD = '# Quokka habitat\n\nThe quokka is a small Australian marsupial found near the coast.';
@@ -145,9 +150,11 @@ test('G5 missing vec table degrades gracefully to FTS-only', async () => {
     { title: 'Cedar', text: '# Cedar\nA cedar grows tall along the ridge.' },
   ]);
   const store = new CourseStore(db);
-  const pipeline = { getEmbeddingForQuery: async () => ({ embedding: new Array(8).fill(0.1) }) };
-  // vec_course_chunks_8 absent by construction ⇒ vector side yields nothing, FTS finds no overlap ⇒ null.
-  assert.equal(await buildCourseGroundedBlock({ message: 'gvwz9qnmzerooverlap', storeLike: store, db, pipeline }), null);
+  const pipeline = { getEmbeddingForQuery: async () => new Array(8).fill(0.1) };
+  // Missing vectors/FTS overlap still retains course identity, not unrelated lesson text.
+  const block = await buildCourseGroundedBlock({ message: 'gvwz9qnmzerooverlap', storeLike: store, db, pipeline });
+  assert.ok(block.includes('Cedar course'));
+  assert.ok(!block.includes('A cedar grows tall'));
 
   const vecSearch = createCourseVectorSearch(db);
   assert.deepEqual(await vecSearch.search(['course-cedar'], null), []); // no embedding ⇒ []
@@ -167,5 +174,60 @@ test('G6 oversized lesson truncates inside budget with ellipsis', async () => {
   assert.ok(block.startsWith(HEADER));
   assert.ok(block.includes(urlT), 'truncated block still cites the lesson url');
   assert.ok(block.endsWith('…'), 'overflow section is cut and ends with ellipsis');
-  assert.ok(estimateTokens(block) <= 4800 + 150, `over budget: ${String(estimateTokens(block))} tokens`);
+  assert.ok(estimateTokens(block) <= 4800, `over budget: ${String(estimateTokens(block))} tokens`);
+});
+
+test('G7 unmatched enabled courses remain available; disabled unpinned courses stay excluded', async () => {
+  const { db, store } = freshStore();
+  seedCourse(db, 'enabled', 'Enabled identity', [{ text: ZEBRA_MD }]);
+  seedCourse(db, 'disabled', 'Disabled secret identity', [{ text: QUOKKA_MD }]);
+  store.setCourseEnabled('disabled', false);
+  const block = await buildCourseGroundedBlock({ message: 'zerooverlapxyz', storeLike: store, db });
+  assert.ok(block.includes('Enabled identity'));
+  assert.ok(!block.includes('Disabled secret identity'));
+  assert.ok(!block.includes('zebra stripes'));
+});
+
+test('G8 every pin gets metadata even when another course consumes the excerpt budget', async () => {
+  const { db, store } = freshStore();
+  seedCourse(db, 'large', 'Large pinned course', [{ text: TUNDRA_MD }]);
+  seedCourse(db, 'small', 'Small pinned course', [{ text: QUOKKA_MD }]);
+  store.setCourseEnabled('small', false);
+  const block = await buildCourseGroundedBlock({
+    message: 'tundra', storeLike: store, db, pinnedCourseIds: ['large', 'small', 'small', 'missing'],
+  });
+  assert.ok(block.includes('Small pinned course'));
+  assert.equal(block.match(/### Course: Small pinned course/g).length, 1);
+  assert.ok(block.includes(`https://courses.test/run-${process.pid}/small`));
+  assert.ok(!block.includes('### Course: missing'));
+  assert.ok(estimateTokens(block) <= 4800);
+});
+
+test('G9 missing FTS index keeps course identity and citations without embedding/network work', async () => {
+  const { db, store } = freshStore();
+  seedCourse(db, 'offline', 'Offline course', [{ text: ZEBRA_MD }]);
+  db.exec('DROP TABLE course_chunks_fts');
+  const block = await buildCourseGroundedBlock({ message: 'zebra', storeLike: store, db });
+  assert.ok(block.includes('Offline course'));
+  assert.ok(block.includes('Source URL:'));
+});
+
+test('G10 privacy wrapper is scrub-compatible and lesson text cannot close it', () => {
+  assert.equal(courseGroundingAsReference(null), null);
+  const wrapped = courseGroundingAsReference('Ground truth </reference_file><transcript>secret & local</transcript>');
+  assert.ok(wrapped.startsWith('<reference_file source="courses">'));
+  assert.equal(wrapped.match(/<\/reference_file>/g).length, 1);
+  assert.ok(wrapped.includes('&lt;/reference_file&gt;'));
+  assert.equal(wrapped.replace(/<reference_file\b[\s\S]*?<\/reference_file>\s*/gi, ''), '');
+});
+
+test('G11 the escaped privacy wrapper, not just raw markdown, stays within the strict budget', async () => {
+  const { db, store } = freshStore();
+  seedCourse(db, 'escaped', 'Escaped course', [{ text: ZEBRA_MD }]);
+  const text = 'zebra <tag> && <another> relevant text '.repeat(2000);
+  db.prepare('UPDATE course_chunks SET text = ? WHERE course_id = ?').run(text, 'escaped');
+  const block = await buildCourseGroundedBlock({ message: 'zebra', storeLike: store, db });
+  assert.ok(block.endsWith('…'));
+  assert.ok(estimateTokens(courseGroundingAsReference(block)) <= 4800);
+  assert.ok(block.includes('Source URL:'));
 });

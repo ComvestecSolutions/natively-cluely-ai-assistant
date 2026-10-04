@@ -205,8 +205,13 @@ describe('manual chat refuses to store a truncated answer', () => {
   });
 
   test('the renderer is told the answer is incomplete', () => {
-    const done = ipcSrc.slice(ipcSrc.indexOf("event.sender.send('gemini-stream-done', {"));
-    assert.match(done.slice(0, 400), /incomplete: v3Truncated/, 'the done payload must carry the incomplete flag');
+    const v3Start = ipcSrc.indexOf('// ── CONTEXT INTELLIGENCE V3');
+    const doneStart = ipcSrc.indexOf("event.sender.send('gemini-stream-done', {", v3Start);
+    assert.ok(v3Start > 0 && doneStart > v3Start, 'locate the V3 done payload, not the selected-model fallback');
+    assert.match(ipcSrc.slice(doneStart, doneStart + 400), /incomplete: v3Truncated/, 'the V3 done payload must carry the incomplete flag');
+    const selectedStart = ipcSrc.indexOf('if (options?.selectedModelOnly)');
+    assert.ok(selectedStart > 0 && selectedStart < v3Start, 'selected fallback must be a separate branch');
+    assert.match(ipcSrc.slice(selectedStart, v3Start), /incomplete: outcome\.truncated/, 'selected fallback must also carry the incomplete flag');
   });
 
   test('the debug trace records it as a non-success', () => {

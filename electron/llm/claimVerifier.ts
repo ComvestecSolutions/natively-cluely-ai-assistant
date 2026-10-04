@@ -384,6 +384,7 @@ export async function runClaimVerifier(opts: {
       observe: opts.observe,
       stream: opts.startStream(body, child.signal) as AsyncGenerator<string>,
       firstUsefulDeadlineMs: opts.budgetMs,
+      deadlinePolicy: 'caller',
       isUsefulYet: () => false,
       // The list quotes the draft and the reply repeats it: up to ~2x the draft is expected.
       shouldAbort: () => out.length > body.length * 3 + 600 || opts.parentSignal?.aborted === true || opts.isSuperseded?.() === true,

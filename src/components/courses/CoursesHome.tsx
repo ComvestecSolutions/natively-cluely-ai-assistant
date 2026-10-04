@@ -5,7 +5,8 @@ import CourseProgressCard, { type CourseImportRun } from './CourseProgressCard';
 import LessonReader from './LessonReader';
 import { AipBadge } from '../settings/AIProvidersSettings';
 import LiquidGlassButton from '../../ui-components/LiquidGlassButton';
-import { SETTINGS_BTN_BASE, SETTINGS_BTN_NEUTRAL, SettingsNotice, SettingsSwitch, useSettingsTones } from '../settings/SettingsRow';
+import { SETTINGS_BTN_BASE, SETTINGS_BTN_NEUTRAL, SETTINGS_CARD, SETTINGS_INPUT, SettingsNotice, SettingsSwitch, useSettingsTones } from '../settings/SettingsRow';
+import { getCoursePinIds, isCourseGroundingEnabled, notifyCourseStateChanged, setCourseGroundingEnabled, setCoursePinIds, subscribeCourseStateChanged } from '../../lib/coursePins';
 
 // Mirrors CourseSummary in electron/courses/courseStore.ts — the renderer has no
 // shared type for it; preload types coursesList() as Promise<any>.
@@ -107,6 +108,15 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
     // store is unavailable — same contract as the other intelligence surfaces.
     const [disabled, setDisabled] = useState(false);
     const [courses, setCourses] = useState<CourseSummary[]>([]);
+    const [pins, setPins] = useState<string[]>(getCoursePinIds);
+    const [listError, setListError] = useState<string | null>(null);
+    const listSeq = useRef(0);
+    const mounted = useRef(true);
+    const actionInFlight = useRef(false);
+    useEffect(() => {
+        mounted.current = true;
+        return () => { mounted.current = false; ++listSeq.current; };
+    }, []);
 
     // ── Import run (P1) ────────────────────────────────────────────────────────
     const [importOpen, setImportOpen] = useState(false);
@@ -125,6 +135,7 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
     const runSourceUrlRef = useRef<string | null>(null);
     // Course ids with an in-flight enable/disable toggle (guards double-clicks).
     const [pendingToggles, setPendingToggles] = useState<Record<string, boolean>>({});
+    const pendingToggleIds = useRef(new Set<string>());
 
     // The course the P3 reader is open for; null shows the course list.
     const [openCourseId, setOpenCourseId] = useState<string | null>(null);
@@ -140,44 +151,40 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
     const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
     const confirmDeleteTimer = useRef<number | undefined>(undefined);
 
-    const refreshCourses = useCallback(async () => {
-        if (!window.electronAPI || !window.electronAPI.coursesList) return;
+    const refreshCourses = useCallback(async (): Promise<CourseSummary[] | null> => {
+        const seq = ++listSeq.current;
+        setListError(null);
         try {
-            const res = await window.electronAPI.coursesList();
-            setCourses(Array.isArray(res) ? (res as CourseSummary[]) : []);
-            setDisabled(!Array.isArray(res) && !!(res as { disabled?: boolean })?.disabled);
-        } catch {
-            setDisabled(true);
-            setCourses([]);
+            const api = window.electronAPI;
+            if (!api || typeof api.coursesList !== 'function') throw new Error('Courses are unavailable in this build.');
+            const res = await api.coursesList();
+            if (!mounted.current || seq !== listSeq.current) return null;
+            if (res?.disabled) { setDisabled(true); setCourses([]); return null; }
+            if (!Array.isArray(res)) throw new Error(typeof res?.error === 'string' ? res.error : 'Could not load the course library.');
+            setCourses(res as CourseSummary[]); setDisabled(false);
+            return res as CourseSummary[];
+        } catch (e) {
+            if (mounted.current && seq === listSeq.current) setListError(e instanceof Error && e.message ? e.message : 'Could not load the course library.');
+            return null;
         }
     }, []);
+
+    useEffect(() => subscribeCourseStateChanged(() => {
+        setPins(getCoursePinIds());
+        void refreshCourses();
+    }), [refreshCourses]);
 
     // Terminal 'done' for a run: the list fetch doubles as the refresh, and we read the
     // finished course's fresh stats off the refreshed row for the completion notice.
     const finishImportRun = useCallback(async (courseId: string) => {
-        const api = window.electronAPI;
-        if (!api || typeof api.coursesList !== 'function') return;
-        try {
-            const res = await api.coursesList();
-            if (!Array.isArray(res)) {
-                setCourses([]);
-                setDisabled(true);
-                return;
-            }
-            setCourses(res as CourseSummary[]);
-            setDisabled(false);
-            const fresh = (res as CourseSummary[]).find((c) => c.id === courseId);
-            if (!fresh) return;
-            const st = courseStats(fresh.stats);
-            if (!(st.planned > 0)) return; // row has no stats yet — nothing to summarize
-            setNotice(st.failed === 0
-                ? { tone: 'ok', text: `Imported ${st.succeeded} of ${st.planned} pages` }
-                : { tone: 'warn', text: `${st.succeeded} of ${st.planned} pages imported · ${st.failed} failed` });
-        } catch {
-            setDisabled(true);
-            setCourses([]);
-        }
-    }, []);
+        const fresh = (await refreshCourses())?.find((c) => c.id === courseId);
+        if (!fresh || !mounted.current) return;
+        const st = courseStats(fresh.stats);
+        if (!(st.planned > 0)) return;
+        setNotice(st.failed === 0
+            ? { tone: 'ok', text: `Imported ${st.succeeded} of ${st.planned} pages` }
+            : { tone: 'warn', text: `${st.succeeded} of ${st.planned} pages imported · ${st.failed} failed` });
+    }, [refreshCourses]);
 
     useEffect(() => {
         let cancelled = false;
@@ -194,9 +201,14 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
         const api = window.electronAPI;
         if (!api || typeof api.onCoursesProgress !== 'function') return undefined;
         return api.onCoursesProgress((raw: unknown) => {
-            const active = runRef.current;
-            if (!active || !raw || typeof raw !== 'object') return;
+            if (!raw || typeof raw !== 'object') return;
             const event = raw as CoursesProgressEvent;
+            // Store status may change even for an import started outside this local run.
+            const isFailure = event.phase === 'failed' || event.stage === 'failed';
+            const terminal = event.phase === 'done' || event.stage === 'done' || isFailure;
+            if (terminal) notifyCourseStateChanged();
+            const active = runRef.current;
+            if (!active) return;
 
             // Never apply events for another course. P0 stage events carry no courseId —
             // those correlate to the single UI-side active run.
@@ -244,14 +256,10 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                 return next;
             });
 
-            const isFailure = event.phase === 'failed' || event.stage === 'failed';
-            if (event.phase === 'done' || event.stage === 'done' || isFailure) {
+            if (terminal) {
                 window.clearTimeout(runEndTimer.current);
-                if (isFailure) {
-                    // Failed terminal: keep the run on screen — the card offers Retry / Dismiss.
-                    // Refresh in place so any partial course row surfaces under it.
-                    void refreshCourses();
-                } else {
+                // Failed runs remain on screen for Retry / Dismiss; the notification refreshed them.
+                if (!isFailure) {
                     // Brief beat so the final state is visible, then drop the run and refresh.
                     const detailId = typeof event.detail === 'string' && event.detail !== '' ? event.detail : active.courseId;
                     runEndTimer.current = window.setTimeout(() => {
@@ -263,7 +271,7 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                 }
             }
         });
-    }, [refreshCourses, finishImportRun]);
+    }, [finishImportRun]);
 
     useEffect(() => () => {
         window.clearTimeout(runEndTimer.current);
@@ -294,55 +302,46 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                 return;
             }
             const importError = res as { ok?: boolean; error?: string };
-            if (importError.ok === false && typeof importError.error === 'string' && importError.error !== '') {
+            if (importError.error || importError.ok === false) {
                 // Zero-lesson guard from main ({ok:false,error}) — surface the reason in the shared notice slot.
-                setNotice({ tone: 'err', text: importError.error });
+                setFormError(importError.error || t('Import failed'));
                 return;
             }
             const courseId = pickImportedCourseId(res);
-            if (!courseId) return;
+            if (!courseId) { setFormError(t('No course was returned. Check the URL and retry.')); return; }
             window.clearTimeout(runEndTimer.current);
             runSourceUrlRef.current = url; // Retry's anchor for this run
             setRun({ courseId, phase: 'importing', done: 0, total: 0, failed: 0, skipped: 0 });
             setImportOpen(false);
-        } catch {
-            // IPC-level failure degrades to the same premium-off notice surface.
-            setDisabled(true);
+            notifyCourseStateChanged();
+        } catch (e) {
+            setFormError(e instanceof Error && e.message ? e.message : t('Import failed. Try again.'));
+            setNotice({ tone: 'err', text: e instanceof Error && e.message ? e.message : t('Import failed. Try again.') });
         } finally {
             setSubmitting(false);
         }
     };
 
     const toggleCourseEnabled = async (course: CourseSummary) => {
-        if (pendingToggles[course.id]) return;
-        const api = window.electronAPI;
-        if (!api || typeof api.coursesSetEnabled !== 'function') return;
-        const next = !course.enabled;
+        if (pendingToggleIds.current.has(course.id)) return;
+        const next = !isCourseGroundingEnabled(course, getCoursePinIds());
+        pendingToggleIds.current.add(course.id);
         setPendingToggles((prev) => ({ ...prev, [course.id]: true }));
         // Optimistic flip…
         setCourses((prev) => prev.map((c) => (c.id === course.id ? { ...c, enabled: next } : c)));
         try {
-            // Preload exposes this positionally: coursesSetEnabled(id, enabled).
-            const res = (await api.coursesSetEnabled(course.id, next)) as
-                | { disabled?: boolean; course?: CourseSummary | null }
-                | null;
-            if (!res) return;
-            if (res.disabled) {
-                // Premium flipped off mid-flight — the list view goes away with it.
-                setDisabled(true);
-                return;
-            }
-            const fresh = res.course;
-            if (fresh && fresh.id === course.id) {
-                setCourses((prev) => prev.map((c) => (c.id === course.id
-                    ? { ...c, enabled: fresh.enabled ?? next, status: fresh.status || c.status, updatedAt: fresh.updatedAt || c.updatedAt }
-                    : c)));
-            }
-        } catch {
-            // …and roll back on error.
-            setCourses((prev) => prev.map((c) => (c.id === course.id ? { ...c, enabled: !next } : c)));
+            // The shared helper confirms IPC and clears a pin override before acknowledging off.
+            // It also notifies both library and toolbar subscribers; do not double-notify here.
+            const fresh = await setCourseGroundingEnabled(course.id, next);
+            if (!mounted.current) return;
+            setCourses((prev) => prev.map((c) => c.id === course.id ? { ...c, enabled: fresh.enabled } : c));
+        } catch (e) {
+            if (!mounted.current) return;
+            setCourses((prev) => prev.map((c) => (c.id === course.id ? { ...c, enabled: course.enabled } : c)));
+            setNotice({ tone: 'err', text: e instanceof Error && e.message ? e.message : t('Course setting could not be saved.') });
         } finally {
-            setPendingToggles((prev) => {
+            pendingToggleIds.current.delete(course.id);
+            if (mounted.current) setPendingToggles((prev) => {
                 const copy = { ...prev };
                 delete copy[course.id];
                 return copy;
@@ -353,11 +352,16 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
     // P4 management actions. Busy keys are '<action>:<courseId>' per row plus 'imp' for the
     // toolbar bundle import; results flow through the shared notice slot under the toolbar.
     const withAction = async (key: string, fn: () => Promise<void>) => {
+        if (actionInFlight.current) return;
+        actionInFlight.current = true;
         setBusyAction(key);
         try {
             await fn();
+        } catch (e) {
+            if (mounted.current) setNotice({ tone: 'err', text: e instanceof Error && e.message ? e.message : t('Course action failed. Try again.') });
         } finally {
-            setBusyAction(null);
+            actionInFlight.current = false;
+            if (mounted.current) setBusyAction(null);
         }
     };
 
@@ -387,7 +391,10 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
         if (!res) return;
         if (res.disabled) setNotice({ tone: 'err', text: t('Courses Studio is disabled') });
         else if (res.error) setNotice({ tone: 'err', text: res.error });
-        else setNotice({ tone: 'ok', text: t('Course re-indexed for AI grounding') });
+        else {
+            setNotice({ tone: 'ok', text: t('Course re-indexed for AI grounding') });
+            notifyCourseStateChanged();
+        }
     });
 
     // Two-step delete without a native dialog: Delete arms a Confirm/Cancel pair on the row
@@ -415,8 +422,18 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
             if (!res) return;
             if (res.disabled) setNotice({ tone: 'err', text: t('Courses Studio is disabled') });
             else if (res.ok) {
-                setNotice({ tone: 'ok', text: t('Course deleted') });
-                void refreshCourses(); // re-read the list so the row disappears
+                const currentPins = getCoursePinIds();
+                if (currentPins.includes(course.id)) {
+                    if (setCoursePinIds(currentPins.filter((id) => id !== course.id))) {
+                        setNotice({ tone: 'ok', text: t('Course deleted') });
+                    } else {
+                        setNotice({ tone: 'warn', text: t('Course deleted, but its pinned selection could not be cleared. Try clearing it in course controls.') });
+                        notifyCourseStateChanged();
+                    }
+                } else {
+                    setNotice({ tone: 'ok', text: t('Course deleted') });
+                    notifyCourseStateChanged();
+                }
             } else setNotice({ tone: 'err', text: res.error ?? t('Delete failed') });
         });
     };
@@ -432,7 +449,7 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
         else if (res.canceled) return; // user dismissed the open dialog — nothing to report
         else if (res.ok && typeof res.courseId === 'string') {
             setNotice({ tone: 'ok', text: `Course "${res.courseId}" imported` });
-            void refreshCourses();
+            notifyCourseStateChanged();
         } else setNotice({ tone: 'err', text: res.error ?? t('Import failed') });
     });
 
@@ -457,9 +474,9 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
     };
 
     // App card surface (the settings Card recipe); muted border stays visible in both themes.
-    const rowTone = 'bg-bg-item-surface rounded-xl border border-border-muted';
+    const rowTone = SETTINGS_CARD;
     // Ghost styling shared by the per-row P4 management buttons (settings button consts).
-    const actionBtnClass = `${SETTINGS_BTN_BASE} ${SETTINGS_BTN_NEUTRAL}`;
+    const actionBtnClass = `${SETTINGS_BTN_BASE} ${SETTINGS_BTN_NEUTRAL} focus-visible:ring-2 focus-visible:ring-accent-focus`;
     // In-flight row action: border spinner + dimmed original label — never a bare "…".
     const actionSpinner = (label: string) => (
         <>
@@ -485,15 +502,17 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                     if (formError) setFormError(null);
                 }}
                 placeholder="https://learn.microsoft.com/en-us/credentials/certifications/..."
-                className={`w-full rounded-full bg-bg-input border border-border-muted px-4 py-2 text-sm text-text-primary placeholder:text-text-secondary outline-none transition-colors focus:border-accent-secondary`}
+                aria-invalid={!!formError}
+                aria-describedby={formError ? 'course-import-error' : undefined}
+                className={`${SETTINGS_INPUT} placeholder:text-text-secondary`}
             />
             {formError && (
-                <p role="alert" className={`mt-1 flex items-center gap-1.5 text-xs font-medium ${tones.text.danger}`}>
+                <p id="course-import-error" role="alert" className={`mt-2 flex items-start gap-1.5 text-xs font-medium ${tones.text.danger}`}>
                     <XCircle size={12} aria-hidden />
-                    <span className="min-w-0 truncate">{formError}</span>
+                    <span className="min-w-0 break-words">{formError}</span>
                 </p>
             )}
-            <div className="flex items-center justify-end gap-2">
+            <div className="mt-3 flex items-center justify-end gap-2">
                 <button
                     type="button"
                     onClick={() => setImportOpen(false)}
@@ -517,8 +536,10 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
         </>
     );
 
+    if (openCourseId) return <LessonReader courseId={openCourseId} onBack={() => setOpenCourseId(null)} />;
+
     return (
-        <div className="h-full w-full flex flex-col bg-bg-primary text-text-primary font-sans overflow-hidden selection:bg-accent-subtle">
+        <div className="h-full min-h-0 w-full flex flex-col bg-bg-primary text-text-primary font-sans overflow-hidden selection:bg-accent-subtle">
             {/* Header (back + title) */}
             <section className={`${isLight ? 'bg-bg-secondary' : 'bg-bg-elevated'} px-8 pt-5 pb-6 border-b border-border-subtle shrink-0`}>
                 <div className="max-w-3xl mx-auto">
@@ -528,7 +549,7 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                                 onClick={onBack}
                                 title={t('Back')}
                                 aria-label={t('Back')}
-                                className="p-2 -ml-2 text-text-secondary hover:text-text-primary rounded-full transition-colors hover:[background-color:var(--bg-row-hover)]"
+                                className="p-2 -ml-2 text-text-secondary hover:text-text-primary rounded-full transition-colors hover:[background-color:var(--bg-row-hover)] focus-visible:ring-2 focus-visible:ring-accent-focus"
                             >
                                 <ArrowLeft size={16} />
                             </button>
@@ -543,12 +564,23 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                 </div>
             </section>
 
-            <div className="flex-1 overflow-y-auto">
-                {openCourseId ? (
-                    // Full-height chain: the wrapper is a flex item with resolved height, so the reader's
-                    // root `min-h-full` fills it and its inner columns own their scrolling.
-                    <LessonReader courseId={openCourseId} onBack={() => setOpenCourseId(null)} />
-                ) : loading ? (
+            <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+                {listError && (
+                    <div className="mx-auto max-w-3xl px-6 pt-4">
+                        <SettingsNotice tone={tones.danger} icon={<XCircle size={14} />} alert className="">
+                            {listError}
+                            <button type="button" onClick={() => { void refreshCourses(); }} className={`${actionBtnClass} mt-2 focus-visible:ring-2 focus-visible:ring-accent-focus`}>{t('Retry')}</button>
+                        </SettingsNotice>
+                    </div>
+                )}
+                {notice && (
+                    <div className="mx-auto max-w-3xl px-6 pt-4">
+                        <SettingsNotice tone={tones[notice.tone === 'err' ? 'danger' : notice.tone]} icon={notice.tone === 'ok' ? <CheckCircle2 size={14} /> : notice.tone === 'warn' ? <AlertTriangle size={14} /> : <XCircle size={14} />} alert={notice.tone === 'err'} className="">
+                            {notice.text}
+                        </SettingsNotice>
+                    </div>
+                )}
+                {loading ? (
                     // Skeleton rows shaped like course cards while the first list fetch is in flight.
                     <div role="status" className="mx-auto w-full max-w-3xl px-8 py-6">
                         <span className="sr-only">{t('Loading')}…</span>
@@ -571,10 +603,11 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                             <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-accent-subtle">
                                 <GraduationCap size={22} className="text-text-primary" />
                             </div>
-                            <h2 className="font-celeb text-xl font-medium text-text-primary">{t('Premium required')}</h2>
+                            <h2 className="font-celeb text-xl font-medium text-text-primary">{t('Courses unavailable')}</h2>
                             <p className="mt-2 text-sm leading-relaxed text-text-secondary">
-                                {t('Courses Studio is part of Natively Pro. Upgrade to import courses and build interview-ready material from them.')}
+                                {t('Courses Studio requires Pro or an active trial and available local course storage. Check access or retry.')}
                             </p>
+                            <button type="button" onClick={() => { void refreshCourses(); }} className={`${actionBtnClass} mx-auto mt-4`}>{t('Retry')}</button>
                             {onUpgrade && (
                                 <LiquidGlassButton
                                     variant="clear"
@@ -618,7 +651,7 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                                         variant="clear"
                                         className="lg-sm text-text-primary"
                                         onClick={() => { void importBundle(); }}
-                                        disabled={busyAction === 'imp'}
+                                        disabled={busyAction !== null}
                                     >
                                         {t('Import bundle (.zip)')}
                                     </LiquidGlassButton>
@@ -647,7 +680,7 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                                     variant="clear"
                                     className="lg-sm text-text-primary"
                                     onClick={() => { void importBundle(); }}
-                                    disabled={busyAction === 'imp'}
+                                    disabled={busyAction !== null}
                                 >
                                     {t('Import bundle (.zip)')}
                                 </LiquidGlassButton>
@@ -667,27 +700,15 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                                 {importControls}
                             </form>
                         )}
-                        {/* The shared settings notice; tones resolve per theme via useSettingsTones. */}
-                        {notice && (
-                            <SettingsNotice
-                                tone={tones[notice.tone === 'err' ? 'danger' : notice.tone]}
-                                icon={notice.tone === 'ok'
-                                    ? <CheckCircle2 size={14} />
-                                    : notice.tone === 'warn' ? <AlertTriangle size={14} /> : <XCircle size={14} />}
-                                className="mb-4"
-                            >
-                                {notice.text}
-                            </SettingsNotice>
-                        )}
                         <ul className="space-y-3">
                             {courses.map((course) => {
                                 const busy = pendingToggles[course.id] === true;
                                 const updatedLabel = relativeUpdatedLabel(t, course.updatedAt);
-                                // Busy keys for this row's P4 actions; any in-flight one disables all three.
+                                // One management action at a time, matching withAction's synchronous lock.
                                 const expKey = `exp:${course.id}`;
                                 const ridxKey = `ridx:${course.id}`;
                                 const delKey = `del:${course.id}`;
-                                const rowBusy = busyAction === expKey || busyAction === ridxKey || busyAction === delKey;
+                                const rowBusy = busyAction !== null;
                                 // Premium card details, derived once per render of the row.
                                 const stats = courseStats(course.stats);
                                 const lessonCount = course.lessonCount ?? 0;
@@ -701,24 +722,12 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                                 return (
                                     <li
                                         key={course.id}
-                                        role="button"
-                                        tabIndex={0}
-                                        aria-label={`${t('Open')}: ${course.name}`}
-                                        onClick={() => setOpenCourseId(course.id)}
-                                        onKeyDown={(e) => {
-                                            // Only the row itself opens on Enter/Space — never a nested control.
-                                            if (e.target !== e.currentTarget) return;
-                                            if (e.key === 'Enter' || e.key === ' ') {
-                                                e.preventDefault();
-                                                setOpenCourseId(course.id);
-                                            }
-                                        }}
-                                        className={`group flex cursor-pointer select-none items-center gap-4 px-4 py-3 outline-none transition-colors hover:[background-color:var(--bg-row-hover)] focus-visible:ring-2 focus-visible:ring-accent-focus ${rowTone}`}
+                                        className={`group flex flex-wrap items-center gap-3 px-4 py-3 transition-colors ${rowTone}`}
                                     >
-                                        {/* Clicking the row opens the single-course reader (P3). */}
-                                        <div className="min-w-0 flex-1">
-                                            <p className="truncate text-sm font-medium text-text-primary">{course.name}</p>
-                                            <div className="mt-0.5 flex min-w-0 items-center gap-1.5 text-xs">
+                                        {/* A native button opens the reader without nesting management controls. */}
+                                        <div className="min-w-0 flex-1 basis-48">
+                                            <button type="button" onClick={() => setOpenCourseId(course.id)} aria-label={`${t('Open')}: ${course.name}`} title={course.name} className="block w-full truncate rounded text-left text-sm font-semibold text-text-primary hover:text-accent-primary focus-visible:ring-2 focus-visible:ring-accent-focus">{course.name}</button>
+                                            <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-1.5 text-xs">
                                                 {updatedLabel !== '' && (
                                                     <span className="truncate text-text-secondary">{t('Updated')} {updatedLabel}</span>
                                                 )}
@@ -767,7 +776,7 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                                             <AipBadge tone="neutral" label={statusLabel(t, course.status)} className="shrink-0" />
                                         )}
                                         {/* P4 management actions — ghost buttons that never open the reader. */}
-                                        <div className="flex shrink-0 items-center gap-1">
+                                        <div className="flex flex-wrap items-center gap-1">
                                             <button
                                                 type="button"
                                                 onClick={(e) => { e.stopPropagation(); void exportCourseBundle(course.id); }}
@@ -827,9 +836,9 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                                             onClick={(e) => { e.stopPropagation(); }}
                                         >
                                             <SettingsSwitch
-                                                checked={course.enabled}
+                                                checked={isCourseGroundingEnabled(course, pins)}
                                                 onChange={() => { void toggleCourseEnabled(course); }}
-                                                label={course.enabled ? t('Disable') : t('Enable')}
+                                                label={isCourseGroundingEnabled(course, pins) ? t('Disable') : t('Enable')}
                                                 disabled={busy}
                                             />
                                         </span>

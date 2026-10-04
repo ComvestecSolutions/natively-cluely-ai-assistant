@@ -109,6 +109,9 @@ describe('the cap covers EVERY public streaming entry point', () => {
   test('every public streaming generator is enumerated', () => {
     const declared = [...src.matchAll(/public async \* (\w+)\(/g)].map(m => m[1]);
     const streaming = declared.filter(n => /^stream/.test(n));
+    // streamChat returns its generator synchronously so deadline metadata is
+    // visible before next(); it still delegates to the same capped funnel.
+    if (/public streamChat\(/.test(src)) streaming.push('streamChat');
     assert.deepEqual(
       streaming.sort(),
       [...PUBLIC_STREAM_ENTRY_POINTS].sort(),
@@ -118,20 +121,37 @@ describe('the cap covers EVERY public streaming entry point', () => {
 
   test('each public streaming generator applies the output cap', () => {
     for (const name of PUBLIC_STREAM_ENTRY_POINTS) {
-      const start = src.indexOf(`public async * ${name}(`);
+      const start = name === 'streamChat' ? src.indexOf('public streamChat(')
+        : src.indexOf(`public async * ${name}(`);
       assert.ok(start > 0, `could not locate ${name}`);
       // Bound the slice at the next method declaration.
-      const nextDecl = src.slice(start + 10).search(/\n  (?:public|private) async \*/);
+      const nextDecl = src.slice(start + 10).search(/\n  (?:public|private) (?:async \* ?)?\w+\(/);
       const body = src.slice(start, nextDecl > 0 ? start + 10 + nextDecl : start + 4000);
       // Accept either an inline cap or delegation to a bounded private impl —
       // `streamChat` is a thin wrapper over `_streamChatTracked`, which holds
       // the counter. What must never happen is a public streaming generator
       // that neither caps nor delegates to something that does.
       const bounded = /capOutput\(|MAX_STREAM_OUTPUT_CHARS/.test(body)
-        || /yield\* this\._streamChatTracked\(/.test(body);
+        || /yield\* this\._streamChatTracked\(/.test(body)
+        || (/return this\.providerAwareChatStream\(/.test(body)
+          && /view => view\._streamChatTracked\(/.test(src));
       assert.ok(bounded, `${name} streams to consumers without a total-output bound`);
     }
   });
+
+  for (const entry of ['streamChatWithOutcome', 'streamChatLongForm', 'streamRAGAnswer']) {
+    test(`${entry} returned stream enforces its output cap and records truncation`, async () => {
+      const helper = Object.create(LLMHelper.prototype);
+      helper._streamChatInner = async function* () { for (let i = 0; i < 2000; i++) yield 'x'.repeat(200); };
+      const { stream, outcome } = helper[entry]('question');
+      let received = 0;
+      for await (const text of stream) received += text.length;
+      const ceiling = entry === 'streamChatLongForm' ? MAX_SUMMARY_OUTPUT_CHARS : MAX_STREAM_OUTPUT_CHARS;
+      assert.ok(received <= ceiling + 200);
+      assert.equal(outcome.truncated, true);
+      assert.equal(outcome.reason, 'output_cap_reached');
+    });
+  }
 
   test('reaching the cap ends the stream by returning, never throwing', () => {
     // Same shape as a post-commit provider failure, so the consumer has one

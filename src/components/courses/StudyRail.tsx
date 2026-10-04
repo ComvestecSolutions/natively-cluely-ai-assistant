@@ -1,18 +1,15 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { ExternalLink, RotateCcw, XCircle } from 'lucide-react';
 import QuizPlayer from './QuizPlayer';
 import Flashcards from './Flashcards';
 import LessonMarkdown from './LessonMarkdown';
 import LiquidGlassButton from '../../ui-components/LiquidGlassButton';
-import { SETTINGS_BTN_BASE, SETTINGS_BTN_NEUTRAL, SettingsNotice, useSettingsTones } from '../settings/SettingsRow';
-import { useResolvedTheme } from '../../hooks/useResolvedTheme';
-import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
-import type { Transition } from 'framer-motion';
+import { SETTINGS_BTN, SETTINGS_BTN_BASE, SETTINGS_BTN_NEUTRAL, SETTINGS_CARD, SettingsNotice, useSettingsTones } from '../settings/SettingsRow';
 
 // Courses Studio P3 — study rail for the lesson reader's right pane (xl+ widths): progress, external
 // lab links, and four cached LLM study aids. Summary/glossary render inline; quiz/flashcards open in a
-// full overlay over the shared player components. Pure presentational — LessonReader computes scope,
-// progress and links each render; state here resets when the reader unmounts.
+// in-surface drills over the shared player components. LessonReader computes scope,
+// progress and links; generated state belongs to that exact course/lesson scope.
 
 type StudyAidType = 'summary' | 'glossary' | 'quiz' | 'flashcards';
 
@@ -40,7 +37,7 @@ const lessonCountLabel = (n: number): string => (n === 1 ? '1 lesson' : `${n} le
 
 // Card-ish section wrapper — every rail block shares the same shape; aid pills reuse the settings button consts.
 // Solid item-surface fill + a real edge so each section reads as a distinct panel in both themes.
-const CARD = 'rounded-xl border border-border-muted bg-bg-item-surface p-3';
+const CARD = `${SETTINGS_CARD} p-3`;
 
 // Titled section header — the small uppercase muted label above every rail block.
 function SectionLabel({ children }: { children: React.ReactNode }) {
@@ -90,13 +87,13 @@ function parseFlashcards(data: unknown): FlashcardPair[] | null {
 }
 
 // Inline result card — bordered panel with a header row carrying the [↻] fresh-regenerate action.
-function ResultCard({ title, onRegenerate, children }: { title: string; onRegenerate: () => void; children: React.ReactNode }) {
+function ResultCard({ title, onRegenerate, busy, children }: { title: string; onRegenerate: () => void; busy: boolean; children: React.ReactNode }) {
     return (
         // Inset one step inside the muted card: a hairline + lighter fill keeps the result distinct from its shell.
         <div className="mt-2 rounded-lg border border-border-subtle bg-bg-elevated p-3">
             <div className="mb-2 flex items-center justify-between gap-2">
                 <p className="truncate text-xs font-semibold uppercase tracking-wide text-text-secondary">{title}</p>
-                <LiquidGlassButton type="button" variant="clear" className="lg-sm shrink-0 text-text-secondary" onClick={onRegenerate} title="Regenerate with a fresh pass" aria-label={`Regenerate ${title}`}>
+                <LiquidGlassButton type="button" variant="clear" className="lg-sm shrink-0 text-text-secondary" onClick={onRegenerate} disabled={busy} title="Regenerate with a fresh pass" aria-label={`Regenerate ${title}`}>
                     <RotateCcw size={12} />
                 </LiquidGlassButton>
             </div>
@@ -109,21 +106,38 @@ const StudyRail: React.FC<StudyRailProps> = ({ courseId, scopeLessons, progress,
     const [busy, setBusy] = useState<StudyAidType | null>(null);
     const [errors, setErrors] = useState<Partial<Record<StudyAidType, string>>>({});
     const [results, setResults] = useState<StudyAidResults>({});
-    // Quiz/flashcards payloads stored separately from `results` so the overlay can open straight into a player.
+    // Drill payloads are separate from the inline summary/glossary results.
     const [quizQuestions, setQuizQuestions] = useState<QuizQuestion[] | null>(null);
     const [flashCards, setFlashCards] = useState<FlashcardPair[] | null>(null);
     const [panel, setPanel] = useState<'quiz' | 'flashcards' | null>(null);
-
-    // House primitives — semantic tones for errors and the theme-aware overlay scrim + reduced-motion gating.
-    const tones = useSettingsTones();
-    const isLight = useResolvedTheme() === 'light';
-    const reduced = useReducedMotion();
-    const overlayTransition: Transition = reduced ? { duration: 0 } : { duration: 0.2, ease: [0.22, 1, 0.36, 1] };
-
-    // Transient overlays own their Escape — one listener for whichever panel is open.
+    const practice = useRef<HTMLElement>(null);
+    const aidButtons = useRef<Partial<Record<StudyAidType, HTMLButtonElement>>>({});
+    const closePractice = () => {
+        setPanel(null);
+        if (panel) aidButtons.current[panel]?.focus();
+    };
     useEffect(() => {
         if (!panel) return;
-        const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setPanel(null); };
+        practice.current?.focus();
+        practice.current?.scrollIntoView({ block: 'nearest' });
+    }, [panel, quizQuestions, flashCards]);
+
+    const tones = useSettingsTones();
+    const requestSeq = useRef(0);
+    const busyRef = useRef(false);
+    const scopeKey = JSON.stringify([courseId, scopeLessons.map((lesson) => lesson.id)]);
+    useEffect(() => {
+        ++requestSeq.current;
+        busyRef.current = false;
+        setBusy(null); setErrors({}); setResults({});
+        setQuizQuestions(null); setFlashCards(null); setPanel(null);
+        return () => { ++requestSeq.current; busyRef.current = false; };
+    }, [scopeKey]);
+
+    // The inline drill owns Escape before the reader's compact study pane.
+    useEffect(() => {
+        if (!panel) return;
+        const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') closePractice(); };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
     }, [panel]);
@@ -162,27 +176,32 @@ const StudyRail: React.FC<StudyRailProps> = ({ courseId, scopeLessons, progress,
     };
 
     // One cached LLM pass over the scoped lessons (the main process owns caching; force bypasses it).
-    const generate = (type: StudyAidType, force: boolean): void => {
-        if (!canGenerate) return;
+    const generate = async (type: StudyAidType, force: boolean): Promise<void> => {
+        if (!canGenerate || busyRef.current) return;
+        busyRef.current = true;
+        const seq = ++requestSeq.current;
         setBusy(type);
         setErrors((prev) => { const next = { ...prev }; delete next[type]; return next; });
-
-        const api = window.electronAPI;
-        if (!api || typeof api.coursesGenerateStudyAid !== 'function') { failAid(type, 'Study aids are unavailable in this build.'); setBusy(null); return; }
-
-        api.coursesGenerateStudyAid(courseId, type, scopeLessons.map((s) => s.id), force)
-            .then((res) => {
-                if (!res || res.ok === false) {
-                    const msg = !res ? 'The study aid request failed.'
-                        : (typeof res.error === 'string' && res.error.trim() !== '' ? res.error : `Could not generate the ${AID_LABELS[type]}.`);
-                    throw new Error(msg);
-                }
-                store(type, res.data);
-            })
-            .catch((err: unknown) => {
-                failAid(type, err instanceof Error && err.message !== '' ? err.message : 'Something went wrong — try again.');
-            })
-            .finally(() => setBusy(null));
+        try {
+            const api = window.electronAPI;
+            if (!api || typeof api.coursesGenerateStudyAid !== 'function') throw new Error('Study aids are unavailable in this build.');
+            const res = await api.coursesGenerateStudyAid(courseId, type, scopeLessons.map((s) => s.id), force) as
+                { ok?: boolean; disabled?: boolean; error?: string; data?: unknown } | null;
+            if (seq !== requestSeq.current) return;
+            if (!res || res.disabled || res.ok === false || res.error) {
+                throw new Error(typeof res?.error === 'string' && res.error.trim() ? res.error
+                    : res?.disabled ? 'Study aids are disabled or local course storage is unavailable. Check access and retry.'
+                        : `Could not generate the ${AID_LABELS[type]}.`);
+            }
+            store(type, res.data);
+        } catch (err) {
+            if (seq === requestSeq.current) failAid(type, err instanceof Error && err.message ? err.message : 'Something went wrong — try again.');
+        } finally {
+            if (seq === requestSeq.current) {
+                busyRef.current = false;
+                setBusy(null);
+            }
+        }
     };
 
     const openLink = (url: string): void => {
@@ -204,8 +223,8 @@ const StudyRail: React.FC<StudyRailProps> = ({ courseId, scopeLessons, progress,
                 {/* Course-wide completion; the only inline style in this file is the dynamic fill width. */}
                 <SectionLabel>Progress</SectionLabel>
                 <p className="text-xs tabular-nums text-text-secondary">{done} of {total} lessons · {pct}%</p>
-                <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-bg-elevated">
-                    <div className="h-full rounded-full bg-accent-primary transition-all" style={{ width: `${pct}%` }} />
+                <div role="progressbar" aria-label="Course completion" aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct} className="mt-2 h-1.5 natively-meter-track">
+                    <div className="h-full natively-meter-fill transition-[width] motion-reduce:transition-none" style={{ width: `${pct}%` }} />
                 </div>
             </section>
 
@@ -231,9 +250,9 @@ const StudyRail: React.FC<StudyRailProps> = ({ courseId, scopeLessons, progress,
                 <SectionLabel>Study aids</SectionLabel>
                 <div className="flex flex-wrap gap-1.5">
                     {AID_TYPES.map((type) => (
-                        <button key={type} type="button" disabled={!canGenerate} onClick={() => generate(type, false)} aria-busy={busy === type}
+                        <button key={type} ref={(node) => { if (node) aidButtons.current[type] = node; else delete aidButtons.current[type]; }} type="button" disabled={!canGenerate} onClick={() => generate(type, false)} aria-busy={busy === type}
                             title={`${AID_LABELS[type]} from ${lessonCountLabel(scopeLessons.length)}`}
-                            className={`${SETTINGS_BTN_BASE} disabled:cursor-not-allowed ${hasResult(type) && busy !== type ? 'border-accent-secondary bg-accent-subtle text-accent-primary' : SETTINGS_BTN_NEUTRAL}`}>
+                            className={`${SETTINGS_BTN_BASE} focus-visible:ring-2 focus-visible:ring-accent-focus disabled:cursor-not-allowed ${hasResult(type) && busy !== type ? 'border-accent-secondary bg-accent-subtle text-accent-primary' : SETTINGS_BTN_NEUTRAL}`}>
                             {busy === type ? (
                                 <>
                                     {/* House spinner idiom (CoursesHome): a currentColor ring, halted for reduced motion. */}
@@ -250,7 +269,11 @@ const StudyRail: React.FC<StudyRailProps> = ({ courseId, scopeLessons, progress,
                     <div className="mt-2 space-y-1.5">
                         {AID_TYPES.filter((t) => !!errors[t]).map((t) => (
                             <SettingsNotice key={t} tone={tones.danger} icon={<XCircle size={13} />} alert className="">
-                                {errors[t]}
+                                <span className="font-medium">{AID_LABELS[t]}: </span>{errors[t]}
+                                <div className="mt-2 flex flex-wrap gap-2">
+                                    <button type="button" disabled={!canGenerate} onClick={() => { void generate(t, true); }} className={`${SETTINGS_BTN} focus-visible:ring-2 focus-visible:ring-accent-focus`}>Retry {t}</button>
+                                    <button type="button" onClick={() => { void window.electronAPI?.openSettingsTab?.('ai-providers'); }} className={`${SETTINGS_BTN} focus-visible:ring-2 focus-visible:ring-accent-focus`}>AI provider settings</button>
+                                </div>
                             </SettingsNotice>
                         ))}
                     </div>
@@ -258,12 +281,12 @@ const StudyRail: React.FC<StudyRailProps> = ({ courseId, scopeLessons, progress,
 
                 {/* Inline results — summary as rendered markdown, glossary as a term/definition list. */}
                 {results.summary && (
-                    <ResultCard title="Summary" onRegenerate={() => generate('summary', true)}>
+                    <ResultCard title="Summary" busy={busy !== null} onRegenerate={() => generate('summary', true)}>
                         <LessonMarkdown courseId={courseId} content={results.summary} />
                     </ResultCard>
                 )}
                 {results.glossary && (
-                    <ResultCard title={`Glossary · ${results.glossary.entries.length}`} onRegenerate={() => generate('glossary', true)}>
+                    <ResultCard title={`Glossary · ${results.glossary.entries.length}`} busy={busy !== null} onRegenerate={() => generate('glossary', true)}>
                         {/* One compact row per term — the rail is too narrow for stacked dt/dd detail. */}
                         <div className="space-y-2">{results.glossary.entries.map((entry) => (
                             <p key={entry.term} className="text-xs leading-relaxed text-text-secondary"><span className="font-medium text-text-primary">{entry.term}</span> — {entry.definition}</p>
@@ -273,39 +296,21 @@ const StudyRail: React.FC<StudyRailProps> = ({ courseId, scopeLessons, progress,
             </section>
 
             {/* Scope note — exactly which lessons fed the LLM pass for this aid set. */}
-            <p className="px-1 pb-0.5 text-[12px] leading-snug text-text-secondary">Aids generated from {lessonCountLabel(scopeLessons.length)} of this module.</p>
+            <div className="px-1 pb-0.5 text-xs leading-relaxed text-text-secondary">
+                <p>Scope: {lessonCountLabel(scopeLessons.length)}, including the current lesson.</p>
+                <ul className="mt-1 list-inside list-disc">{scopeLessons.map((lesson) => <li key={lesson.id} className="break-words">{lesson.title}</li>)}</ul>
+            </div>
 
-            {/* Quiz overlay — theme-aware scrim + fade/scale entry; Escape or backdrop click closes back to the rail. */}
-            <AnimatePresence>
-                {panel === 'quiz' && quizQuestions && (
-                    <motion.div key="study-aid-overlay-quiz" role="dialog" aria-modal="true" data-study-aid-overlay=""
-                        initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={overlayTransition}
-                        onClick={(e) => { if (e.target === e.currentTarget) setPanel(null); }}
-                        className={`fixed inset-0 z-50 flex items-center justify-center p-6 ${isLight ? 'bg-black/[0.06]' : 'bg-black/40'}`}>
-                        <motion.div initial={{ opacity: 0, scale: 0.96 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.96 }} transition={overlayTransition}
-                            className="max-h-[86vh] w-[min(720px,94vw)] overflow-y-auto rounded-xl border border-border-muted bg-bg-elevated p-5">
-                            <QuizPlayer questions={quizQuestions} onExit={() => setPanel(null)} />
-                        </motion.div>
-                    </motion.div>
-                )}
-            </AnimatePresence>
-
-            {/* Flashcards overlay — same treatment, plus an explicit Close under the deck. */}
-            <AnimatePresence>
-                {panel === 'flashcards' && flashCards && (
-                    <motion.div key="study-aid-overlay-flashcards" role="dialog" aria-modal="true" data-study-aid-overlay=""
-                        initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={overlayTransition}
-                        onClick={(e) => { if (e.target === e.currentTarget) setPanel(null); }}
-                        className={`fixed inset-0 z-50 flex items-center justify-center p-6 ${isLight ? 'bg-black/[0.06]' : 'bg-black/40'}`}>
-                        <motion.div initial={{ opacity: 0, scale: 0.96 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.96 }} transition={overlayTransition}
-                            className="flex max-h-[86vh] w-[min(560px,94vw)] flex-col overflow-y-auto rounded-xl border border-border-muted bg-bg-elevated p-5">
-                            <Flashcards cards={flashCards} />
-                            <button type="button" onClick={() => setPanel(null)} title="Close flashcards"
-                                className="mt-3 shrink-0 self-center rounded-full border border-border-muted bg-bg-input px-4 py-2 text-xs font-medium text-text-primary transition-all active:scale-[0.98] focus-visible:ring-2 focus-visible:ring-accent-focus">Close</button>
-                        </motion.div>
-                    </motion.div>
-                )}
-            </AnimatePresence>
+            {panel && (
+                <section ref={practice} tabIndex={-1} aria-label={panel === 'quiz' ? 'Practice quiz' : 'Flashcard practice'} data-study-aid-player="" className={`${CARD} min-w-0`}>
+                    <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                        <h3 className="text-sm font-semibold text-text-primary">{panel === 'quiz' ? 'Practice quiz' : 'Flashcards'}</h3>
+                        <button type="button" onClick={closePractice} className={`${SETTINGS_BTN} focus-visible:ring-2 focus-visible:ring-accent-focus`}>Close practice</button>
+                    </div>
+                    {panel === 'quiz' && quizQuestions && <QuizPlayer key={JSON.stringify(quizQuestions)} questions={quizQuestions} onExit={closePractice} />}
+                    {panel === 'flashcards' && flashCards && <Flashcards key={JSON.stringify(flashCards)} cards={flashCards} />}
+                </section>
+            )}
         </div>
     );
 };

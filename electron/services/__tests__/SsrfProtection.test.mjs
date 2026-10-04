@@ -130,7 +130,7 @@ describe('the guard is wired into every custom-provider executor', () => {
       `expected all three executors to check the host; found ${calls.length} call site(s)`);
   });
 
-  test('chatWithCurl checks the host before it calls axios', () => {
+  test('chatWithCurl checks the host before shared transport dispatch', () => {
     const start = src.indexOf('public async chatWithCurl(');
     assert.ok(start >= 0, 'chatWithCurl should exist');
     // Bound the body properly. The previous version passed a RegExp to indexOf,
@@ -139,10 +139,10 @@ describe('the guard is wired into every custom-provider executor', () => {
     const body = src.slice(start, next > start ? next : src.length);
 
     const guardAt = body.indexOf('blockedInfrastructureHost(');
-    const axiosAt = body.indexOf('axios(');
+    const dispatchAt = body.indexOf('this.collectCustomResponse(');
     assert.ok(guardAt >= 0, 'chatWithCurl must check the outbound host');
-    assert.ok(axiosAt >= 0, 'chatWithCurl should dispatch via axios');
-    assert.ok(guardAt < axiosAt, 'the host check must run BEFORE the request');
+    assert.ok(dispatchAt >= 0, 'chatWithCurl should use shared transport');
+    assert.ok(guardAt < dispatchAt, 'the host check must run BEFORE the request');
   });
 
   test('the check throws rather than returning the refusal as answer text', () => {
@@ -207,15 +207,12 @@ test('custom cURL transports never follow an unvalidated redirect target', () =>
     // own customProviderIsLocal() branch exists to support.
     const guard = 'blockedInfrastructureHost';
     const validationAt = body.indexOf(`${guard}(url)`);
-    const axiosAt = body.indexOf('axios({');
-    const redirectsAt = body.indexOf('maxRedirects: 0');
+    const dispatchAt = Math.max(body.indexOf('this.collectCustomResponse('), body.indexOf('this.streamCustomAttempt('));
+    const transport = codeOf(read('electron/llm/customProviderTransport.ts'));
 
     assert.ok(validationAt >= 0, `${entry.name} should validate its destination via ${guard}`);
-    assert.ok(axiosAt > validationAt, `${entry.name} should validate before dispatch`);
-    assert.ok(
-      redirectsAt > axiosAt,
-      `${entry.name} must disable redirects so the request body is not replayed to an unchecked URL`,
-    );
+    assert.ok(dispatchAt > validationAt, `${entry.name} should validate before shared dispatch`);
+    assert.ok(transport.includes("redirect: 'manual'"), 'shared fetch must refuse redirects');
   }
 });
 
@@ -240,14 +237,12 @@ test('fetch-based custom providers refuse redirects instead of replaying sensiti
     assert.ok(end > entry.start, `${entry.name} should have a bounded source block`);
 
     const body = source.slice(entry.start, end);
-    const fetchAt = body.indexOf('fetch(url, {');
-    const manualRedirectAt = body.indexOf("redirect: 'manual'");
-
-    assert.ok(fetchAt >= 0, `${entry.name} should dispatch through fetch`);
-    assert.ok(
-      manualRedirectAt > fetchAt,
-      `${entry.name} must use manual redirects so fetch cannot replay prompt data to another URL`,
-    );
+    assert.match(body, /streamCustomTransport\(/, `${entry.name} must use the shared transport`);
+    const transport = codeOf(read('electron/llm/customProviderTransport.ts'));
+    const fetchAt = transport.indexOf('fetch(options.url, {');
+    const manualRedirectAt = transport.indexOf("redirect: 'manual'");
+    assert.ok(fetchAt >= 0 && manualRedirectAt > fetchAt,
+      `${entry.name} must refuse redirects in shared fetch dispatch`);
   }
 });
 
@@ -273,7 +268,7 @@ test('fetch-based custom providers refuse metadata hosts — and stay able to re
 
     const body = codeOf(source.slice(entry.start, end));
     const validationAt = body.indexOf('blockedInfrastructureHost(url)');
-    const fetchAt = body.indexOf('fetch(url, {');
+    const fetchAt = Math.max(body.indexOf('this.collectCustomResponse('), body.indexOf('this.streamCustomAttempt('));
 
     // POLICY, and a deliberate departure from what this test asserted when it
     // arrived from main. It required validateUrlForSsrf here, which rejects

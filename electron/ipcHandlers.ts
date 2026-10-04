@@ -29,7 +29,7 @@ import { indexCourseForRetrieval } from './courses/embeddings';
 import { resolveCoursesStudioSettings } from './courses/defaults';
 import { runCourseImport } from './courses/ingest';
 import { resolveCourseDataDir, safeCourseDirName } from './courses/courseDir';
-import { buildCourseGroundedBlock } from './courses/chatGrounding';
+import { buildCourseGroundedBlock, courseGroundingAsReference } from './courses/chatGrounding';
 import { generateStudyAid } from './courses/studyAids';
 import { stripCourseFrontmatter } from './courses/markdown';
 import JSZip from 'jszip';
@@ -207,6 +207,7 @@ import {
 type DirectAssistSource = 'typed' | 'stt' | 'screenshot';
 
 interface DirectAssistRendererRequest {
+  courseIds?: string[];
   requestId: string;
   source: DirectAssistSource;
   currentRequest: string;
@@ -1677,7 +1678,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       message: string,
       imagePaths?: string[],
       context?: string,
-      options?: { skipSystemPrompt?: boolean },
+      options?: { skipSystemPrompt?: boolean; courseIds?: unknown },
     ) => {
       try {
         // Symmetric strip on the non-stream path: defense-in-depth against any
@@ -1685,9 +1686,11 @@ export function initializeIpcHandlers(appState: AppState): void {
         // `message`. The renderer does NOT currently inject it on either path;
         // both strips are belt-and-suspenders.
         const strippedMessage = stripEmbeddedAnswerContract(message);
+        const courseGrounding = courseGroundingAsReference(await getChatCourseGrounding(strippedMessage, options?.courseIds));
+        const groundedContext = [context, courseGrounding].filter(Boolean).join('\n\n') || undefined;
         const result = await appState.processingHelper
           .getLLMHelper()
-          .chatWithGemini(strippedMessage, imagePaths, context, options?.skipSystemPrompt);
+          .chatWithGemini(strippedMessage, imagePaths, groundedContext, options?.skipSystemPrompt);
 
         console.log(`[IPC] gemini - chat response received`, { length: result?.length ?? 0 });
 
@@ -1780,12 +1783,28 @@ export function initializeIpcHandlers(appState: AppState): void {
   // assistant-meta probes canned but routes candidate-ambiguous probes to the
   // profile fast path whenever a profile is loaded.
 
+  // Course retrieval is local SQL only. Do not send chat questions to an
+  // embedding provider merely to make enabled/pinned ground truth available.
+  const getChatCourseGrounding = async (message: string, courseIds?: unknown): Promise<string | null> => {
+    try {
+      const db = DatabaseManager.getInstance().getDb();
+      if (!db) return null;
+      const pinnedCourseIds = Array.isArray(courseIds)
+        ? courseIds.filter((id): id is string => typeof id === 'string' && id.length > 0).slice(0, 8)
+        : [];
+      return await buildCourseGroundedBlock({ message, pinnedCourseIds, storeLike: new CourseStore(db), db });
+    } catch (error) {
+      console.warn('[courses] chat grounding unavailable', error);
+      return null;
+    }
+  };
+
   const _geminiChatStreamHandler = async (
       event: any,
       message: string,
       imagePaths?: string[],
       context?: string,
-      options?: { skipSystemPrompt?: boolean; ignoreKnowledgeMode?: boolean; courseIds?: unknown; surface?: 'live' | 'chat'; liveQuestion?: boolean },
+      options?: { skipSystemPrompt?: boolean; ignoreKnowledgeMode?: boolean; courseIds?: unknown; surface?: 'live' | 'chat'; liveQuestion?: boolean; selectedModelOnly?: boolean; requestId?: string },
     ): Promise<null> => {
       const _courseIdsRaw = options?.courseIds;
       const pinnedCourseIds = Array.isArray(_courseIdsRaw)
@@ -1914,6 +1933,41 @@ export function initializeIpcHandlers(appState: AppState): void {
             event.sender.send('gemini-stream-error', `Skill lookup failed: ${skillErr?.message || 'unknown error'}`, { streamId: myStreamId });
             return null;  // sibling error paths return null; handler is typed `| null`
           }
+        }
+
+        courseBlock = courseGroundingAsReference(await getChatCourseGrounding(skillStrippedMessage ?? message, pinnedCourseIds));
+        if (myController.signal.aborted) return null;
+
+        // Global Ask-anything fallback has the same selected-model contract as
+        // RAG. Do not let a Background Model or active-mode pipeline steal it.
+        if (options?.selectedModelOnly) {
+          const groundingContext = [context, courseBlock, skillPromptBlock].filter(Boolean).join('\n\n') || undefined;
+          const { stream, outcome } = llmHelper.streamRAGAnswer(
+            skillStrippedMessage ?? message, imagePaths, groundingContext, CHAT_MODE_PROMPT,
+            true, true, courseBlock ? ['reference_files'] : [], myController.signal,
+            undefined, { v3Owned: true },
+          );
+          const { raceGeneratorWithDeadline } = require('./rag/RAGManager') as typeof import('./rag/RAGManager');
+          let finalText = '';
+          for await (const chunk of raceGeneratorWithDeadline(stream, 20_000, myController, undefined, policy => {
+            event.sender.send('chat:stream-policy', {
+              source: 'fallback', requestId: options.requestId, streamId: myStreamId,
+              firstUsefulDeadlineMs: policy.firstUsefulDeadlineMs, interTokenStallMs: policy.interTokenStallMs,
+            });
+          })) {
+            if (myController.signal.aborted) return null;
+            finalText += chunk;
+            event.sender.send('gemini-stream-token', chunk, { streamId: myStreamId, requestId: options.requestId });
+          }
+          if (!myController.signal.aborted) {
+            if (outcome.truncated) {
+              const { RAG_STREAM_INCOMPLETE_CODA } = require('./rag/RAGManager') as typeof import('./rag/RAGManager');
+              finalText += RAG_STREAM_INCOMPLETE_CODA;
+              event.sender.send('gemini-stream-token', RAG_STREAM_INCOMPLETE_CODA, { streamId: myStreamId, requestId: options.requestId });
+            }
+            event.sender.send('gemini-stream-done', { streamId: myStreamId, finalText, incomplete: outcome.truncated, requestId: options.requestId });
+          }
+          return null;
         }
 
         // ── CONTEXT INTELLIGENCE V3 — wired manual-chat surface ──────────────
@@ -2203,22 +2257,6 @@ export function initializeIpcHandlers(appState: AppState): void {
             ];
             const port = v3Ports.length > 1 ? combineRetrievalPorts(v3Ports as never[]) : modePort;
 
-            // Courses Studio ground-truth evidence, computed once before V3
-            // composition (assigned into the handler-body-level `courseBlock`
-            // declared near myController). Never throws; null when no courses
-            // are configured or nothing relevant matched.
-            try {
-              const cdb = DatabaseManager.getInstance().getDb();
-              if (cdb) {
-                courseBlock = await buildCourseGroundedBlock({
-                  message,
-                  pinnedCourseIds,
-                  storeLike: new CourseStore(cdb),
-                  db: cdb,
-                  pipeline: appState.getRAGManager()?.getEmbeddingPipeline() ?? null,
-                });
-              }
-            } catch (e) { console.warn('[courses] chat grounding unavailable', e); courseBlock = null; }
 
             // ONE construction, shared with every engine surface: the bridge
             // resolves the per-mode Answer policy, reads conversation state for
@@ -7836,6 +7874,9 @@ export function initializeIpcHandlers(appState: AppState): void {
       skillId: candidate.skillId as string | undefined,
       manualContext: candidate.manualContext as string | undefined,
       referenceContext: candidate.referenceContext as string | undefined,
+      courseIds: Array.isArray(candidate.courseIds)
+        ? candidate.courseIds.filter((id): id is string => typeof id === 'string' && id.length > 0).slice(0, 8)
+        : [],
       pageContext,
       history,
       transcript: candidate.transcript as string | undefined,
@@ -8063,6 +8104,9 @@ export function initializeIpcHandlers(appState: AppState): void {
     } catch (error) {
       console.warn('[direct-assist] live session transcript unavailable, proceeding without it:', (error as Error)?.message);
     }
+
+    const courseGrounding = await getChatCourseGrounding(resolvedSkill.currentRequest, request.courseIds);
+    if (courseGrounding) referenceFiles.unshift({ fileName: 'Course ground truth', content: courseGrounding });
 
     const directRequest: DirectAssistRequestInput = Object.freeze({
       requestId: request.requestId,
@@ -12577,15 +12621,28 @@ export function initializeIpcHandlers(appState: AppState): void {
     try {
       const { CredentialsManager } = require('./services/CredentialsManager');
       const cm = CredentialsManager.getInstance();
+      if (cm.isCredentialStoreDegraded()) {
+        throw new Error('Your credential store is unavailable this session. Restart Natively and try again.');
+      }
       // Merge new Curl Providers with legacy Custom Providers
       // New ones take precedence if IDs conflict (though unlikely as UUIDs)
       const curlProviders = cm.getCurlProviders();
       const legacyProviders = cm.getCustomProviders() || [];
       return [...curlProviders, ...legacyProviders];
-    } catch (error: any) {
-      console.error('Error getting custom providers:', error);
-      return [];
+    } catch {
+      // A false empty list can make Settings confirm a refused deletion. Reject
+      // with safe copy, never an exception containing a cURL token or user path.
+      console.error('[IPC] Could not read custom providers from credential storage');
+      throw new Error('Could not load custom providers. Your credential store may be unavailable; restart Natively and try again.');
     }
+  });
+
+  const customProviderWriteFailure = (degraded: boolean) => ({
+    success: false,
+    error: degraded ? 'credential_store_degraded' : 'credential_persistence_failed',
+    message: degraded
+      ? 'Your credential store is unavailable this session. Restart Natively and try again.'
+      : 'Could not save the custom provider change. Check available disk space and storage access, then try again.',
   });
 
   const validateCurlProviderPayload = (provider: unknown): { ok: true } | { ok: false; error: string } => {
@@ -12627,28 +12684,31 @@ export function initializeIpcHandlers(appState: AppState): void {
       }
 
       const { CredentialsManager } = require('./services/CredentialsManager');
-      CredentialsManager.getInstance().saveCurlProvider(provider as any);
+      const cm = CredentialsManager.getInstance();
+      if (cm.isCredentialStoreDegraded()) return customProviderWriteFailure(true);
+      if (!cm.saveCurlProvider(provider as any)) return customProviderWriteFailure(cm.isCredentialStoreDegraded());
       await refreshRuntimeDefaultIfUnavailable();
       broadcastCredentialsChanged();
       return { success: true };
-    } catch (error: any) {
-      console.error('Error saving custom provider:', error);
-      return { success: false, error: error.message };
+    } catch {
+      console.error('[IPC] Could not save custom provider');
+      return customProviderWriteFailure(false);
     }
   });
 
   safeHandle('delete-custom-provider', async (_, id: string) => {
     try {
+      if (typeof id !== 'string' || !id.trim()) return { success: false, error: 'Invalid provider id' };
       const { CredentialsManager } = require('./services/CredentialsManager');
-      // Try deleting from both storages to be safe
-      CredentialsManager.getInstance().deleteCurlProvider(id);
-      CredentialsManager.getInstance().deleteCustomProvider(id);
+      const cm = CredentialsManager.getInstance();
+      if (cm.isCredentialStoreDegraded()) return customProviderWriteFailure(true);
+      if (!cm.deleteConfiguredCustomProvider(id)) return customProviderWriteFailure(cm.isCredentialStoreDegraded());
       await refreshRuntimeDefaultIfUnavailable();
       broadcastCredentialsChanged();
       return { success: true };
-    } catch (error: any) {
-      console.error('Error deleting custom provider:', error);
-      return { success: false, error: error.message };
+    } catch {
+      console.error('[IPC] Could not delete custom provider');
+      return customProviderWriteFailure(false);
     }
   });
 
@@ -12683,10 +12743,12 @@ export function initializeIpcHandlers(appState: AppState): void {
   safeHandle('get-curl-providers', async () => {
     try {
       const { CredentialsManager } = require('./services/CredentialsManager');
-      return CredentialsManager.getInstance().getCurlProviders();
-    } catch (error: any) {
-      console.error('Error getting curl providers:', error);
-      return [];
+      const cm = CredentialsManager.getInstance();
+      if (cm.isCredentialStoreDegraded()) throw new Error('Credential store unavailable');
+      return cm.getCurlProviders();
+    } catch {
+      console.error('[IPC] Could not read curl providers from credential storage');
+      throw new Error('Could not load custom providers. Your credential store may be unavailable; restart Natively and try again.');
     }
   });
 
@@ -12699,22 +12761,27 @@ export function initializeIpcHandlers(appState: AppState): void {
       }
 
       const { CredentialsManager } = require('./services/CredentialsManager');
-      CredentialsManager.getInstance().saveCurlProvider(provider as any);
+      const cm = CredentialsManager.getInstance();
+      if (cm.isCredentialStoreDegraded()) return customProviderWriteFailure(true);
+      if (!cm.saveCurlProvider(provider as any)) return customProviderWriteFailure(cm.isCredentialStoreDegraded());
       return { success: true };
-    } catch (error: any) {
-      console.error('Error saving curl provider:', error);
-      return { success: false, error: error.message };
+    } catch {
+      console.error('[IPC] Could not save curl provider');
+      return customProviderWriteFailure(false);
     }
   });
 
   safeHandle('delete-curl-provider', async (_, id: string) => {
     try {
+      if (typeof id !== 'string' || !id.trim()) return { success: false, error: 'Invalid provider id' };
       const { CredentialsManager } = require('./services/CredentialsManager');
-      CredentialsManager.getInstance().deleteCurlProvider(id);
+      const cm = CredentialsManager.getInstance();
+      if (cm.isCredentialStoreDegraded()) return customProviderWriteFailure(true);
+      if (!cm.deleteCurlProvider(id)) return customProviderWriteFailure(cm.isCredentialStoreDegraded());
       return { success: true };
-    } catch (error: any) {
-      console.error('Error deleting curl provider:', error);
-      return { success: false, error: error.message };
+    } catch {
+      console.error('[IPC] Could not delete curl provider');
+      return customProviderWriteFailure(false);
     }
   });
 
@@ -16787,7 +16854,7 @@ export function initializeIpcHandlers(appState: AppState): void {
   // Query meeting with RAG (meeting-scoped)
   safeHandle(
     'rag:query-meeting',
-    async (event, { meetingId, query }: { meetingId: string; query: string }) => {
+    async (event, { meetingId, query, courseIds }: { meetingId: string; query: string; courseIds?: unknown }) => {
       const ragManager = appState.getRAGManager();
 
       if (!ragManager || !ragManager.isReady()) {
@@ -16814,7 +16881,8 @@ export function initializeIpcHandlers(appState: AppState): void {
       activeRAGQueries.set(queryKey, abortController);
 
       try {
-        const stream = ragManager.queryMeeting(meetingId, query, abortController.signal);
+        const courseGrounding = await getChatCourseGrounding(query, courseIds);
+        const stream = ragManager.queryMeeting(meetingId, query, abortController.signal, courseGrounding);
 
         for await (const chunk of stream) {
           if (abortController.signal.aborted) break;
@@ -16961,7 +17029,7 @@ export function initializeIpcHandlers(appState: AppState): void {
   }
 
   // Query live meeting with JIT RAG
-  safeHandle('rag:query-live', async (event, { query }: { query: string }) => {
+  safeHandle('rag:query-live', async (event, { query, courseIds }: { query: string; courseIds?: unknown }) => {
     const ragManager = appState.getRAGManager();
 
     if (!ragManager || !ragManager.isReady()) {
@@ -17024,7 +17092,8 @@ export function initializeIpcHandlers(appState: AppState): void {
     const manualActiveMode = ModesManager.getInstance().getActiveMode();
 
     try {
-      const stream = ragManager.queryMeeting(liveMeetingId, query, abortController.signal);
+      const courseGrounding = await getChatCourseGrounding(query, courseIds);
+      const stream = ragManager.queryMeeting(liveMeetingId, query, abortController.signal, courseGrounding);
 
       // Accumulated so the turn can be RECORDED (issue #552). A RAG-answered
       // turn used to leave no trace in main: not in the conversation ring V3
@@ -17072,7 +17141,7 @@ export function initializeIpcHandlers(appState: AppState): void {
   });
 
   // Query global (cross-meeting search)
-  safeHandle('rag:query-global', async (event, { query }: { query: string }) => {
+  safeHandle('rag:query-global', async (event, { query, courseIds, requestId }: { query: string; courseIds?: unknown; requestId?: string }) => {
     const ragManager = appState.getRAGManager();
 
     if (!ragManager || !ragManager.isReady()) {
@@ -17086,21 +17155,27 @@ export function initializeIpcHandlers(appState: AppState): void {
     activeRAGQueries.set(queryKey, abortController);
 
     try {
-      const stream = ragManager.queryGlobal(query, abortController.signal);
+      const courseGrounding = await getChatCourseGrounding(query, courseIds);
+      const stream = ragManager.queryGlobal(query, abortController.signal, courseGrounding, policy => {
+        event.sender.send('chat:stream-policy', {
+          source: 'rag', requestId,
+          firstUsefulDeadlineMs: policy.firstUsefulDeadlineMs, interTokenStallMs: policy.interTokenStallMs,
+        });
+      });
 
       for await (const chunk of stream) {
         if (abortController.signal.aborted) break;
-        event.sender.send('rag:stream-chunk', { global: true, chunk });
+        event.sender.send('rag:stream-chunk', { global: true, requestId, chunk });
       }
 
       // See the meeting-scoped handler's identical comment above.
       if (!abortController.signal.aborted) {
-        event.sender.send('rag:stream-complete', { global: true });
+        event.sender.send('rag:stream-complete', { global: true, requestId });
       }
       return { success: true };
     } catch (error: any) {
       if (error.name !== 'AbortError') {
-        event.sender.send('rag:stream-error', { global: true, error: error.message });
+        event.sender.send('rag:stream-error', { global: true, requestId, error: error.message });
       }
       return { success: false, error: error.message };
     } finally {
@@ -19968,6 +20043,8 @@ export function initializeIpcHandlers(appState: AppState): void {
         // The design on the table joins this turn's context (a follow-up typed
         // on the phone refines the design drawn on the desktop).
         if (phoneDiagramTurn) context = withDiagramTurnBlock(context, phoneDiagramTurn) || context;
+        const phoneCourseGrounding = courseGroundingAsReference(await getChatCourseGrounding(message));
+        if (phoneCourseGrounding) context = context ? `${context}\n\n${phoneCourseGrounding}` : phoneCourseGrounding;
         const stream = llmHelper.streamChat(message, phoneImagePaths.length ? phoneImagePaths : undefined, context, phoneBasePrompt(resolveCodingPromptSignals({ answerType: phoneRouteOptions?.answerType as any, question: message }), 'live'), false, false, [], phoneController.signal, undefined, phoneRouteOptions);
         let full = '';
         let phoneSuperseded = false;

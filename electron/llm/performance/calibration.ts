@@ -163,6 +163,7 @@ async function runOne(
     await raceStreamWithDeadline({
       stream,
       firstUsefulDeadlineMs: timeoutMs,
+      deadlinePolicy: 'caller',
       onToken: (t) => { text += t; },
       isUsefulYet: () => text.trim().length > 0,
       observe: (o) => { captured = o; },

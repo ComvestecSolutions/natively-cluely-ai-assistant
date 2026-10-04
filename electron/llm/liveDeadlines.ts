@@ -21,6 +21,7 @@
 // 134-second hang). See raceStreamWithDeadline() below.
 
 import type { AnswerType } from './AnswerPlanner';
+import { providerStreamPolicy } from './providerStreamPolicy';
 
 /** First-useful-token budget by difficulty (ms). Mirrors the planner targets. */
 export const LIVE_FIRST_USEFUL_BUDGET_MS = {
@@ -703,6 +704,9 @@ export async function raceStreamWithDeadline(opts: {
   stream: AsyncGenerator<string> | AsyncIterable<string>;
   firstUsefulDeadlineMs: number;
   interTokenStallMs?: number;
+  /** 'caller' preserves an intentional quick/utility budget. Default live route
+   * budgets may defer to the selected local transport's bounded warmup policy. */
+  deadlinePolicy?: 'provider' | 'caller';
   isSpeculative?: boolean;
   onToken: (value: string) => void | Promise<void>;
   /** Return true once `accumulated` is user-useful. */
@@ -738,11 +742,23 @@ export async function raceStreamWithDeadline(opts: {
   observe?: StreamObserver;
 }): Promise<'done' | 'first_useful_timeout' | 'stall_timeout' | 'aborted'> {
   const {
-    stream, firstUsefulDeadlineMs: fuMs, interTokenStallMs = LIVE_INTER_TOKEN_STALL_MS,
+    stream,
     isSpeculative = false, onToken, isUsefulYet, onFirstUsefulTimeout, onStallTimeout, shouldAbort, onCleanup,
     observe,
   } = opts;
+  const streamPolicy = providerStreamPolicy(stream);
+  const policy = opts.deadlinePolicy === 'caller' ? undefined : streamPolicy;
+  const signal = streamPolicy?.signal;
+  const fuMs = policy?.firstUsefulDeadlineMs ?? opts.firstUsefulDeadlineMs;
+  const interTokenStallMs = policy?.interTokenStallMs ?? opts.interTokenStallMs ?? LIVE_INTER_TOKEN_STALL_MS;
   const iterator = (stream as AsyncIterable<string>)[Symbol.asyncIterator]();
+  const ABORTED = Symbol('provider-stream-aborted');
+  let onAbort: (() => void) | undefined;
+  const cancelled = new Promise<typeof ABORTED>(resolve => {
+    onAbort = () => resolve(ABORTED);
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener('abort', onAbort, { once: true });
+  });
   const start = Date.now();
   let lastTokenAt = start;
   let useful = false;
@@ -764,6 +780,7 @@ export async function raceStreamWithDeadline(opts: {
     error?: unknown,
   ) => {
     try { observe?.beforeCleanup?.(); } catch { /* measurement must never break cleanup */ }
+    if (onAbort) signal?.removeEventListener('abort', onAbort);
     try { onCleanup?.(reason); } catch { /* abort callback must not break cleanup */ }
     // AFTER onCleanup, so the observation is never taken on a turn the caller
     // has not finished tearing down — and inside its own try for the same
@@ -788,14 +805,23 @@ export async function raceStreamWithDeadline(opts: {
     // eslint-disable-next-line no-constant-condition
     while (true) {
       if (shouldAbort?.()) { cleanup('aborted'); return 'aborted'; }
-      let res: IteratorResult<string> | typeof DEADLINE;
+      let res: IteratorResult<string> | typeof DEADLINE | typeof ABORTED;
       if (!isSpeculative) {
         if (!useful) useful = isUsefulYet();
-        const remaining = !useful
-          ? Math.max(50, fuMs - (Date.now() - start))
-          : Math.max(50, interTokenStallMs - (Date.now() - lastTokenAt));
+        const remaining = () => !useful
+          ? fuMs - (Date.now() - start)
+          : interTokenStallMs - (Date.now() - Math.max(lastTokenAt, policy?.lastActivityAt ?? lastTokenAt));
         let timer: ReturnType<typeof setTimeout> | undefined;
-        const deadline = new Promise<typeof DEADLINE>((r) => { timer = setTimeout(() => r(DEADLINE), remaining); });
+        const deadline = new Promise<typeof DEADLINE>(resolve => {
+          const check = () => {
+            const ms = remaining();
+            // Hidden reasoning can reset activity while the SAME next() remains
+            // pending. Re-arm its timer, never issue a concurrent iterator.next().
+            if (ms > 0) timer = setTimeout(check, Math.max(50, ms));
+            else resolve(DEADLINE);
+          };
+          timer = setTimeout(check, Math.max(50, remaining()));
+        });
         // DEFUSE the racing next() promise: if the deadline wins, this promise is
         // still pending and unobserved — when the hung provider's request later
         // rejects (timeout / 429 / socket reset) it would surface as an
@@ -803,8 +829,9 @@ export async function raceStreamWithDeadline(opts: {
         // loser can never be an unhandled rejection (code-review 2026-06-05, HIGH).
         const nextP = iterator.next();
         nextP.catch(() => { /* loser of the race — defused */ });
-        res = await Promise.race([nextP, deadline]);
-        if (timer) clearTimeout(timer);
+        try { res = await Promise.race([nextP, deadline, cancelled]); }
+        finally { if (timer) clearTimeout(timer); }
+        if (res === ABORTED) { cleanup('aborted'); return 'aborted'; }
         if (res === DEADLINE) {
           if (!useful) {
             cleanup('first_useful_timeout');
@@ -816,7 +843,8 @@ export async function raceStreamWithDeadline(opts: {
           return 'stall_timeout';
         }
       } else {
-        res = await iterator.next();
+        res = await Promise.race([iterator.next(), cancelled]);
+        if (res === ABORTED) { cleanup('aborted'); return 'aborted'; }
       }
       if (res.done) { cleanup('done'); return 'done'; }
       const now = Date.now();

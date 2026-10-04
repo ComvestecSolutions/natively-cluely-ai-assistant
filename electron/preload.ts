@@ -18,6 +18,7 @@ interface DomCaptureMeta {
 type DirectAssistSource = 'typed' | 'stt' | 'screenshot';
 
 interface DirectAssistRequest {
+  courseIds?: string[];
   requestId: string;
   source: DirectAssistSource;
   currentRequest: string;
@@ -840,10 +841,10 @@ interface ElectronAPI {
     message: string,
     imagePaths?: string[],
     context?: string,
-    options?: { skipSystemPrompt?: boolean; ignoreKnowledgeMode?: boolean; liveQuestion?: boolean },
+    options?: { skipSystemPrompt?: boolean; ignoreKnowledgeMode?: boolean; courseIds?: string[]; liveQuestion?: boolean; selectedModelOnly?: boolean; requestId?: string },
   ) => Promise<void>;
-  onGeminiStreamToken: (callback: (token: string, meta?: { streamId?: number }) => void) => () => void;
-  onGeminiStreamDone: (callback: (data?: { finalText?: string; streamId?: number }) => void) => () => void;
+  onGeminiStreamToken: (callback: (token: string, meta?: { streamId?: number; requestId?: string }) => void) => () => void;
+  onGeminiStreamDone: (callback: (data?: { finalText?: string; streamId?: number; requestId?: string; incomplete?: boolean }) => void) => () => void;
   onGeminiStreamError: (callback: (error: string, meta?: { streamId?: number | null; source?: string }) => void) => () => void;
 
   onUndetectableChanged: (callback: (state: boolean) => void) => () => void;
@@ -909,15 +910,20 @@ interface ElectronAPI {
   testReleaseFetch: () => Promise<{ success: boolean; error?: string }>;
 
   // RAG (Retrieval-Augmented Generation) API
+  onChatStreamPolicy: (callback: (data: { source: 'rag' | 'fallback'; requestId?: string; streamId?: number; firstUsefulDeadlineMs: number; interTokenStallMs: number }) => void) => () => void;
   ragQueryMeeting: (
     meetingId: string,
     query: string,
+    courseIds?: string[],
   ) => Promise<{ success?: boolean; fallback?: boolean; error?: string }>;
   ragQueryLive: (
     query: string,
+    courseIds?: string[],
   ) => Promise<{ success?: boolean; fallback?: boolean; error?: string }>;
   ragQueryGlobal: (
     query: string,
+    courseIds?: string[],
+    requestId?: string,
   ) => Promise<{ success?: boolean; fallback?: boolean; error?: string }>;
   ragCancelQuery: (options: {
     meetingId?: string;
@@ -932,13 +938,13 @@ interface ElectronAPI {
   }>;
   ragRetryEmbeddings: () => Promise<{ success: boolean }>;
   onRAGStreamChunk: (
-    callback: (data: { meetingId?: string; global?: boolean; live?: boolean; chunk: string }) => void,
+    callback: (data: { meetingId?: string; global?: boolean; live?: boolean; requestId?: string; chunk: string }) => void,
   ) => () => void;
   onRAGStreamComplete: (
-    callback: (data: { meetingId?: string; global?: boolean; live?: boolean }) => void,
+    callback: (data: { meetingId?: string; global?: boolean; live?: boolean; requestId?: string }) => void,
   ) => () => void;
   onRAGStreamError: (
-    callback: (data: { meetingId?: string; global?: boolean; live?: boolean; error: string }) => void,
+    callback: (data: { meetingId?: string; global?: boolean; live?: boolean; requestId?: string; error: string }) => void,
   ) => () => void;
 
   // Keybind Management
@@ -2495,21 +2501,21 @@ contextBridge.exposeInMainWorld('electronAPI', {
     message: string,
     imagePaths?: string[],
     context?: string,
-    options?: { skipSystemPrompt?: boolean; ignoreKnowledgeMode?: boolean; liveQuestion?: boolean },
+    options?: { skipSystemPrompt?: boolean; ignoreKnowledgeMode?: boolean; courseIds?: string[]; liveQuestion?: boolean; selectedModelOnly?: boolean; requestId?: string },
   ) => ipcRenderer.invoke('gemini-chat-stream', message, imagePaths, context, options),
 
-  onGeminiStreamToken: (callback: (token: string, meta?: { streamId?: number }) => void) => {
+  onGeminiStreamToken: (callback: (token: string, meta?: { streamId?: number; requestId?: string }) => void) => {
     // meta is an optional 2nd arg carrying { streamId } (audit finding #3). Existing
     // (token)=>… callbacks ignore it; the renderer uses it to drop stale-stream tokens.
-    const subscription = (_: any, token: string, meta?: { streamId?: number }) => callback(token, meta);
+    const subscription = (_: any, token: string, meta?: { streamId?: number; requestId?: string }) => callback(token, meta);
     ipcRenderer.on('gemini-stream-token', subscription);
     return () => {
       ipcRenderer.removeListener('gemini-stream-token', subscription);
     };
   },
 
-  onGeminiStreamDone: (callback: (data?: { finalText?: string; streamId?: number }) => void) => {
-    const subscription = (_: any, data?: { finalText?: string; streamId?: number }) => callback(data);
+  onGeminiStreamDone: (callback: (data?: { finalText?: string; streamId?: number; requestId?: string; incomplete?: boolean }) => void) => {
+    const subscription = (_: any, data?: { finalText?: string; streamId?: number; requestId?: string; incomplete?: boolean }) => callback(data);
     ipcRenderer.on('gemini-stream-done', subscription);
     return () => {
       ipcRenderer.removeListener('gemini-stream-done', subscription);
@@ -2830,10 +2836,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   testReleaseFetch: () => ipcRenderer.invoke('test-release-fetch'),
 
   // RAG API
-  ragQueryMeeting: (meetingId: string, query: string) =>
-    ipcRenderer.invoke('rag:query-meeting', { meetingId, query }),
-  ragQueryLive: (query: string) => ipcRenderer.invoke('rag:query-live', { query }),
-  ragQueryGlobal: (query: string) => ipcRenderer.invoke('rag:query-global', { query }),
+  ragQueryMeeting: (meetingId: string, query: string, courseIds?: string[]) =>
+    ipcRenderer.invoke('rag:query-meeting', { meetingId, query, courseIds }),
+  ragQueryLive: (query: string, courseIds?: string[]) => ipcRenderer.invoke('rag:query-live', { query, courseIds }),
+  ragQueryGlobal: (query: string, courseIds?: string[], requestId?: string) => ipcRenderer.invoke('rag:query-global', { query, courseIds, requestId }),
   ragCancelQuery: (options: { meetingId?: string; global?: boolean }) =>
     ipcRenderer.invoke('rag:cancel-query', options),
   ragIsMeetingProcessed: (meetingId: string) =>
@@ -2888,8 +2894,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   reindexIncompatibleMeetings: () => ipcRenderer.invoke('rag:reindex-incompatible-meetings'),
 
+  onChatStreamPolicy: (callback) => {
+    const subscription = (_: any, data: Parameters<typeof callback>[0]) => callback(data);
+    ipcRenderer.on('chat:stream-policy', subscription);
+    return () => ipcRenderer.removeListener('chat:stream-policy', subscription);
+  },
   onRAGStreamChunk: (
-    callback: (data: { meetingId?: string; global?: boolean; live?: boolean; chunk: string }) => void,
+    callback: (data: { meetingId?: string; global?: boolean; live?: boolean; requestId?: string; chunk: string }) => void,
   ) => {
     const subscription = (_: any, data: any) => callback(data);
     ipcRenderer.on('rag:stream-chunk', subscription);
@@ -2897,7 +2908,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.removeListener('rag:stream-chunk', subscription);
     };
   },
-  onRAGStreamComplete: (callback: (data: { meetingId?: string; global?: boolean }) => void) => {
+  onRAGStreamComplete: (callback: (data: { meetingId?: string; global?: boolean; requestId?: string }) => void) => {
     const subscription = (_: any, data: any) => callback(data);
     ipcRenderer.on('rag:stream-complete', subscription);
     return () => {
@@ -2905,7 +2916,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     };
   },
   onRAGStreamError: (
-    callback: (data: { meetingId?: string; global?: boolean; live?: boolean; error: string }) => void,
+    callback: (data: { meetingId?: string; global?: boolean; live?: boolean; requestId?: string; error: string }) => void,
   ) => {
     const subscription = (_: any, data: any) => callback(data);
     ipcRenderer.on('rag:stream-error', subscription);

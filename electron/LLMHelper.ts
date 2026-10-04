@@ -74,6 +74,8 @@ import { profileInterceptAllowedByRoute, modeAnswerType, type StreamRouteOptions
 import type { ActiveModeDocumentGroundingInfo } from "./services/ModesManager"
 import type { TranscriptTurn } from "./llm/transcriptCleaner"
 import { applyCurlVariables, getByPath, injectImageIntoMessages, flattenStructuredJsonAnswer, blockedInfrastructureHost } from './utils/curlUtils';
+import { customRequestBody, streamCustomTransport, CustomProviderTransportError, CUSTOM_REQUEST_TIMEOUT_MS, CUSTOM_LOCAL_IDLE_TIMEOUT_MS, type CustomAttemptState } from './llm/customProviderTransport';
+import { withProviderStreamPolicy, type ProviderStreamPolicy } from './llm/providerStreamPolicy';
 import { getImageOptimizer } from './services/screen/ImageOptimizer';
 import { isPhoneImagePath, visionImageEdge } from './utils/phoneImage';
 import curl2Json from "@bany/curl-to-json";
@@ -3120,7 +3122,10 @@ export class LLMHelper {
     // to be intercepted by the unified vision chain far above this; reaching here
     // with images means that chain already declined, and a text-only rescue is
     // not a rescue.
-    if (opts.hasImages) {
+    // A local weight load / reasoning phase must not be hedged: the second
+    // request competes for the same GPU and both get killed by the cloud TTFT.
+    const localCustom = opts.id === 'custom' && customProviderIsLocal(this.customProvider);
+    if (opts.hasImages || localCustom) {
       yield* opts.open(opts.abortSignal ?? new AbortController().signal);
       return;
     }
@@ -7595,7 +7600,7 @@ let isMultimodal = !!(imagePaths?.length);
   }
 
   // The handler for cURL requests
-  public async chatWithCurl(userMessage: string, systemPrompt?: string, imagePath?: string): Promise<string> {
+  public async chatWithCurl(userMessage: string, systemPrompt?: string, imagePath?: string, abortSignal?: AbortSignal): Promise<string> {
     if (!this.activeCurlProvider) throw new Error("No cURL provider active");
     this.assertOutboundScopes('custom_curl', userMessage, imagePath ? [imagePath] : undefined);
 
@@ -7646,6 +7651,10 @@ let isMultimodal = !!(imagePaths?.length);
       // model as the literal characters \" and \n. Serialization is the
       // serializer's job; the value goes in as the user wrote it.
       TEXT: fullPrompt,
+      PROMPT: fullPrompt,
+      SYSTEM_PROMPT: systemPrompt || '',
+      USER_MESSAGE: userMessage,
+      CONTEXT: '',
       IMAGE_BASE64: base64Image,
     };
 
@@ -7696,44 +7705,17 @@ let isMultimodal = !!(imagePaths?.length);
     // Bounded timeout: without it a hung user-configured endpoint stalls the
     // whole session indefinitely. 5 min is generous for local models that may
     // need to load into VRAM, while still failing over in bounded time.
-    try {
-      const templateSource = JSON.stringify(curlConfig.data ?? {});
-      const markerIntegrity = /\{\{\s*TEXT\s*\}\}/.test(templateSource);
-      require('./llm/providerPayloadCapture').captureProviderPayload({
-        provider: 'raw_curl',
-        classification: 'custom_template_expanded_payload',
-        payload: data,
-        serializedPayload: (() => { try { return JSON.stringify(data); } catch { return undefined; } })(),
-        markerIntegrity,
-      });
-      const response = await axios({
-        method: curlConfig.method || 'POST',
-        url: url,
-        headers: headers,
-        data: data,
-        // Matches the 5-minute budget documented above for local models that
-        // may need to load into VRAM before responding. Cloud providers finish
-        // well before this, so the ceiling only bites on genuine hangs.
-        timeout: 300_000,
-        // The URL above is the only destination that passed the SSRF policy.
-        // Never replay the prompt, credentials, or image body to an unchecked
-        // redirect target.
-        maxRedirects: 0,
-      });
-
-      // 6. Extract Answer
-      // If user didn't specify a path, try to guess or dump string
-      if (!responsePath) return JSON.stringify(response.data);
-
-      const answer = getByPath(response.data, responsePath);
-
-      if (typeof answer === 'string') return flattenStructuredJsonAnswer(answer) ?? answer;
-      return JSON.stringify(answer); // Fallback if they pointed to an object
-
-    } catch (error: any) {
-      console.error("[LLMHelper] cURL Execution Error:", error.message);
-      return `Error: ${error.message}`;
-    }
+    data = customRequestBody(data, false);
+    const templateSource = JSON.stringify(curlConfig.data ?? {});
+    const markerIntegrity = /\{\{\s*TEXT\s*\}\}/.test(templateSource);
+    require('./llm/providerPayloadCapture').captureProviderPayload({
+      provider: 'raw_curl',
+      classification: 'custom_template_expanded_payload',
+      payload: data,
+      serializedPayload: (() => { try { return JSON.stringify(data); } catch { return undefined; } })(),
+      markerIntegrity,
+    });
+    return await this.collectCustomResponse(url, headers, data, curlConfig.method || 'POST', responsePath, abortSignal);
   }
 
   /**
@@ -7828,6 +7810,7 @@ let isMultimodal = !!(imagePaths?.length);
     context: string,
     imagePath?: string,
     responsePath?: string,
+    abortSignal?: AbortSignal,
   ): Promise<string> {
     this.assertOutboundScopes('custom_provider', combinedMessage, imagePath ? [imagePath] : undefined);
 
@@ -7922,54 +7905,39 @@ let isMultimodal = !!(imagePaths?.length);
     //     local endpoint — 8 CustomProviderWirePayload cases went red with
     //     "SSRF protection blocked URL (Loopback addresses are not allowed)".
 
-    // 5. Execute Fetch — generous timeout for local models that may need to load
-    //    into VRAM before processing (model load + prompt eval + generation can
-    //    easily exceed 30s for quantized models). User-cancel via the UI still
-    //    terminates immediately. Cloud providers respond in seconds anyway.
-    const CUSTOM_PROVIDER_TIMEOUT_MS = 300_000; // 5 minutes
-    const customAbort = new AbortController();
-    const customTimeout = setTimeout(() => customAbort.abort(), CUSTOM_PROVIDER_TIMEOUT_MS);
-    try {
-      const serializedBody = JSON.stringify(body);
-      // markerIntegrity reports whether the template actually substituted our
-      // placeholders (TEXT/PROMPT/USER_MESSAGE) into the expanded body — a
-      // template that never referenced them would silently drop the prompt.
-      const templateSource = JSON.stringify(requestConfig.data ?? {});
-      const markerIntegrity = /\{\{\s*(TEXT|PROMPT|USER_MESSAGE)\s*\}\}/.test(templateSource);
-      require('./llm/providerPayloadCapture').captureProviderPayload({
-        provider: 'custom_curl',
-        classification: 'custom_template_expanded_payload',
-        payload: body,
-        serializedPayload: serializedBody,
-        markerIntegrity,
-      });
-      const response = await fetch(url, {
-        method: requestConfig.method || 'POST',
-        headers: headers,
-        body: serializedBody,
-        signal: customAbort.signal,
-        // Do not replay credentials or generated content to an unchecked URL.
-        redirect: 'manual',
-      });
-      clearTimeout(customTimeout);
+    body = customRequestBody(body, false);
+    const serializedBody = JSON.stringify(body);
+    // markerIntegrity reports whether the template actually substituted our
+    // placeholders (TEXT/PROMPT/USER_MESSAGE) into the expanded body — a
+    // template that never referenced them would silently drop the prompt.
+    const templateSource = JSON.stringify(requestConfig.data ?? {});
+    const markerIntegrity = /\{\{\s*(TEXT|PROMPT|USER_MESSAGE)\s*\}\}/.test(templateSource);
+    require('./llm/providerPayloadCapture').captureProviderPayload({
+      provider: 'custom_curl',
+      classification: 'custom_template_expanded_payload',
+      payload: body,
+      serializedPayload: serializedBody,
+      markerIntegrity,
+    });
+    return await this.collectCustomResponse(url, headers, body, requestConfig.method || 'POST', responsePath, abortSignal);
+  }
 
-      const data = await response.json();
-      console.log(`[LLMHelper] Custom Provider response received`, { status: response.status, ok: response.ok });
-
-      if (!response.ok) {
-        throw new Error(`Custom Provider HTTP ${response.status}`);
+  private async collectCustomResponse(url: string, headers: Record<string, string>, body: unknown, method: string, responsePath?: string, signal?: AbortSignal): Promise<string> {
+    let answer = '';
+    for await (const piece of streamCustomTransport({
+      url, headers, body: customRequestBody(body, false), method, signal,
+      state: { outputStreamed: false },
+      extractWhole: data => this.extractCustomAnswer(data, responsePath),
+      extractDelta: data => this.extractFromCommonFormats(data),
+      extractLine: data => this.extractCustomAnswer(data, responsePath, false),
+    })) {
+      if (answer.length + piece.length > 16 * 1024 * 1024) {
+        throw new CustomProviderTransportError('Custom provider buffered answer exceeded the size limit.');
       }
-
-      // 6. Extract Answer — the user's configured responsePath first, then the
-      //    shape heuristics. See extractCustomAnswer.
-      const extracted = this.extractCustomAnswer(data, responsePath);
-      console.log(`[LLMHelper] Custom Provider extracted text length: ${extracted.length}`);
-      return extracted;
-    } catch (error) {
-      clearTimeout(customTimeout);
-      console.error("Custom Provider Error:", error);
-      throw error;
+      answer += piece;
     }
+    if (signal?.aborted) throw signal.reason ?? new DOMException('Cancelled', 'AbortError');
+    return answer;
   }
 
   /**
@@ -7990,12 +7958,8 @@ let isMultimodal = !!(imagePaths?.length);
   private extractCustomAnswer(data: any, responsePath?: string, warnOnMiss = true): string {
     if (responsePath) {
       const answer = getByPath(data, responsePath);
-      // A path that resolves to an EMPTY string is treated as a miss, not as an
-      // answer. It resolves that way routinely — a reasoning model that puts
-      // everything in `reasoning_content` leaves `choices[0].message.content`
-      // as "" — and before responsePath was honored at all, such a response
-      // still produced text via shape detection. Returning '' here would make
-      // a working provider start yielding blank answers.
+      // An empty path resolution falls through to known answer shapes, never
+      // to private reasoning in an otherwise empty chat response.
       if (typeof answer === 'string' && answer.length > 0) {
         return flattenStructuredJsonAnswer(answer) ?? answer;
       }
@@ -8034,14 +7998,21 @@ let isMultimodal = !!(imagePaths?.length);
     // Ollama format: { response: "..." }
     if (typeof data.response === 'string') return data.response;
 
-    // OpenAI format: { choices: [{ message: { content: "..." } }] }
-    if (data.choices?.[0]?.message?.content) return data.choices[0].message.content;
+    // Known chat envelopes with no content must not fall through to raw JSON
+    // (which includes reasoning_content and other private model internals).
+    if (data.choices?.[0]?.message !== undefined) return typeof data.choices[0].message.content === 'string' ? data.choices[0].message.content : '';
+    if (data.message !== undefined) return typeof data.message.content === 'string' ? data.message.content : '';
 
     // OpenAI delta/streaming format: { choices: [{ delta: { content: "..." } }] }
     if (data.choices?.[0]?.delta?.content) return data.choices[0].delta.content;
 
     // NOTE: reasoning_content (model's thinking process) is intentionally NOT extracted
     // to avoid showing internal reasoning to users. Only final content is returned.
+
+    // Anthropic text deltas, never thinking/usage/control packets.
+    if (data.type === 'content_block_delta') return typeof data.delta?.text === 'string' ? data.delta.text : '';
+    if (data.type === 'content_block_start') return typeof data.content_block?.text === 'string' ? data.content_block.text : '';
+    if (['message_start', 'message_delta', 'message_stop', 'content_block_stop', 'ping'].includes(data.type)) return '';
 
     // Anthropic format: { content: [{ text: "..." }] }
     if (Array.isArray(data.content) && data.content[0]?.text) return data.content[0].text;
@@ -9427,13 +9398,67 @@ let isMultimodal = !!(imagePaths?.length);
    * so the renderer never displays the AI-tell punctuation that the prompt
    * rules ban but providers emit anyway. Single-place backstop.
    */
-  public async * streamChat(
+  public streamChat(
     ...args: Parameters<LLMHelper['_streamChatInner']>
   ): AsyncGenerator<string, void, unknown> {
-    // Callers that need to know whether the turn completed use
-    // streamChatWithOutcome; this overload discards the outcome so the nine
-    // existing call sites are untouched.
-    yield* this._streamChatTracked({ truncated: false }, undefined, ...args);
+    return this.providerAwareChatStream({ truncated: false }, ...args);
+  }
+
+  private _providerStreamPolicy?: ProviderStreamPolicy;
+  private _ragSelectedProviderOnly?: boolean;
+
+  private providerAwareChatStream(
+    outcome: StreamOutcome,
+    ...args: Parameters<LLMHelper['_streamChatInner']>
+  ): AsyncGenerator<string, void, unknown> {
+    return this.withProviderStreamPolicy(
+      view => view._streamChatTracked(outcome, undefined, ...args),
+      args[7], Boolean(args[1]?.length),
+    );
+  }
+
+  /** Publish timing before first next(), and freeze the corresponding dispatch.
+   * Wrappers (WTA) and the underlying chat stream share ONE activity record.
+   */
+  public withProviderStreamPolicy<T extends AsyncIterable<string>>(
+    open: (helper: LLMHelper) => T, signal?: AbortSignal, hasImages = false,
+  ): T {
+    const policy = this._providerStreamPolicy ?? this.getProviderStreamPolicy(signal, hasImages);
+    if (!policy) return open(this);
+    const view: LLMHelper = Object.create(this);
+    view.currentModelId = this.currentModelId;
+    view.useOllama = this.useOllama;
+    view.customProvider = this.customProvider ? Object.freeze({ ...this.customProvider }) : null;
+    view.activeCurlProvider = this.activeCurlProvider ? Object.freeze({ ...this.activeCurlProvider }) : null;
+    view._providerStreamPolicy = policy;
+    return withProviderStreamPolicy(open(view), policy);
+  }
+
+  private getProviderStreamPolicy(signal?: AbortSignal, hasImages = false): ProviderStreamPolicy | undefined {
+    const turn = signal ? this.textTurn(signal) : this;
+    if (!customProviderIsLocal(this.customProvider ?? this.activeCurlProvider)) return undefined;
+    if (!hasImages && turn.fastPickForTextTurn()) return undefined;
+    return { firstUsefulDeadlineMs: CUSTOM_REQUEST_TIMEOUT_MS, interTokenStallMs: CUSTOM_LOCAL_IDLE_TIMEOUT_MS, signal };
+  }
+
+  /** Grounded answers use the exact selected model, never Gemini's tier list or
+   * the Background Model. The normal scope gates, filters and outcome remain.
+   * Arguments and return value match streamChatWithOutcome for RAG consumers.
+   */
+  public streamRAGAnswer(
+    ...args: Parameters<LLMHelper['_streamChatInner']>
+  ): { stream: AsyncGenerator<string, void, unknown>; outcome: StreamOutcome } {
+    const view: LLMHelper = Object.create(this);
+    view.currentModelId = this.currentModelId;
+    view.useOllama = this.useOllama;
+    view.ollamaModel = this.ollamaModel;
+    view.customProvider = this.customProvider ? Object.freeze({ ...this.customProvider }) : null;
+    view.activeCurlProvider = this.activeCurlProvider ? Object.freeze({ ...this.activeCurlProvider }) : null;
+    view.groqFastTextMode = false;
+    view._fastTurn = undefined;
+    view._fastTurns = new WeakMap();
+    view._ragSelectedProviderOnly = true;
+    return view.streamChatWithOutcome(...args);
   }
 
   /**
@@ -9469,7 +9494,7 @@ let isMultimodal = !!(imagePaths?.length);
     ...args: Parameters<LLMHelper['_streamChatInner']>
   ): { stream: AsyncGenerator<string, void, unknown>; outcome: StreamOutcome } {
     const outcome: StreamOutcome = { truncated: false };
-    return { stream: this._streamChatTracked(outcome, undefined, ...args), outcome };
+    return { stream: this.providerAwareChatStream(outcome, ...args), outcome };
   }
 
   private async * _streamChatTracked(
@@ -11034,6 +11059,27 @@ let isMultimodal = !!(imagePaths?.length);
     markH4Stage('provider_dispatch_start', { model: this.currentModelId });
     _stage(`provider dispatch START (sysPrompt=${finalSystemPrompt.length}c, userContent=${userContent.length}c, model=${this.currentModelId})`);
 
+    // RAG must reach its exact frozen adapter before ANY failover/fast/vision
+    // branch can substitute a different provider or model.
+    if (this._ragSelectedProviderOnly) {
+      let emitted = false;
+      try {
+        for await (const chunk of this.streamDirectAssist({
+          requestId: makeRequestId(), selection: this.getDirectAssistSelection(),
+          systemPrompt: finalSystemPrompt, userPrompt: userContent,
+          imagePaths: imagePaths ?? [],
+        }, abortSignal)) {
+          emitted = true;
+          yield chunk;
+        }
+      } catch (error) {
+        if (abortSignal?.aborted) return;
+        if (!emitted) throw error;
+        yield LLMHelper.TRUNCATION_SENTINEL;
+      }
+      return;
+    }
+
     if (!this.useOllama && !this.customProvider && !this.activeCurlProvider && this.isAntigravityModel(this.currentModelId)) {
       // Selected-provider text turn (2026-09-07): this was the one remaining
       // bare terminal rung. Measured on the live What-To-Answer path with
@@ -11293,27 +11339,31 @@ let isMultimodal = !!(imagePaths?.length);
           yield LLMHelper.TRUNCATION_SENTINEL;
           return;
         }
-        // Byte-identical to what streamWithCustom used to yield, so this path's
-        // UX is unchanged.
-        yield typeof e?.status === 'number'
-          ? `Error: Custom Provider returned HTTP ${e.status}`
-          : 'Error streaming from custom provider.';
+        // Only transport-authored text is safe to expose: parser/fetch errors
+        // can contain the saved URL, authorization or prompt.
+        yield e instanceof CustomProviderTransportError
+          ? `Error: ${e.message}`
+          : 'Error: Custom provider request failed. Check the saved cURL URL and JSON template.';
       }
       return;
     }
 
-    // 2b. Custom Provider Streaming (via cURL - Non-streaming fallback for now)
+    // The live cURL lane must stream and forward cancellation too; buffered
+    // execution here hid reasoning/warmup and left an aborted fetch running.
     if (this.activeCurlProvider) {
-      const response = await this.executeCustomProvider(
-        this.activeCurlProvider.curlCommand,
-        userContent,
-        finalSystemPrompt,
-        message,
-        context || "",
-        imagePaths?.[0],
-        this.activeCurlProvider.responsePath
-      );
-      yield response;
+      let emitted = false;
+      try {
+        for await (const chunk of this.streamWithCustom(message, context, imagePaths, finalSystemPrompt, abortSignal, this.activeCurlProvider)) {
+          emitted = true;
+          yield chunk;
+        }
+      } catch (e) {
+        if (abortSignal?.aborted) return;
+        if (emitted) yield LLMHelper.TRUNCATION_SENTINEL;
+        else yield e instanceof CustomProviderTransportError
+          ? `Error: ${e.message}`
+          : 'Error: Custom provider request failed. Check the saved cURL URL and JSON template.';
+      }
       return;
     }
 
@@ -13262,7 +13312,11 @@ let isMultimodal = !!(imagePaths?.length);
 
     const fullPrompt = systemPrompt ? `${systemPrompt}\n\n${userMessage}` : userMessage;
     const variables = {
-      TEXT: JSON.stringify(fullPrompt).slice(1, -1),
+      TEXT: fullPrompt,
+      PROMPT: fullPrompt,
+      SYSTEM_PROMPT: systemPrompt,
+      USER_MESSAGE: userMessage,
+      CONTEXT: '',
       IMAGE_BASE64: base64Image,
     };
     // applyCurlVariables, not three raw deepVariableReplacer calls. This
@@ -13296,27 +13350,7 @@ let isMultimodal = !!(imagePaths?.length);
       throw new DirectAssistError('INVALID_REQUEST', `The custom provider endpoint was refused: ${blockedHost}`);
     }
 
-    const response = await axios({
-      method: curlConfig.method || 'POST',
-      url,
-      headers,
-      data,
-      timeout: 60_000,
-      signal: abortSignal,
-      // The initial URL is validated immediately above. Refuse redirects so
-      // Axios cannot resend Direct Assist data to an unvalidated destination.
-      maxRedirects: 0,
-    });
-    if (abortSignal?.aborted) return;
-
-    const answer = provider.responsePath
-      ? getByPath(response.data, provider.responsePath)
-      : response.data;
-    if (typeof answer === 'string') {
-      yield answer;
-      return;
-    }
-    if (answer !== undefined) yield JSON.stringify(answer);
+    yield* this.streamCustomAttempt(url, headers, customRequestBody(data, true), curlConfig.method || 'POST', true, abortSignal, imagePaths, { outputStreamed: false }, provider.responsePath);
   }
 
   // --- CUSTOM PROVIDER STREAMING ---
@@ -13328,14 +13362,8 @@ let isMultimodal = !!(imagePaths?.length);
       if (strictErrors) throw new Error('Custom provider not configured');
       return;
     }
-    // We reuse the executeCustomProvider logic but we need it to stream.
-    // If the user provided a curl command, it might support streaming (SSE) or not.
-    // If we execute it via Child Process, we can read stdout stream.
-
-    // 1. Prepare command with variables
-    // Re-use logic from executeCustomProvider to replace variables
-    // But we can't easily reuse the function since it awaits the whole fetch.
-    // So we'll implement a simplified streaming version using our existing variable replacer and node-fetch.
+    // Saved cURL is parsed as configuration, never executed in a shell. Both
+    // streaming and buffered callers use the shared fetch/parser transport.
 
     if (bypassCloudDataScopes) {
       if (this.isProviderDisabled('custom') || this.isProviderDisabled(selectedCustomProvider.id)) {
@@ -13448,9 +13476,7 @@ let isMultimodal = !!(imagePaths?.length);
     // the entire response. Without this, the server blocks until generation
     // completes — which can exceed the timeout, especially when the model needs
     // to be loaded into VRAM first. This matches what Zed sends to LM Studio.
-    if (body && typeof body === 'object' && Array.isArray(body.messages) && body.stream === undefined) {
-      body.stream = true;
-    }
+    body = customRequestBody(body, true);
 
     // Cold start for LOOPBACK endpoints (LM Studio & co. still loading their model): if an attempt
     // fails in a "not ready" shape — no HTTP status at all, or 408/502/503/504 — before it has
@@ -13467,13 +13493,14 @@ let isMultimodal = !!(imagePaths?.length);
 
     for (let coldStartAttempt = 0; coldStartAttempt < 2; coldStartAttempt++) {
       // outputStreamed stops a mid-stream drop from triggering the retry: re-running such an attempt would duplicate content already delivered to the caller.
-      const attemptState = { outputStreamed: false };
+      if (abortSignal?.aborted) return;
+      const attemptState: CustomAttemptState = { outputStreamed: false };
       try {
-        yield* this.streamCustomAttempt(url, headers, body, requestConfig.method || 'POST', strictErrors, abortSignal, imagePaths, attemptState);
+        yield* this.streamCustomAttempt(url, headers, body, requestConfig.method || 'POST', strictErrors, abortSignal, imagePaths, attemptState, selectedCustomProvider.responsePath);
         // Normal completion — or a silent end on caller cancel; the stream is over either way.
         return;
       } catch (e: any) {
-        if (coldStartAttempt === 0 && coldStartOrigin !== null && !attemptState.outputStreamed && isNotReadyProviderFailure(e)) {
+        if (!abortSignal?.aborted && coldStartAttempt === 0 && coldStartOrigin !== null && !attemptState.responseStarted && !attemptState.outputStreamed && isNotReadyProviderFailure(e)) {
           await waitForLocalProviderReady({ origin: coldStartOrigin, modelId: requestedModelId, headers, abortSignal, waitBudgetMs: CUSTOM_LOCAL_READY_WAIT_MS });
           continue; // one final attempt regardless of whether readiness was reached.
         }
@@ -13493,247 +13520,40 @@ let isMultimodal = !!(imagePaths?.length);
     strictErrors: boolean,
     abortSignal: AbortSignal | undefined,
     imagePaths: string[] | undefined,
-    attemptState: { outputStreamed: boolean },
+    attemptState: CustomAttemptState,
+    responsePath?: string,
   ): AsyncGenerator<string, void, unknown> {
-    // Generous timeout for local models: model loading + prompt processing +
-    // first-token latency can easily exceed 30s (e.g. quantized 27B model
-    // loading into VRAM). Use 5 minutes to match typical local model behavior.
-    // The caller's abortSignal still allows instant cancellation on user action.
-    const LOCAL_STREAM_TIMEOUT_MS = 300_000; // 5 minutes
-    const streamAbort = new AbortController();
-    // Direct Assist callers get the SAME per-path budget streamWithNatively
-    // already uses (DIRECT_ASSIST_CONNECT_TIMEOUT_MS/VISION_CONNECT_TIMEOUT_MS,
-    // LLMHelper.ts ~195-196) instead of always waiting the vision-sized window
-    // on a plain text turn — a stalled custom text endpoint fails over in
-    // ~15s per attempt instead of waiting the full local-model budget below.
-    // Legacy/general-purpose (non-Direct-Assist) callers — which is where
-    // local servers like LM Studio/Ollama are reached — get the generous
-    // LOCAL_STREAM_TIMEOUT_MS budget instead, since model loading + prompt
-    // processing can easily exceed 30s.
-    const customConnectTimeoutMs = strictErrors
-      ? (imagePaths?.length ? DIRECT_ASSIST_VISION_CONNECT_TIMEOUT_MS : DIRECT_ASSIST_CONNECT_TIMEOUT_MS)
-      : LOCAL_STREAM_TIMEOUT_MS;
-    const streamTimeout = setTimeout(() => streamAbort.abort(), customConnectTimeoutMs);
-    // Forward the caller's user-cancel signal into the same controller so
-    // the fetch socket closes immediately on supersession, freeing the
-    // custom provider's quota and any rate-limiter slot.
-    const onCallerAbort = () => {
-      try { streamAbort.abort(abortSignal?.reason); } catch { /* already aborted */ }
-    };
-    abortSignal?.addEventListener('abort', onCallerAbort, { once: true });
-    if (abortSignal?.aborted) {
-      clearTimeout(streamTimeout);
-      return;
-    }
-    // The connect phase of the USER-ENDPOINT route — the one route whose
-    // deadlines actually adapt, so the one where a measured handshake is worth
-    // most. Same measurement streamWithNatively takes: request issued → response
-    // headers. (For an SSE response that is also the first body byte, so Phase
-    // 6's "first byte" and this are the same instant; TTFT, measured by the
-    // deadline driver, is the first PARSED event and is a separate number.)
-    const customConnectStartedAt = Date.now();
+    const startedAt = Date.now();
     try {
-      const response = await fetch(url, {
-        method: requestMethod,
-        headers: headers,
-        body: JSON.stringify(body),
-        signal: streamAbort.signal,
-        // WHATWG fetch follows redirects by default and can replay this body
-        // and its credentials to a destination that never passed provider
-        // selection or network-safety checks. Treat every redirect as an HTTP
-        // error instead of following it.
-        redirect: 'manual',
+      yield* streamCustomTransport({
+        url, headers, body, method: requestMethod, signal: abortSignal, state: attemptState,
+        connectTimeoutMs: strictErrors
+          ? (imagePaths?.length ? DIRECT_ASSIST_VISION_CONNECT_TIMEOUT_MS : DIRECT_ASSIST_CONNECT_TIMEOUT_MS)
+          : undefined,
+        extractWhole: data => this.extractCustomAnswer(data, responsePath),
+        extractDelta: data => this.extractFromCommonFormats(data),
+        extractLine: data => this.extractCustomAnswer(data, responsePath, false),
+        onActivity: () => {
+          if (this._providerStreamPolicy) this._providerStreamPolicy.lastActivityAt = Date.now();
+        },
+        onHeaders: () => {
+          try {
+            const { recordConnectLatency } = require("./llm/performance/wiring");
+            recordConnectLatency({ llmHelper: this, ms: Date.now() - startedAt });
+          } catch { /* measurement must never break a request */ }
+        },
       });
-      clearTimeout(streamTimeout);
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const { recordConnectLatency } = require('./llm/performance/wiring');
-        recordConnectLatency({ llmHelper: this, ms: Date.now() - customConnectStartedAt });
-      } catch { /* measurement must never break a request */ }
-
-      if (!response.ok) {
-        // strictErrors callers keep main's exact early throw, message shape and
-        // all, so nothing that already depends on it changes. Everything below
-        // is the NON-strict path, which used to yield the error as if it were an
-        // answer.
-        if (strictErrors) {
-          const error = new Error(`Custom Provider returned HTTP ${response.status}`) as Error & { status?: number };
-          error.status = response.status;
-          throw error;
-        }
-        // Keep the structured status log AND throw. The log is the operator's
-        // only breadcrumb when a chain silently falls back to another provider,
-        // and SensitiveLogRedaction pins this exact line as the redaction-safe
-        // shape (status only, never a body snippet).
-        console.error('[LLMHelper] Custom Provider stream HTTP error', { status: response.status });
-        // THROW, never yield. Yielding made a provider failure indistinguishable
-        // from an answer: every consumer of this generator decides "did the
-        // provider work?" by whether a non-empty first chunk arrived, so a 500
-        // was a successful commit. Measured against a local 500 —
-        //   [Vision] committed to Custom (OpenRouter) (attempt 1/1, ttft=11ms)
-        // — the healthy fallback rung behind it was never invoked, the provider
-        // was marked healthy, and the user's answer was the literal string
-        // "Error: Custom Provider returned HTTP 500".
-        //
-        // Message shape matches executeCustomProvider's ("Custom Provider HTTP
-        // <status>"), which is what the non-streaming twin has always thrown, so
-        // both chains' classifiers bucket the two identically.
-        throw Object.assign(
-          new Error(`Custom Provider HTTP ${response.status}`),
-          { status: response.status },
-        );
-      }
-
-      if (!response.body) return;
-
-      // Collect all chunks to handle both SSE streaming and non-SSE JSON responses
-      let fullBody = "";
-      let yieldedAny = false;
-      const streamDecoder = new TextDecoder();
-      let lineBuffer = "";
-      // Every parseStreamLine call passes the configured responsePath. This
-      // helper arrived with the main merge and omitted it, which put a whole
-      // non-streaming JSON body back on the raw-JSON path: such a body is ONE
-      // complete object on ONE line, so it lands here rather than in the
-      // !yieldedAny fallback, and without the path the user saw
-      // `{"data":{"answer":"..."}}` instead of the answer.
-      //
-      // Safe to pass unconditionally: parseStreamLine ignores it for `data: `
-      // SSE frames, which are deltas a whole-body path cannot address, and
-      // applies it only to a complete JSON object.
-      const parseCompleteChunkFrame = (): { complete: boolean; item: string | null } => {
-        const trimmed = lineBuffer.trim();
-        if (!trimmed) return { complete: false, item: null };
-        if (trimmed.startsWith('data: ')) {
-          const payload = trimmed.slice(6).trim();
-          if (payload === '[DONE]') return { complete: true, item: null };
-          try {
-            JSON.parse(payload);
-            return { complete: true, item: this.parseStreamLine(trimmed, this.customProvider?.responsePath) };
-          } catch {
-            return { complete: false, item: null };
-          }
-        }
-        if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
-          try {
-            JSON.parse(trimmed);
-            return { complete: true, item: this.parseStreamLine(trimmed, this.customProvider?.responsePath) };
-          } catch {
-            return { complete: false, item: null };
-          }
-        }
-        return { complete: false, item: null };
-      };
-
-      // @ts-ignore
-      for await (const chunk of response.body) {
-        // Per-chunk caller-cancel check (the abort above already closed the
-        // socket, but a buffered chunk could still be in the iterator).
-        if (abortSignal?.aborted) return;
-        const text = streamDecoder.decode(chunk, { stream: true });
-        fullBody += text;
-        lineBuffer += text;
-        const lines = lineBuffer.split('\n');
-        lineBuffer = lines.pop() ?? "";
-        for (const line of lines) {
-          if (line.trim().length === 0) continue;
-
-          const items = this.parseStreamLine(line, this.customProvider?.responsePath);
-          if (items) {
-            yield items;
-            yieldedAny = true;
-            attemptState.outputStreamed = true;
-          }
-        }
-        // Some legacy custom endpoints use each HTTP chunk as the frame and
-        // omit newlines. Consume a syntactically-complete JSON/SSE frame now;
-        // otherwise retain it as a fragmented line for the next chunk.
-        const chunkFrame = parseCompleteChunkFrame();
-        if (chunkFrame.complete) {
-          lineBuffer = "";
-          if (chunkFrame.item) {
-            yield chunkFrame.item;
-            yieldedAny = true;
-            attemptState.outputStreamed = true;
-          }
-        }
-      }
-
-      // Flush a split UTF-8 code point and the final non-newline-terminated
-      // SSE/JSON line. This keeps legacy extraction semantics while preventing
-      // a valid delta split across TCP chunks from disappearing.
-      const decoderTail = streamDecoder.decode();
-      fullBody += decoderTail;
-      lineBuffer += decoderTail;
-      if (lineBuffer.trim().length > 0) {
-        const item = this.parseStreamLine(lineBuffer, this.customProvider?.responsePath);
-        if (item) {
-          yield item;
-          yieldedAny = true;
-          attemptState.outputStreamed = true;
-        }
-      }
-
-      // If no SSE content was yielded, try parsing the full body as JSON
-      // This handles non-streaming responses (e.g. Ollama with stream: false)
-      // But skip if it looks like SSE data (starts with "data: ")
-      if (!yieldedAny && fullBody.trim().length > 0 && !fullBody.trim().startsWith("data: ")) {
-        try {
-          const data = JSON.parse(fullBody);
-          // Whole-body branch only. parseStreamLine deliberately keeps using the
-          // shape heuristics: a responsePath aimed at a complete response body
-          // does not resolve against an SSE delta chunk.
-          const extracted = this.extractCustomAnswer(data, this.customProvider?.responsePath);
-          if (extracted) {
-            yield extracted;
-            attemptState.outputStreamed = true;
-          }
-        } catch {
-          // Not JSON, yield raw text if it's not looking like garbage
-          if (fullBody.length < 5000) {
-            yield fullBody.trim();
-            attemptState.outputStreamed = true;
-          }
-        }
-      }
-
-    } catch (e: any) {
-      clearTimeout(streamTimeout);
-      // A CALLER-INITIATED abort is not a provider error and must not produce
-      // content. The fetch above rejects with AbortError the moment the caller
-      // cancels, and yielding here made that rejection look like a first token:
-      // in natively_debug (3).log the live deadline aborted the turn at 13.00s,
-      // this catch yielded 35 non-empty characters, and the vision chain
-      // committed to a stream the consumer had already stopped reading.
-      // The per-chunk `if (abortSignal?.aborted) return` above already applies
-      // this rule to the success path; the error path simply never learned it.
+    } catch (error) {
       if (abortSignal?.aborted) return;
-      if (strictErrors) {
-        // Disambiguate OUR OWN internal stall guard (streamAbort, 30s above)
-        // from a genuine provider failure before it reaches
-        // normalizeDirectAssistError — that classifier maps every AbortError
-        // to CANCELLED, and streamAbort fires with no distinguishing info of
-        // its own, so a provider that connects and then goes silent was
-        // reported as if the request had been cancelled instead of timing
-        // out. The caller's own abortSignal was just checked above and is
-        // NOT aborted, so any abort observed here can only be streamAbort's,
-        // exactly like streamWithNatively's connect-timeout branch above.
-        if (streamAbort.signal.aborted) {
-          throw new DirectAssistError('CONNECT_TIMEOUT', 'The selected provider timed out.', true);
+      if (error instanceof CustomProviderTransportError) {
+        if (!strictErrors && error.status) {
+          console.error("[LLMHelper] Custom Provider stream HTTP error", { status: error.status });
         }
-        throw e;
+        if (strictErrors && error.code !== "PROVIDER_ERROR") {
+          throw new DirectAssistError(error.code, error.message, true);
+        }
       }
-      console.error("Custom streaming failed", e);
-      // Same rule as the HTTP branch above: a failure must reach the caller AS a
-      // failure. The user-facing sentence this used to yield now lives at the
-      // one call site that is genuinely terminal (the `2a. CustomProvider`
-      // branch of _streamChatInner), where "there is no provider after this"
-      // is actually known. Here, it is not.
-      throw e instanceof Error ? e : new Error(String(e));
-    } finally {
-      // Always drop the listener so we don't leak a subscription on a
-      // long-lived AbortSignal shared across many calls.
-      abortSignal?.removeEventListener('abort', onCallerAbort);
+      throw error;
     }
   }
 
@@ -14566,7 +14386,19 @@ let isMultimodal = !!(imagePaths?.length);
       ? Object.freeze({ ...this.activeCurlProvider })
       : null;
 
-    return this.streamDirectAssistFrozen(frozenRequest, custom, curl, abortSignal, rung);
+    if (!customProviderIsLocal(custom ?? curl)) {
+      return this.streamDirectAssistFrozen(frozenRequest, custom, curl, abortSignal, rung);
+    }
+    // Expose the frozen rung's policy for deadline consumers; Direct Assist's
+    // separate service watchdog still has to opt into this policy itself.
+    const view: LLMHelper = Object.create(this);
+    const policy: ProviderStreamPolicy = {
+      firstUsefulDeadlineMs: CUSTOM_REQUEST_TIMEOUT_MS,
+      interTokenStallMs: CUSTOM_LOCAL_IDLE_TIMEOUT_MS,
+      signal: abortSignal,
+    };
+    view._providerStreamPolicy = policy;
+    return withProviderStreamPolicy(view.streamDirectAssistFrozen(frozenRequest, custom, curl, abortSignal, rung), policy);
   }
 
   private snapshotDirectCustomProvider(modelId: string): CustomProvider | null {

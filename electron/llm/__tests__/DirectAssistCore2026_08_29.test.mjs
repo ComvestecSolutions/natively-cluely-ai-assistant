@@ -944,17 +944,12 @@ test('custom provider carries split SSE lines and Direct system instructions saf
   assert.match(custom, /const directCustomMode = strictErrors && Boolean\(providerOverride\)/);
   assert.match(custom, /templateUsesSystemPrompt = \/\\\{\\\{\\s\*SYSTEM_PROMPT/);
   assert.match(custom, /TEXT: genericPromptValue,\s*PROMPT: genericPromptValue/);
-  assert.match(custom, /const streamDecoder = new TextDecoder\(\);\s*let lineBuffer = ""/);
-  assert.match(custom, /streamDecoder\.decode\(chunk, \{ stream: true \}\)/);
-  assert.match(custom, /lineBuffer = lines\.pop\(\) \?\? ""/);
-  assert.match(custom, /const parseCompleteChunkFrame = \(\): \{ complete: boolean; item: string \| null \}/);
-  assert.match(custom, /const chunkFrame = parseCompleteChunkFrame\(\)/);
-  assert.match(custom, /const decoderTail = streamDecoder\.decode\(\)/);
-  // The decoder tail must be flushed THROUGH parseStreamLine — that is the
-  // property. The argument list is not: this branch honours the user's
-  // configured responsePath, so the call carries a second argument, and
-  // pinning the exact signature turned that feature into a red test.
-  assert.match(custom, /this\.parseStreamLine\(lineBuffer[,)]/);
+  assert.match(custom, /yield\* streamCustomTransport\(/);
+  const transport = fs.readFileSync(path.resolve(root, 'electron/llm/customProviderTransport.ts'), 'utf8');
+  assert.match(transport, /new TextDecoder\(\)/);
+  assert.match(transport, /decoder\.decode\(bytes, \{ stream: true \}\)/);
+  assert.match(transport, /buffer \+= decoder\.decode\(\)/);
+  // Executable split/UTF-8/framing regressions live in CustomProviderTransport.test.mjs.
 });
 
 test('custom vision injection follows optimized MIME and restores raw fallback MIME', () => {

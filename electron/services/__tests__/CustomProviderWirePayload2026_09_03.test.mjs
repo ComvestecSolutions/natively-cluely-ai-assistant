@@ -412,14 +412,14 @@ describe('the vision gates count the ACTIVE custom provider, not every saved one
 });
 
 describe('a responsePath that resolves to empty falls back to shape detection', () => {
-  test('empty string is a miss, not a blank answer', async () => {
-    // A reasoning model that puts everything in reasoning_content leaves
-    // choices[0].message.content as "". Before responsePath was honored, shape
-    // detection still produced text; returning '' would be a new blank-answer bug.
+  test('empty content never falls back to raw JSON containing private reasoning', () => {
     const h = helperFor(null);
-    const data = { choices: [{ message: { content: '' } }], data: { answer: 'FALLBACK_TEXT' } };
-    const out = LLMHelper.prototype.extractCustomAnswer.call(h, data, 'choices[0].message.content');
-    assert.notEqual(out, '', 'an empty resolution must not become the answer');
+    const data = { choices: [{ message: { content: '', reasoning_content: 'PRIVATE' } }] };
+    assert.equal(LLMHelper.prototype.extractCustomAnswer.call(h, data, 'choices[0].message.content'), '');
+    // The transport rejects this empty result instead of persisting a blank
+    // answer. A configured path to a real answer still wins.
+    data.data = { answer: 'FALLBACK_TEXT' };
+    assert.equal(LLMHelper.prototype.extractCustomAnswer.call(h, data, 'data.answer'), 'FALLBACK_TEXT');
   });
 
   test('a non-empty resolution still wins over shape detection', () => {

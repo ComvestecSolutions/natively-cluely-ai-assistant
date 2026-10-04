@@ -7082,6 +7082,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       const response = await window.electronAPI.startDirectAssist({
         requestId,
         source,
+        courseIds: getCoursePinIds(),
         // Preserve the current instruction byte-for-byte, including a /skill or
         // $skill prefix. Main resolves `skillId`; it does not need renderer-side
         // prompt rewriting or instruction injection.
@@ -9036,7 +9037,7 @@ Instructions:
 2. Provide a direct, helpful answer.
 3. Be concise.`;
           } else {
-            const ragResult = await window.electronAPI.ragQueryLive?.(question);
+            const ragResult = await window.electronAPI.ragQueryLive?.(question, getCoursePinIds());
             if (ragResult?.success) {
               return;
             }
@@ -11436,8 +11437,6 @@ Provide only the answer, nothing else.`;
                                 actionable suggestions in their primary scan path. Bar self-hides
                                 when no actions are present. */}
 
-              {/* Pinned course chips (compact); self-hides when there is nothing pinned. */}
-              <CoursePinBar compact />
 
               <DynamicActionBar
                 onAcceptAction={(action: DynamicActionPayload) => {
@@ -12271,6 +12270,14 @@ Provide only the answer, nothing else.`;
                       </ModelSelectorLabel>
                       <ChevronDown size={12} className="shrink-0 transition-transform" />
                     </button>
+
+                    <CoursePinBar
+                      compact
+                      panelRef={shellRef}
+                      interfaceTheme={interfaceTheme}
+                      surfaceStyle={appearance.shellStyle}
+                      controlStyle={appearance.controlStyle}
+                    />
 
                     <div className="relative">
                       <button

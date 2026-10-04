@@ -1996,28 +1996,42 @@ export class CredentialsManager {
         console.log(`[CredentialsManager] ${provider} preferred model set to: ${modelId}`);
     }
 
-    public saveCustomProvider(provider: CustomProvider): void {
-        if (this.refuseWriteWhileDegraded('save custom provider')) return;
-        if (!this.credentials.customProviders) {
-            this.credentials.customProviders = [];
-        }
-        // Check if exists, update if so
-        const index = this.credentials.customProviders.findIndex(p => p.id === provider.id);
-        if (index !== -1) {
-            this.credentials.customProviders[index] = provider;
-        } else {
-            this.credentials.customProviders.push(provider);
-        }
-        this.saveCredentials();
-        console.log(`[CredentialsManager] Custom Provider '${provider.name}' saved`);
+    public saveCustomProvider(provider: CustomProvider): boolean {
+        const providers = [...(this.credentials.customProviders || [])];
+        const index = providers.findIndex(p => p.id === provider.id);
+        if (index !== -1) providers[index] = { ...provider };
+        else providers.push({ ...provider });
+        return this.persistCustomProviderLists({ customProviders: providers });
     }
 
-    public deleteCustomProvider(id: string): void {
-        if (this.refuseWriteWhileDegraded('delete custom provider')) return;
-        if (!this.credentials.customProviders) return;
-        this.credentials.customProviders = this.credentials.customProviders.filter(p => p.id !== id);
-        this.saveCredentials();
-        console.log(`[CredentialsManager] Custom Provider '${id}' deleted`);
+    public deleteCustomProvider(id: string): boolean {
+        return this.persistCustomProviderLists({
+            customProviders: this.credentials.customProviders?.filter(p => p.id !== id),
+        });
+    }
+
+    /** Settings merges both lists, so delete both copies with ONE durable write. */
+    public deleteConfiguredCustomProvider(id: string): boolean {
+        return this.persistCustomProviderLists({
+            customProviders: this.credentials.customProviders?.filter(p => p.id !== id),
+            curlProviders: this.credentials.curlProviders?.filter(p => p.id !== id),
+        });
+    }
+
+    private persistCustomProviderLists(next: Pick<StoredCredentials, 'customProviders' | 'curlProviders'>): boolean {
+        // List editing is not credential-store recovery: never overwrite an
+        // unreadable set, including while other credential re-entry is allowed.
+        if (this.isCredentialStoreDegraded() || this.refuseWriteWhileDegraded('update custom providers')) return false;
+        const previous = this.credentials;
+        this.credentials = { ...previous, ...next };
+        let persisted = false;
+        try {
+            persisted = this.saveCredentials();
+            return persisted;
+        } finally {
+            // A read-back must not confirm a change that only existed in memory.
+            if (!persisted) this.credentials = previous;
+        }
     }
 
     public getCurlProviders(): CurlProvider[] {
@@ -2049,27 +2063,18 @@ export class CredentialsManager {
         ] as CustomProvider[];
     }
 
-    public saveCurlProvider(provider: CurlProvider): void {
-        if (this.refuseWriteWhileDegraded('save curl provider')) return;
-        if (!this.credentials.curlProviders) {
-            this.credentials.curlProviders = [];
-        }
-        const index = this.credentials.curlProviders.findIndex(p => p.id === provider.id);
-        if (index !== -1) {
-            this.credentials.curlProviders[index] = provider;
-        } else {
-            this.credentials.curlProviders.push(provider);
-        }
-        this.saveCredentials();
-        console.log(`[CredentialsManager] Curl Provider '${provider.name}' saved`);
+    public saveCurlProvider(provider: CurlProvider): boolean {
+        const providers = [...(this.credentials.curlProviders || [])];
+        const index = providers.findIndex(p => p.id === provider.id);
+        if (index !== -1) providers[index] = { ...provider };
+        else providers.push({ ...provider });
+        return this.persistCustomProviderLists({ curlProviders: providers });
     }
 
-    public deleteCurlProvider(id: string): void {
-        if (this.refuseWriteWhileDegraded('delete curl provider')) return;
-        if (!this.credentials.curlProviders) return;
-        this.credentials.curlProviders = this.credentials.curlProviders.filter(p => p.id !== id);
-        this.saveCredentials();
-        console.log(`[CredentialsManager] Curl Provider '${id}' deleted`);
+    public deleteCurlProvider(id: string): boolean {
+        return this.persistCustomProviderLists({
+            curlProviders: this.credentials.curlProviders?.filter(p => p.id !== id),
+        });
     }
 
     // ── Free Trial ─────────────────────────────────────────────

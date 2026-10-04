@@ -5,7 +5,6 @@ import { DiagramAwareMarkdown } from './diagram/DiagramAwareMarkdown';
 import { motion, AnimatePresence } from 'framer-motion';
 import { genMessageId } from '../utils/messageId';
 import nativelyIcon from './icon.png';
-import CoursePinBar from './courses/CoursePinBar';
 import { getCoursePinIds } from '../lib/coursePins';
 import { useResolvedTheme } from '../hooks/useResolvedTheme';
 import { stripGistTrailer } from '../lib/displayMarkup';
@@ -121,28 +120,36 @@ const AssistantMessage: React.FC<{ content: string; isStreaming?: boolean; isLat
 
 type ChatState = 'idle' | 'waiting_for_llm' | 'streaming_response' | 'error';
 
-// Hard client-side ceiling on the ragQueryGlobal IPC round-trip. The main
-// process has its own internal timeouts (worker deadman switch, stream
-// stall guard), but every one of those protects a DIFFERENT stage of the
-// pipeline — if the hang happens somewhere NONE of them cover (e.g. the
-// main thread itself blocked inside a synchronous native call before any
-// of those timers can even be scheduled), the `await` on this invoke() has
-// no ceiling of its own and can wait forever with the UI showing nothing.
-// This is the backstop: no matter what breaks on the other side of the IPC
-// boundary, the user gets an answer (even if it's "something went wrong")
-// within a bounded time instead of a silently frozen chat bubble.
+// IPC backstop for cloud requests and preparation. Once main publishes the
+// selected local stream's policy, adopt its bounded warmup/total budget.
+// Main owns activity-aware idle detection; renderer never sees hidden reasoning.
 const RAG_QUERY_CLIENT_TIMEOUT_MS = 20000;
 
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-        const timer = setTimeout(() => {
-            reject(new Error(`${label} timed out after ${ms}ms — the main process never responded`));
-        }, ms);
-        promise.then(
-            (v) => { clearTimeout(timer); resolve(v); },
-            (e) => { clearTimeout(timer); reject(e); },
-        );
-    });
+function createQueryDeadline(signal: AbortSignal, label: string) {
+    let timer: ReturnType<typeof setTimeout>;
+    let adopted = false;
+    let rejectDeadline!: (error: Error) => void;
+    const deadline = new Promise<never>((_, reject) => { rejectDeadline = reject; });
+    const arm = (ms: number) => {
+        clearTimeout(timer);
+        timer = setTimeout(() => rejectDeadline(Object.assign(new Error(`${label} timed out after ${ms}ms`), { name: 'TimeoutError' })), ms);
+    };
+    const onAbort = () => rejectDeadline(Object.assign(new Error('Query cancelled'), { name: 'AbortError' }));
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) onAbort();
+    arm(RAG_QUERY_CLIENT_TIMEOUT_MS);
+    const dispose = () => { clearTimeout(timer); signal.removeEventListener('abort', onAbort); };
+    return {
+        adopt(firstUsefulDeadlineMs: number) {
+            if (adopted || signal.aborted || !Number.isFinite(firstUsefulDeadlineMs) || firstUsefulDeadlineMs <= 0) return;
+            adopted = true;
+            // Main owns hidden-reasoning idle. Visible tokens must not reset this
+            // total backstop. A small IPC grace lets main report its own timeout.
+            arm(Math.min(firstUsefulDeadlineMs, 300_000) + 1_000);
+        },
+        wait<T>(promise: Promise<T>): Promise<T> { return Promise.race([promise, deadline]).finally(dispose); },
+        dispose,
+    };
 }
 
 const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
@@ -171,23 +178,20 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
     // whatever the other call had already buffered, so the eventual
     // completion can render empty. A ref updates immediately, no batching.
     const submitInFlightRef = useRef(false);
+    const cancelActiveTurnRef = useRef<(() => void) | null>(null);
 
-    // Submit initial query when overlay opens
+    const pendingQuestionsRef = useRef<string[]>([]);
+    const lastInitialQueryRef = useRef<string | null>(null);
+    const isOpenRef = useRef(isOpen);
+    isOpenRef.current = isOpen;
     useEffect(() => {
-        if (isOpen && initialQuery && messages.length === 0) {
-            setTimeout(() => {
-                submitQuestion(initialQuery);
-            }, 100);
-        }
-    }, [isOpen, initialQuery]);
-
-    // Listen for new queries from parent
-    useEffect(() => {
-        if (isOpen && initialQuery && messages.length > 0) {
-            // This is a follow-up query
-            submitQuestion(initialQuery);
-        }
-    }, [initialQuery]);
+        isOpenRef.current = isOpen;
+        return () => {
+            isOpenRef.current = false;
+            pendingQuestionsRef.current = [];
+            cancelActiveTurnRef.current?.();
+        };
+    }, [isOpen]);
 
     // ESC key handler
     useEffect(() => {
@@ -217,8 +221,13 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
 
     // Submit question using global RAG
     const submitQuestion = useCallback(async (question: string) => {
-        if (!question.trim() || submitInFlightRef.current) return;
+        if (!question.trim() || !isOpenRef.current) return;
+        if (submitInFlightRef.current) {
+            pendingQuestionsRef.current.push(question);
+            return;
+        }
         submitInFlightRef.current = true;
+        const courseIds = getCoursePinIds();
 
         const userMessage: Message = {
             id: genMessageId(),
@@ -243,11 +252,27 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
         // top of submitQuestion silently drops every subsequent message
         // (no user-message push, no response).
         let activeCleanups: Array<() => void> = [];
+        const controller = new AbortController();
+        let source: 'rag' | 'fallback' = 'rag';
+        let backendCancelled = false;
+        let queryDeadline = createQueryDeadline(controller.signal, 'ragQueryGlobal');
+        const cancelBackend = () => {
+            if (backendCancelled) return;
+            backendCancelled = true;
+            try {
+                if (source === 'rag') void window.electronAPI?.ragCancelQuery({ global: true }).catch(() => {});
+                else window.electronAPI?.cancelChatStream?.();
+            } catch { /* best-effort if the bridge is gone */ }
+        };
+        const policyCleanup = window.electronAPI?.onChatStreamPolicy?.(data => {
+            if (!controller.signal.aborted && data.requestId === assistantMessageId && data.source === source) {
+                queryDeadline.adopt(data.firstUsefulDeadlineMs);
+            }
+        });
+        const cancelTurn = () => { controller.abort(); cancelBackend(); };
+        cancelActiveTurnRef.current = cancelTurn;
 
         try {
-            // Add typing indicator delay (200ms) - makes the AI feel "thoughtful"
-            await new Promise(resolve => setTimeout(resolve, 200));
-
             // Create assistant message placeholder
             setMessages(prev => [...prev, {
                 id: assistantMessageId,
@@ -258,6 +283,8 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
 
             // Set up RAG streaming listeners (RAF-batched)
             streamBuffer.reset();
+            let finishRag!: (result: { success: boolean; error?: string }) => void;
+            const ragTerminal = new Promise<{ success: boolean; error?: string }>(resolve => { finishRag = resolve; });
             // F-122: the rag:stream-* channels are SHARED by three scopes and
             // main tags every payload ({meetingId} | {live:true} | {global:true}),
             // but no consumer read the tag — so a meeting-scoped or live-scoped
@@ -265,7 +292,8 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
             // MeetingDetails are siblings in the same Launcher renderer, and
             // abortPriorRAGQueriesOfClass only supersedes WITHIN a class, so two
             // different-class queries can genuinely be in flight together.
-            const isGlobal = (d: any) => d?.global === true;
+            const isGlobal = (d: any) => !controller.signal.aborted && d?.global === true
+                && (d.requestId == null || d.requestId === assistantMessageId);
             const tokenCleanup = window.electronAPI?.onRAGStreamChunk((data: { chunk: string }) => {
                 if (!isGlobal(data)) return;
                 setChatState('streaming_response');
@@ -279,7 +307,7 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
             });
 
             const doneCleanup = window.electronAPI?.onRAGStreamComplete((data?: any) => {
-                if (data && !isGlobal(data)) return;   // F-122
+                if (controller.signal.aborted || (data && !isGlobal(data))) return;   // F-122
                 // The stream can legitimately complete with zero chunks (e.g. a
                 // short non-question like "hi" fed through the strict RAG-grounding
                 // prompt can make the model return an empty/degenerate completion).
@@ -293,6 +321,7 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
                         : msg
                 ));
                 setChatState('idle');
+                finishRag({ success: true });
                 streamBuffer.reset();
                 tokenCleanup?.();
                 doneCleanup?.();
@@ -301,6 +330,7 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
 
             const errorCleanup = window.electronAPI?.onRAGStreamError((data: { error: string }) => {
                 if (!isGlobal(data)) return;   // F-122
+                finishRag({ success: false, error: data.error });
                 console.error('[GlobalChat] RAG stream error:', data.error);
                 setMessages(prev => prev.filter(msg => msg.id !== assistantMessageId));
                 setErrorMessage("Couldn't get a response. Please try again.");
@@ -315,22 +345,24 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
             if (doneCleanup) activeCleanups.push(doneCleanup);
             if (errorCleanup) activeCleanups.push(errorCleanup);
 
-            // Use global RAG query. Wrapped in a hard client-side ceiling — see
-            // RAG_QUERY_CLIENT_TIMEOUT_MS above for why this exists: nothing
-            // upstream of this call can guarantee the invoke() ever resolves.
+            // Subscribe before invoke so local policy can extend the default
+            // IPC backstop even before the first user-visible answer chunk.
             let result: { fallback?: boolean; success?: boolean; error?: string } | undefined;
             try {
-                const call = window.electronAPI?.ragQueryGlobal(question);
+                const call = window.electronAPI?.ragQueryGlobal(question, courseIds, assistantMessageId);
                 result = call
-                    ? await withTimeout(call, RAG_QUERY_CLIENT_TIMEOUT_MS, 'ragQueryGlobal')
+                    ? await queryDeadline.wait(Promise.race([call, ragTerminal]))
                     : undefined;
             } catch (timeoutErr) {
+                if (controller.signal.aborted) return;
+                if ((timeoutErr as Error)?.name !== 'TimeoutError') throw timeoutErr;
                 console.error('[GlobalChat] ragQueryGlobal client-side timeout:', timeoutErr);
                 // Tear down the RAG listeners we just registered — the main
                 // process may still respond well after this point (its own
                 // internal timeouts run on a longer clock), and a late
                 // rag:stream-chunk/-complete/-error must not land on a message
                 // this function has already abandoned.
+                cancelBackend();
                 tokenCleanup?.();
                 doneCleanup?.();
                 errorCleanup?.();
@@ -345,6 +377,10 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
                 return;
             }
 
+            if (result?.success === false && !result.fallback) {
+                throw new Error(result.error || 'The model request failed.');
+            }
+
             // If electronAPI is unavailable or IPC failed, result will be undefined.
             // Treat this as a fallback case to ensure the user gets SOME response.
             if (!result || result.fallback) {
@@ -355,15 +391,22 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
                 errorCleanup?.();
                 activeCleanups = [];
 
-                // Setup fallback listeners (Standard Gemini)
+                queryDeadline.dispose();
+                source = 'fallback';
+                queryDeadline = createQueryDeadline(controller.signal, 'streamGeminiChat');
+                // Setup fallback listeners (selected model)
                 streamBuffer.reset();
+                let finishFallback!: () => void;
+                let failFallback!: (error: Error) => void;
+                const fallbackTerminal = new Promise<void>((resolve, reject) => { finishFallback = resolve; failFallback = reject; });
                 // Stream-id guard (2026-07-31): these fallback listeners used to
                 // ignore the streamId meta entirely, so tokens from an ABANDONED
                 // earlier stream (client timeout below leaves main streaming)
                 // landed in the next request's bubble. Adopt the first tagged id
                 // seen after registration; drop anything older.
                 let adoptedStreamId: number | null = null;
-                const acceptsMeta = (meta?: { streamId?: number }) => {
+                const acceptsMeta = (meta?: { streamId?: number; requestId?: string }) => {
+                    if (controller.signal.aborted || (meta?.requestId != null && meta.requestId !== assistantMessageId)) return false;
                     const id = meta?.streamId;
                     if (typeof id !== 'number') return true;      // legacy untagged
                     if (adoptedStreamId === null || id > adoptedStreamId) { adoptedStreamId = id; return true; }
@@ -392,6 +435,7 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
                             : msg
                     ));
                     setChatState('idle');
+                    finishFallback();
                     streamBuffer.reset();
                     oldTokenCleanup?.();
                     oldDoneCleanup?.();
@@ -399,8 +443,9 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
                 });
 
                 const oldErrorCleanup = window.electronAPI?.onGeminiStreamError((error: string, meta?: { streamId?: number | null; source?: string }) => {
-                    if (meta?.source === 'phone-mirror') return;
+                    if (controller.signal.aborted || meta?.source === 'phone-mirror') return;
                     if (typeof meta?.streamId === 'number' && adoptedStreamId !== null && meta.streamId !== adoptedStreamId) return;
+                    failFallback(new Error(error));
                     console.error('[GlobalChat] Gemini stream error:', error);
                     setMessages(prev => prev.filter(msg => msg.id !== assistantMessageId));
                     setErrorMessage("Couldn't get a response. Please check your settings.");
@@ -415,16 +460,19 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
                 if (oldDoneCleanup) activeCleanups.push(oldDoneCleanup);
                 if (oldErrorCleanup) activeCleanups.push(oldErrorCleanup);
 
-                // Call standard chat — same client-side ceiling as ragQueryGlobal above.
-                const fallbackCall = window.electronAPI?.streamGeminiChat(question, undefined, undefined, { skipSystemPrompt: false, courseIds: getCoursePinIds() });
+                // The selected-model fallback adopts the same local policy as RAG.
+                const fallbackCall = window.electronAPI?.streamGeminiChat(question, undefined, undefined, { skipSystemPrompt: false, courseIds, selectedModelOnly: true, requestId: assistantMessageId });
+                if (!fallbackCall) throw new Error('The chat bridge is unavailable.');
                 if (fallbackCall) {
                     try {
-                        await withTimeout(fallbackCall, RAG_QUERY_CLIENT_TIMEOUT_MS, 'streamGeminiChat');
+                        await queryDeadline.wait(Promise.race([fallbackCall, fallbackTerminal]));
                     } catch (timeoutErr) {
+                        if (controller.signal.aborted) return;
+                        if ((timeoutErr as Error)?.name !== 'TimeoutError') throw timeoutErr;
                         console.error('[GlobalChat] streamGeminiChat client-side timeout:', timeoutErr);
                         // Abandoning without cancelling left main streaming into
                         // listeners the NEXT submit registers.
-                        try { (window.electronAPI as any)?.cancelChatStream?.(); } catch { /* best-effort */ }
+                        cancelBackend();
                         oldTokenCleanup?.();
                         oldDoneCleanup?.();
                         oldErrorCleanup?.();
@@ -440,7 +488,14 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
                 }
             }
 
+            // IPC settlement is a second completion signal. If a terminal event
+            // was missed, finalize buffered text rather than leaving a blank row.
+            const settledContent = streamBuffer.getBufferedContent().trim() || "No response was received. Please try again.";
+            setMessages(prev => prev.map(msg => msg.id === assistantMessageId && msg.isStreaming
+                ? { ...msg, content: settledContent, isStreaming: false }
+                : msg));
         } catch (error) {
+            if (controller.signal.aborted) return;
             console.error('[GlobalChat] Error:', error);
             setMessages(prev => prev.filter(msg => msg.id !== assistantMessageId));
             setErrorMessage("Something went wrong. Please try again.");
@@ -452,11 +507,33 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
             // subsequent submitQuestion (no user-message push, no response).
             activeCleanups.forEach(fn => fn());
             activeCleanups = [];
-            setChatState(prev => (prev === 'error' ? prev : 'idle'));
+            policyCleanup?.();
+            queryDeadline.dispose();
+            if (cancelActiveTurnRef.current === cancelTurn) cancelActiveTurnRef.current = null;
+            if (isOpenRef.current) setChatState(prev => (prev === 'error' ? prev : 'idle'));
             streamBuffer.reset();
             submitInFlightRef.current = false;
+            const nextQuestion = pendingQuestionsRef.current.shift();
+            if (nextQuestion && isOpenRef.current) void submitQuestion(nextQuestion);
         }
     }, []);
+
+    // One cancellable dispatch per parent query/open cycle. Busy turns queue
+    // instead of silently losing the launcher's next Ask-anything submission.
+    useEffect(() => {
+        if (!isOpen) {
+            lastInitialQueryRef.current = null;
+            pendingQuestionsRef.current = [];
+            cancelActiveTurnRef.current?.();
+            return;
+        }
+        if (!initialQuery.trim() || lastInitialQueryRef.current === initialQuery) return;
+        const timer = setTimeout(() => {
+            lastInitialQueryRef.current = initialQuery;
+            void submitQuestion(initialQuery);
+        }, 0);
+        return () => clearTimeout(timer);
+    }, [isOpen, initialQuery, submitQuestion]);
 
     return (
         <AnimatePresence
@@ -497,9 +574,6 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
                                 <img src={nativelyIcon} className="w-3.5 h-3.5 force-black-icon opacity-50" alt="logo" />
                                 <span className="text-[13px] font-medium">Search all meetings</span>
                             </div>
-                            <span className="flex items-center gap-2 min-w-0 ml-auto">
-                                <CoursePinBar compact />
-                            </span>
                             <button
                                 onClick={onClose}
                                 className="p-2 transition-colors group"

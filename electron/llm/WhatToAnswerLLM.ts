@@ -1,4 +1,5 @@
 import { LLMHelper } from "../LLMHelper";
+
 import { UNIVERSAL_WHAT_TO_ANSWER_PROMPT } from "./prompts";
 import { TINY_WHAT_TO_ANSWER_PROMPT } from "./tinyPrompts";
 import { resolveV2SystemPrompt, v2TierForPromptTier } from "./promptSystemV2";
@@ -158,7 +159,17 @@ export class WhatToAnswerLLM {
         return full;
     }
 
-    async *generateStream(
+    generateStream(...args: Parameters<WhatToAnswerLLM['generateStreamInner']>): AsyncGenerator<string> {
+        if (!this.llmHelper.withProviderStreamPolicy) return this.generateStreamInner(...args);
+        return this.llmHelper.withProviderStreamPolicy(helper => {
+            // Timing/selection belong to this stream, not the WTA singleton.
+            const view: WhatToAnswerLLM = Object.create(this);
+            view.llmHelper = helper;
+            return view.generateStreamInner(...args);
+        }, args[12], Boolean(args[3]?.length));
+    }
+
+    private async *generateStreamInner(
         cleanedTranscript: string,
         temporalContext?: TemporalContext,
         intentResult?: IntentResult,
@@ -1227,6 +1238,7 @@ The user triggered this action with a coding problem on screen and NO new questi
             const _wtaStream = typeof (this.llmHelper as any).streamChatWithOutcome === 'function'
                 ? (this.llmHelper as any).streamChatWithOutcome(..._wtaArgs)
                 : { stream: (this.llmHelper as any).streamChat(..._wtaArgs), outcome: { truncated: false } };
+
             for await (const token of _wtaStream.stream) {
                 if (MEASURE) {
                     const now = performance.now();

@@ -35,6 +35,7 @@ export interface DynamicActionPayload {
 export type DirectAssistSource = 'typed' | 'stt' | 'screenshot'
 
 export interface DirectAssistRequest {
+  courseIds?: string[]
   requestId: string
   source: DirectAssistSource
   currentRequest: string
@@ -133,7 +134,7 @@ export interface ElectronAPI {
   coursesLessonContent: (courseId: string, lessonId: string) => Promise<any>
   // Courses Studio study aids: one cached LLM pass over up to four lessons.
   coursesGenerateStudyAid: (courseId: string, type: 'summary' | 'glossary' | 'quiz' | 'flashcards', lessonIds: string[], force?: boolean) =>
-    Promise<{ ok: boolean; cached?: boolean; data?: unknown; error?: string }>
+    Promise<{ ok?: boolean; disabled?: boolean; cached?: boolean; data?: unknown; error?: string }>
   // Courses Studio P4 portability: zip bundle export/import + cascade delete.
   coursesExportBundle: (courseId: string) => Promise<{ ok?: boolean; canceled?: boolean; path?: string; error?: string }>
   coursesImportBundle: () => Promise<{ ok?: boolean; canceled?: boolean; courseId?: string; error?: string }>
@@ -854,9 +855,9 @@ export interface ElectronAPI {
   onSessionReset: (callback: () => void) => () => void;
 
   // Streaming listeners
-  streamGeminiChat: (message: string, imagePaths?: string[], context?: string, options?: { skipSystemPrompt?: boolean, ignoreKnowledgeMode?: boolean, courseIds?: string[], surface?: 'live' | 'chat', liveQuestion?: boolean }) => Promise<void>
-  onGeminiStreamToken: (callback: (token: string, meta?: { streamId?: number }) => void) => () => void
-  onGeminiStreamDone: (callback: (data?: { finalText?: string; streamId?: number }) => void) => () => void
+  streamGeminiChat: (message: string, imagePaths?: string[], context?: string, options?: { skipSystemPrompt?: boolean, ignoreKnowledgeMode?: boolean, courseIds?: string[], surface?: 'live' | 'chat', liveQuestion?: boolean, selectedModelOnly?: boolean, requestId?: string }) => Promise<void>
+  onGeminiStreamToken: (callback: (token: string, meta?: { streamId?: number; requestId?: string }) => void) => () => void
+  onGeminiStreamDone: (callback: (data?: { finalText?: string; streamId?: number; requestId?: string; incomplete?: boolean }) => void) => () => void
   onGeminiStreamError: (callback: (error: string, meta?: { streamId?: number | null; source?: string }) => void) => () => void;
 
   // NOTE: onSkillsChanged broadcast subscription was removed. Skills are
@@ -1006,16 +1007,17 @@ export interface ElectronAPI {
   testReleaseFetch: () => Promise<{ success: boolean; error?: string }>
 
   // RAG (Retrieval-Augmented Generation) API
-  ragQueryMeeting: (meetingId: string, query: string) => Promise<{ success?: boolean; fallback?: boolean; error?: string }>
-  ragQueryLive: (query: string) => Promise<{ success?: boolean; fallback?: boolean; error?: string }>
-  ragQueryGlobal: (query: string) => Promise<{ success?: boolean; fallback?: boolean; error?: string }>
+  onChatStreamPolicy: (callback: (data: { source: 'rag' | 'fallback'; requestId?: string; streamId?: number; firstUsefulDeadlineMs: number; interTokenStallMs: number }) => void) => () => void
+  ragQueryMeeting: (meetingId: string, query: string, courseIds?: string[]) => Promise<{ success?: boolean; fallback?: boolean; error?: string }>
+  ragQueryLive: (query: string, courseIds?: string[]) => Promise<{ success?: boolean; fallback?: boolean; error?: string }>
+  ragQueryGlobal: (query: string, courseIds?: string[], requestId?: string) => Promise<{ success?: boolean; fallback?: boolean; error?: string }>
   ragCancelQuery: (options: { meetingId?: string; global?: boolean }) => Promise<{ success: boolean }>
   ragIsMeetingProcessed: (meetingId: string) => Promise<boolean>
   ragGetQueueStatus: () => Promise<{ pending: number; processing: number; completed: number; failed: number }>
   ragRetryEmbeddings: () => Promise<{ success: boolean }>
-  onRAGStreamChunk: (callback: (data: { meetingId?: string; global?: boolean; chunk: string }) => void) => () => void
-  onRAGStreamComplete: (callback: (data: { meetingId?: string; global?: boolean }) => void) => () => void
-  onRAGStreamError: (callback: (data: { meetingId?: string; global?: boolean; error: string }) => void) => () => void
+  onRAGStreamChunk: (callback: (data: { meetingId?: string; global?: boolean; requestId?: string; chunk: string }) => void) => () => void
+  onRAGStreamComplete: (callback: (data: { meetingId?: string; global?: boolean; requestId?: string }) => void) => () => void
+  onRAGStreamError: (callback: (data: { meetingId?: string; global?: boolean; requestId?: string; error: string }) => void) => () => void
 
   // Donation API
   getDonationStatus: () => Promise<{ shouldShow: boolean; hasDonated: boolean; lifetimeShows: number }>;
