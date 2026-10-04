@@ -276,7 +276,10 @@
       "perMachine": false,
       "allowToChangeInstallationDirectory": true,
       "deleteAppDataOnUninstall": false,
-      "artifactName": "${productName}-Setup-${version}.${ext}"
+      "artifactName": "Natively-Setup-${version}.${ext}"
+    },
+    "portable": {
+      "artifactName": "Natively-${version}.${ext}"
     },
     "publish": [
       {

@@ -29,6 +29,16 @@ test('no Windows target builds 32-bit (ia32)', () => {
   }
 });
 
+test('Windows downloads use the brand independently of the executable disguise', () => {
+  const disguise = createRequire(import.meta.url)('../disguise-name.cjs');
+  assert.equal(pkg.build?.nsis?.artifactName, 'Natively-Setup-${version}.${ext}');
+  assert.equal(pkg.build?.portable?.artifactName, 'Natively-${version}.${ext}');
+  assert.equal(pkg.build?.win?.executableName, disguise.win32);
+  assert.equal(pkg.build?.productName, disguise.darwin);
+  assert.equal(pkg.build?.mac?.artifactName, undefined);
+  assert.equal(pkg.build?.artifactName, undefined);
+});
+
 test('the TypeScript native compiler is excluded from the shipped app', () => {
   // `typescript7` is an npm ALIAS (npm:typescript@^7.0.2), so npm never marks the
   // transitive @typescript/native-preview* packages as dev — electron-builder then
