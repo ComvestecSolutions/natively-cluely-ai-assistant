@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { ImageOff } from 'lucide-react';
+import { BookOpen, ExternalLink, ImageOff } from 'lucide-react';
 
 // LessonMarkdown — renders a single lesson's stored markdown inside the app (Courses Studio P3).
 // Pure presentation: all cross-component wiring is injected by the parent.
@@ -61,11 +61,12 @@ function mediaFallbackLabel(alt: string | undefined, src: string): string {
   return src.length > 48 ? `${src.slice(0, 45)}…` : src || 'Image unavailable';
 }
 
-// Shared link styling for both the in-app lesson <button> and external <a>. Full accent on a dark UI:
-// per the note in tailwind.config.js a `/NN` opacity modifier cannot be chained onto var() accent
-// tokens (it compiles to nothing), so visibility comes from full-strength color + hover white tint.
+// Shared link styling for both the in-app lesson <button> and external <a>: full accent + a
+// permanent underline — the app-wide doc-link idiom. A `/NN` opacity modifier cannot be chained
+// onto var() accent tokens (tailwind.config.js note), so hover is a color shift, not a fill.
+// The focus ring is local: index.css resets :focus-visible outlines globally for this surface family.
 const LINK_CLASSES =
-  'align-baseline text-accent-primary underline decoration-accent-primary underline-offset-2 rounded-[3px] -mx-0.5 px-0.5 hover:bg-white/5 cursor-pointer break-words';
+  'align-baseline text-accent-primary underline decoration-accent-primary underline-offset-2 cursor-pointer break-words transition-colors duration-150 motion-reduce:transition-none hover:text-accent-hover focus-visible:ring-2 focus-visible:ring-accent-focus';
 
 // Open a URL in the OS browser through the preload bridge. The main process enforces an https
 // allow-list before actually opening, so forwarding any non-internal href is safe — it's ignored there.
@@ -96,9 +97,26 @@ export default function LessonMarkdown({ courseId, content, lessonUrls, onNaviga
     });
   };
 
+  // Sources whose <img> has decoded — drives the load fade-in so media settles in instead of popping.
+  const [loadedMediaSrcs, setLoadedMediaSrcs] = useState<ReadonlySet<string>>(() => new Set());
+  const markMediaLoaded = (src: string): void => {
+    if (!src || loadedMediaSrcs.has(src)) return;
+    setLoadedMediaSrcs((prev) => {
+      if (prev.has(src)) return prev;
+      const next = new Set(prev);
+      next.add(src);
+      return next;
+    });
+  };
+
   const trimmed = (content ?? '').trim();
   if (!trimmed) {
-    return <p className="text-[14px] leading-relaxed text-text-secondary">No content available for this lesson yet.</p>;
+    return (
+      <div className="my-6 flex w-full max-w-md flex-col items-center gap-2 rounded-xl border border-border-muted bg-bg-item-surface px-6 py-8 text-center">
+        <BookOpen size={18} aria-hidden />
+        <p className="text-[13px] leading-relaxed text-text-secondary">No content available for this lesson yet.</p>
+      </div>
+    );
   }
 
   return (
@@ -113,21 +131,22 @@ export default function LessonMarkdown({ courseId, content, lessonUrls, onNaviga
             if (failedMediaSrcs.has(resolved)) {
               // Leftover absolute https URLs can 404 — an understated pill instead of a broken glyph.
               return (
-                // Bracket alphas on purpose: TW 3.x drops off-scale /NN modifiers (house style elsewhere too).
-                <span className="inline-flex items-center gap-1.5 rounded-md border border-white/[0.08] bg-white/[0.03] px-2 py-1 text-[12px] text-zinc-500">
+                <span className="inline-flex items-center gap-1.5 rounded-md border border-border-muted bg-bg-secondary px-2 py-1 text-[12px] text-text-tertiary">
                   <ImageOff size={14} aria-hidden />
                   {mediaFallbackLabel(alt, resolved)}
                 </span>
               );
             }
+            const loaded = loadedMediaSrcs.has(resolved);
             return (
               <img
                 src={resolved}
                 alt={alt ?? ''}
                 loading="lazy"
                 decoding="async"
+                onLoad={() => markMediaLoaded(resolved)}
                 onError={() => markMediaFailed(resolved)}
-                className="max-w-full rounded-lg border border-border-subtle my-3"
+                className={`my-3 max-w-full rounded-lg border transition-opacity duration-300 motion-reduce:transition-none ${loaded ? 'border-border-muted opacity-100' : 'min-h-[96px] w-full animate-pulse border-transparent bg-bg-elevated opacity-0'}`}
               />
             );
           },
@@ -164,6 +183,7 @@ export default function LessonMarkdown({ courseId, content, lessonUrls, onNaviga
                 className={LINK_CLASSES}
               >
                 {children}
+                <ExternalLink aria-hidden size={12} className="mb-0.5 ml-0.5 inline" />
               </a>
             );
           },
@@ -172,35 +192,35 @@ export default function LessonMarkdown({ courseId, content, lessonUrls, onNaviga
           // where it matters (bottom breathing); inner <code> is reset because the `code` override
           // below styles inline chips.
           pre: ({ children }) => (
-            <pre className="my-4 overflow-x-auto rounded-md border border-white/[0.06] bg-black/40 p-3 font-mono text-[12.5px] leading-relaxed [&>code]:bg-transparent [&>code]:p-0 [&>code]:text-[12.5px]">
+            <pre className="my-4 overflow-x-auto rounded-md border border-border-muted bg-bg-input p-3 font-mono text-[12.5px] leading-relaxed text-text-primary [&>code]:bg-transparent [&>code]:p-0 [&>code]:text-[12.5px]">
               {children}
             </pre>
           ),
 
           code: ({ children }) => (
-            <code className="rounded bg-white/[0.08] px-1 py-px font-mono text-[0.92em] text-zinc-200">{children}</code>
+            <code className="rounded bg-bg-input px-1 py-px font-mono text-[0.92em] text-text-primary">{children}</code>
           ),
 
           table: ({ children }) => (
-            <div className="my-3 overflow-x-auto rounded-lg border border-border-subtle">
+            <div className="my-3 overflow-x-auto rounded-lg border border-border-muted">
               <table className="w-full border-collapse align-top text-[13px]">{children}</table>
             </div>
           ),
 
           th: ({ children }) => (
-            <th className="border border-border-subtle px-3 py-1.5 text-left align-top font-medium text-text-primary">
+            <th className="border border-border-muted bg-bg-secondary px-3 py-1.5 text-left align-top font-medium text-text-primary">
               {children}
             </th>
           ),
 
           td: ({ children }) => (
-            <td className="border border-border-subtle px-3 py-1.5 align-top text-text-primary">{children}</td>
+            <td className="border border-border-muted px-3 py-1.5 align-top text-text-primary">{children}</td>
           ),
 
           blockquote: ({ children }) => (
             // accent-primary cannot take a /NN alpha modifier (var() token — see tailwind.config.js),
             // so the accent-border token carries the tinted bar.
-            <blockquote className="my-4 border-l-2 border-accent-border pl-3 text-zinc-400 not-italic">
+            <blockquote className="my-4 border-l-2 border-accent-border pl-3 text-text-secondary not-italic">
               {children}
             </blockquote>
           ),
@@ -221,13 +241,13 @@ export default function LessonMarkdown({ courseId, content, lessonUrls, onNaviga
             <h3 className="scroll-mt-24 pt-4 text-[15.5px] font-medium leading-snug text-text-primary">{children}</h3>
           ),
 
-          hr: () => <hr className="my-6 border-white/[0.08]" />,
+          hr: () => <hr className="my-6 border-border-muted" />,
 
           ul: ({ children }) => (
-            <ul className="space-y-1.5 pl-5 list-disc leading-relaxed marker:text-zinc-500">{children}</ul>
+            <ul className="space-y-1.5 pl-5 list-disc leading-relaxed marker:text-text-tertiary">{children}</ul>
           ),
           ol: ({ children }) => (
-            <ol className="space-y-1.5 pl-5 list-decimal leading-relaxed marker:text-zinc-500">{children}</ol>
+            <ol className="space-y-1.5 pl-5 list-decimal leading-relaxed marker:text-text-tertiary">{children}</ol>
           ),
         }}
       >

@@ -1,5 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
+import { BookOpen, ChevronDown } from 'lucide-react';
 import { getCoursePinIds, setCoursePinIds } from '../../lib/coursePins';
+
+// The settings panes' smooth-out curve — the pin menu opens on it too.
+const MENU_EASE = [0.22, 1, 0.36, 1] as const;
 
 /** Minimal course row shape as returned by `courses:list` (CourseSummary[]). */
 interface PinnableCourse {
@@ -27,6 +32,9 @@ const CoursePinBar: React.FC<CoursePinBarProps> = ({ compact = false }) => {
     const [open, setOpen] = useState(false);
     const [pins, setPins] = useState<string[]>(() => getCoursePinIds());
     const rootRef = useRef<HTMLDivElement | null>(null);
+    // Chip is the disclosure's source of truth — Escape re-focuses it after closing.
+    const chipRef = useRef<HTMLButtonElement | null>(null);
+    const reduceMotion = useReducedMotion();
 
     useEffect(() => {
         let alive = true;
@@ -67,6 +75,19 @@ const CoursePinBar: React.FC<CoursePinBarProps> = ({ compact = false }) => {
         return () => document.removeEventListener('mousedown', onPointerDown);
     }, [open]);
 
+    // Escape closes and hands focus back to the chip — completes the disclosure pattern.
+    useEffect(() => {
+        if (!open) return;
+        const onKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                setOpen(false);
+                chipRef.current?.focus();
+            }
+        };
+        document.addEventListener('keydown', onKeyDown);
+        return () => document.removeEventListener('keydown', onKeyDown);
+    }, [open]);
+
     const togglePin = (id: string) => {
         const next = pins.includes(id) ? pins.filter((pinnedId) => pinnedId !== id) : [...pins, id];
         setPins(next);
@@ -80,27 +101,37 @@ const CoursePinBar: React.FC<CoursePinBarProps> = ({ compact = false }) => {
     return (
         <div ref={rootRef} className="relative inline-block text-left">
             <button
+                ref={chipRef}
                 type="button"
                 aria-expanded={open}
+                aria-controls="course-pin-menu"
+                aria-haspopup="true"
                 onClick={() => setOpen((nextOpen) => !nextOpen)}
-                className={`flex cursor-pointer select-none items-center gap-1.5 rounded-full border bg-bg-item-surface border-border-subtle text-xs font-medium text-text-primary ${compact ? 'px-2 py-0.5' : 'px-3 py-1.5'}`}
+                className={`flex cursor-pointer select-none items-center gap-1.5 rounded-full border bg-bg-item-surface border-border-subtle text-xs font-medium text-text-primary transition-colors duration-150 hover:bg-[var(--bg-row-hover)] focus-visible:ring-2 focus-visible:ring-accent-focus ${compact ? 'px-2 py-0.5' : 'px-3 py-1.5'}`}
             >
-                <span aria-hidden>📖</span>
+                <BookOpen size={14} aria-hidden />
                 {pins.length > 0 ? `Courses · ${pins.length}` : 'Courses'}
+                <ChevronDown size={12} aria-hidden className={`text-text-secondary transition-transform duration-200 motion-reduce:transition-none ${open ? 'rotate-180' : ''}`} />
             </button>
 
-            {open && (
-                <div
-                    className="absolute z-50 rounded-xl border bg-bg-elevated border-border-subtle shadow-lg"
-                    style={{ right: 0, top: 'calc(100% + 6px)', width: 288, maxHeight: 260, overflowY: 'auto' }}
-                >
+            <AnimatePresence>
+                {open && (
+                    <motion.div
+                        id="course-pin-menu"
+                        className="absolute right-0 top-full z-50 mt-1.5 max-h-[260px] w-72 origin-top-right overflow-y-auto rounded-xl border border-border-muted bg-bg-elevated shadow-lg"
+                        initial={{ opacity: 0, scale: 0.96, y: -4 }}
+                        animate={{ opacity: 1, scale: 1, y: 0 }}
+                        exit={{ opacity: 0, scale: 0.97, y: -2 }}
+                        transition={{ duration: reduceMotion ? 0 : 0.18, ease: MENU_EASE }}
+                    >
                     <p className="px-3 pt-2 pb-1 text-xs font-medium text-text-secondary">Ground-truth courses</p>
 
                     {courses.map((course) => (
-                        <label key={course.id} className="flex cursor-pointer items-center gap-2 px-3 py-1.5">
+                        <label key={course.id} className="flex cursor-pointer items-center gap-2 rounded-md px-3 py-1.5 transition-colors duration-150 hover:bg-[var(--bg-row-hover)]">
                             <input
                                 type="checkbox"
-                                className="h-3.5 w-3.5 shrink-0"
+                                className="h-3.5 w-3.5 shrink-0 cursor-pointer accent-[var(--accent-primary)] focus-visible:ring-2 focus-visible:ring-accent-focus"
+                                aria-label={`Pin ${labelFor(course)}`}
                                 checked={pins.includes(course.id)}
                                 onChange={() => togglePin(course.id)}
                             />
@@ -111,11 +142,11 @@ const CoursePinBar: React.FC<CoursePinBarProps> = ({ compact = false }) => {
                     ))}
 
                     <div className="px-3 pt-1.5 pb-2">
-                        <p className="text-xs leading-relaxed text-text-secondary">Pinned courses are always available to chat.</p>
-                        <p className="text-xs leading-relaxed text-text-secondary">Enabled courses may be used automatically when relevant.</p>
+                        <p className="text-xs leading-relaxed text-text-secondary">Pinned courses are always available to chat as ground-truth context.</p>
                     </div>
-                </div>
-            )}
+                    </motion.div>
+                )}
+            </AnimatePresence>
         </div>
     );
 };
