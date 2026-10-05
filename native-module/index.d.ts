@@ -29,6 +29,8 @@ export declare class StealthKeyboardTap {
    * Windows, matching the shipped macOS build). Idempotent while active.
    */
   start(callback: ((err: Error | null, arg: CapturedKey) => any), appChords: Array<AppChordInput>, shortcutOnly: boolean, overlayBounds?: OverlayBoundsInput | undefined | null): boolean
+  /** Enable default Reset chord capture only while that binding is configured. */
+  setResetChordEnabled(enabled: boolean): void
   /** No-op on Windows (accepted for API parity — see `start`). */
   updateOverlayBounds(overlayBounds?: OverlayBoundsInput | undefined | null): void
   /**

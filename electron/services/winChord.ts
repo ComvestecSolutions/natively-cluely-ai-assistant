@@ -134,6 +134,9 @@ export function acceleratorToWin32Chord(accelerator: string, id: string): Win32C
     if ((mods & MOD_CTRL) === 0) return null;
     if ((mods & MOD_WIN) !== 0) return null;
     if ((mods & MOD_ALT) !== 0 && !isArrowVk(keyVk)) return null;
+    // Guard mode runs even when stealth typing is off: never steal foreground
+    // Copy/Paste/Cut, including old user overrides that bypassed setKeybind.
+    if (mods === MOD_CTRL && [0x43, 0x56, 0x58].includes(keyVk)) return null;
 
     return { vk: keyVk, mods, id };
 }

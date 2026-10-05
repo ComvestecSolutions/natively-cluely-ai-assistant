@@ -323,12 +323,21 @@ export const useShortcuts = () => {
 
         if (backendId) {
             try {
-                await window.electronAPI.setKeybind(backendId, accelerator);
+                const accepted = await window.electronAPI.setKeybind(backendId, accelerator);
+                if (accepted === false) {
+                    mapBackendToFrontend(await window.electronAPI.getKeybinds());
+                    const clipboardChord = /^(?:CommandOrControl|CmdOrCtrl|Control|Ctrl|Command|Cmd|Meta|Super)\+(?:C|V|X)$/i.test(accelerator);
+                    return clipboardChord
+                        ? 'Copy, Paste and Cut shortcuts are reserved for the foreground app. Choose another combination.'
+                        : 'Could not assign this shortcut. Choose a supported combination.';
+                }
             } catch (error) {
                 console.error(`Failed to set keybind for ${actionId}:`, error);
+                mapBackendToFrontend(await window.electronAPI.getKeybinds().catch(() => []));
+                return 'Could not assign this shortcut. Please try another combination.';
             }
         }
-    }, []);
+    }, [mapBackendToFrontend]);
 
     // Function to reset all shortcuts to defaults
     const resetShortcuts = useCallback(async () => {

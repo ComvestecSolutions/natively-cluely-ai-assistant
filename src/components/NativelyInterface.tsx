@@ -10661,8 +10661,12 @@ Provide only the answer, nothing else.`;
   // OS frontmost+key application throughout the entire typing session.
   //
   // HID virtual keycodes referenced below (stable across layouts):
-  //   36 = Return,  48 = Tab,  51 = Delete (Backspace),  53 = Esc,
+  //   15 = R (reset only with Cmd/Ctrl), 36 = Return, 48 = Tab,
+  //   51 = Delete (Backspace), 53 = Esc,
   //   76 = Numpad Enter,  123 = Left,  124 = Right,  125 = Down,  126 = Up.
+  // Captured-key IPC is subscribed once; use the live Settings binding after rebinds.
+  const stealthShortcutMatcherRef = useRef(isShortcutPressed);
+  stealthShortcutMatcherRef.current = isShortcutPressed;
   useEffect(() => {
     if (!window.electronAPI?.onStealthTapState || !window.electronAPI?.onStealthKeyCaptured) return;
 
@@ -10693,17 +10697,9 @@ Provide only the answer, nothing else.`;
     });
 
     const unsubKey = window.electronAPI.onStealthKeyCaptured((ev) => {
-      // CONTRACT WITH RUST: keyboard_tap.rs pass-through filter (R3)
-      // returns the event unmodified for ANY system-modifier key
-      // (Cmd / Ctrl / Option / Fn) and for ALL F-keys, so the OS
-      // routes those normally to the foreground app. Consequence:
-      // (ev.flags & CMD) is NEVER true here, neither is OPT or CTRL.
-      // The previous round had Cmd+Enter / Cmd+Backspace / Cmd+A /
-      // Option+Backspace branches — all dead code under R3. Removed
-      // to prevent a false sense of feature support; if Rust ever
-      // changes the filter to deliver Cmd events, those branches
-      // need to be REINTRODUCED with explicit testing, not
-      // resurrected from a TODO.
+      // Native taps pass system-modifier chords to the foreground app except
+      // plain paste and reset while full stealth typing is engaged. Windows'
+      // shortcut-only guard never forwards reset here.
 
       // Esc handled regardless of active state (main process broadcasts
       // it BEFORE stopping the tap, so we get here while still active;
@@ -10733,6 +10729,20 @@ Provide only the answer, nothing else.`;
       if (!stealthTapActiveRef.current) return; // ignore other events after stop
       if (!ev.isKeyDown) return; // we only act on keyDown
 
+      // The native hooks send keyCode 15 only for an engaged Cmd/Ctrl+R,
+      // without printable chars. Check the current Settings binding as well:
+      // rebinding Reset / Cancel must not leave the old R chord active here.
+      const resetModifier = window.electronAPI.platform === 'darwin' ? 1 << 20 : 1 << 18;
+      const systemModifiers = (1 << 20) | (1 << 19) | (1 << 18) | (1 << 17) | (1 << 23);
+      if (ev.keyCode === 15 && (ev.flags & systemModifiers) === resetModifier &&
+          stealthShortcutMatcherRef.current({
+            key: 'r', code: 'KeyR', metaKey: !!(ev.flags & (1 << 20)),
+            ctrlKey: !!(ev.flags & (1 << 18)), altKey: false, shiftKey: false,
+          } as KeyboardEvent, 'resetCancel')) {
+        generalHandlersRef.current.resetCancel();
+        return;
+      }
+
       switch (ev.keyCode) {
         case 36: // Return
         case 76: // Numpad Enter
@@ -10747,8 +10757,13 @@ Provide only the answer, nothing else.`;
             window.electronAPI.stealthTapStop().catch(() => {});
           }
           return;
-        case 51: // Backspace — delete one char
-          setInputValue((prev) => prev.slice(0, -1));
+        case 51: // Backspace — delete the last displayed grapheme, not a UTF-16 unit
+          setInputValue((prev) => {
+            const segments = new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(prev);
+            let lastStart = 0;
+            for (const segment of segments) lastStart = segment.index;
+            return prev.slice(0, lastStart);
+          });
           return;
         // ROUND 4 FIX (#6): Tab (48) and arrows (123-126) used to
         // be no-op'd here. They're now passed through at the Rust

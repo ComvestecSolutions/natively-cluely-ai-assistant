@@ -27,7 +27,7 @@ test('start() accepts the app-chord table and stores it before the worker instal
   );
   assert.match(
     rust,
-    /\*self\.state\.app_chords\.lock\(\)[\s\S]{0,120}app_chords_from_inputs\(app_chords\)/,
+    /\*self\s*\.state\s*\.app_chords\s*\.lock\(\)[\s\S]{0,120}app_chords_from_inputs\(app_chords\)/,
     'BUG: the chord table must be published into HookState at start(), before the hook installs.',
   );
 });
@@ -65,7 +65,7 @@ test('the matching key-UP is swallowed too (no half a sequence reaches the app)'
   const rust = read(HOOK);
   assert.match(
     rust,
-    /if is_key_up \{[\s\S]{0,200}swallowed_ups[\s\S]{0,80}\.remove\(&vk\)[\s\S]{0,60}return LRESULT\(1\)/,
+    /if is_key_up \{[\s\S]{0,260}swallowed_ups[\s\S]{0,160}\.remove\(&vk\)[\s\S]{0,60}return LRESULT\(1\)/,
     'BUG: a completing key whose down we swallowed must have its up swallowed as well.',
   );
 });
@@ -103,6 +103,12 @@ test('the hook never swallows a bare modifier, only completed app chords', () =>
   // to prevent.
   assert.match(rust, /let ctrl = modifier_held\(VK_CONTROL\);/,
     'BUG: ctrl must come from GetAsyncKeyState so a lost key-up self-heals.');
+});
+
+test('native matcher independently refuses plain Ctrl+C/V/X from a stale guard table', () => {
+  const rust = read('native-module/src/app_chord.rs');
+  const matcher = rust.slice(rust.indexOf('pub fn match_app_chord('), rust.indexOf('#[cfg(test)]'));
+  assert.match(matcher, /mods == MOD_CTRL && matches!\(vk, 0x43 \| 0x56 \| 0x58\)/);
 });
 
 test('an empty chord table leaves the hook fully inert (no behaviour change)', () => {
@@ -156,7 +162,7 @@ test('start() takes the shortcut_only flag and publishes it before install', () 
   );
   assert.match(
     rust,
-    /self\.state\.shortcut_only\.store\(shortcut_only, Ordering::Release\)/,
+    /self\s*\.state\s*\.shortcut_only\s*\.store\(shortcut_only, Ordering::Release\)/,
     'BUG: the mode must be published into HookState before the worker installs the hook.',
   );
 });

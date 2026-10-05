@@ -35,9 +35,10 @@
 //!
 //! `NativelyInterface.tsx` hardcodes macOS HID virtual keycodes (53=Esc,
 //! 36=Return, 76=NumpadEnter, 51=Backspace) and expects Tab (48) + arrows
-//! (123-126) + F-keys + any system-modifier combo to be PASSED THROUGH (never
-//! delivered). We translate Windows VK codes to those mac HID codes and apply
-//! the same pass-through filter, so the JS switch statement works unchanged.
+//! (123-126) + F-keys + system-modifier combos other than plain Ctrl+V and
+//! Ctrl+R (only while full stealth typing is engaged) to pass through. We
+//! translate Windows VK codes to mac HID codes and forward paste to main for
+//! the unfocused input; the renderer sees ordinary text.
 //!
 //! # Threading
 //!
@@ -54,10 +55,10 @@
 
 #![cfg(target_os = "windows")]
 
+use std::collections::HashSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -83,11 +84,10 @@ use windows::Win32::UI::TextServices::HKL;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetAncestor, GetForegroundWindow, GetMessageW,
     GetWindowThreadProcessId, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
-    TranslateMessage, UnhookWindowsHookEx, WindowFromPoint,
-    EVENT_SYSTEM_FOREGROUND, GA_ROOT, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
-    PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT,
-    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_QUIT, WM_RBUTTONDOWN,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN,
+    TranslateMessage, UnhookWindowsHookEx, WindowFromPoint, EVENT_SYSTEM_FOREGROUND, GA_ROOT,
+    HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WINEVENT_OUTOFCONTEXT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_QUIT,
+    WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN,
 };
 
 // ─── napi objects shared with the macOS module's JS surface ──────────────────
@@ -179,6 +179,8 @@ struct HookState {
     /// full stealth-typing tap: it swallows typing into the overlay and arms the
     /// outside-click / Alt+Tab auto-stop hooks. See StealthKeyboardManager.
     shortcut_only: AtomicBool,
+    /// Enable Ctrl+R capture only while Reset retains its default binding.
+    reset_chord_enabled: AtomicBool,
 }
 
 impl HookState {
@@ -193,6 +195,7 @@ impl HookState {
             app_chords: Mutex::new(Vec::new()),
             swallowed_ups: Mutex::new(HashSet::new()),
             shortcut_only: AtomicBool::new(false),
+            reset_chord_enabled: AtomicBool::new(false),
         }
     }
 }
@@ -208,11 +211,7 @@ static ACTIVE_HOOK: Lazy<Mutex<Option<Arc<HookState>>>> = Lazy::new(|| Mutex::ne
 // Must return promptly (Windows drops slow LL hooks after LowLevelHooksTimeout,
 // ~300ms). We do no blocking work: the tsfn.call is non-blocking (queues onto
 // V8 and returns).
-unsafe extern "system" fn keyboard_hook_proc(
-    code: i32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // A panic crossing this `extern "system"` boundary aborts the process (since
     // Rust 1.81) — a hard kill from the OS input thread. Contain it and pass the
     // event through, mirroring keyboard_tap.rs. `pass_through` never swallows, so
@@ -287,7 +286,10 @@ unsafe fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRES
     // the completing key (Enter, a digit, a letter) would otherwise take the
     // deliver-to-overlay path on its own up.
     if is_key_up {
-        let mut ups = state.swallowed_ups.lock().unwrap_or_else(|p| p.into_inner());
+        let mut ups = state
+            .swallowed_ups
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         if ups.remove(&vk) {
             return LRESULT(1);
         }
@@ -296,6 +298,7 @@ unsafe fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRES
     // ── PASS-THROUGH FILTER (mirrors keyboard_tap.rs R3/R4) ──
     // Win combos and F-keys/nav/modifiers/lock/media keys go back to the OS so
     // system shortcuts keep working. Ctrl/Alt combos also pass through EXCEPT
+    // plain Ctrl+R/Ctrl+V (handled after app chords in full stealth mode) and
     // AltGr: Windows reports AltGr as Ctrl+Alt (or right-Alt), and on EU layouts
     // AltGr produces real text (@ { } \ € ~ …). Passing those through would both
     // fail to type them into the overlay AND leak them into the foreground
@@ -326,7 +329,11 @@ unsafe fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRES
     // through: an Alt chord with a printable completing key never matches.
     if is_key_down && ctrl {
         let mods = MOD_CTRL
-            | if modifier_held(VK_SHIFT) { MOD_SHIFT } else { 0 }
+            | if modifier_held(VK_SHIFT) {
+                MOD_SHIFT
+            } else {
+                0
+            }
             | if alt { MOD_ALT } else { 0 };
         let matched = {
             let chords = state.app_chords.lock().unwrap_or_else(|p| p.into_inner());
@@ -336,16 +343,22 @@ unsafe fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRES
             // Deliver on the SAME threadsafe callback as ordinary keys, tagged
             // with the action id so StealthKeyboardManager dispatches it instead
             // of typing it into the overlay.
-            let delivered = send_payload(&state, CapturedKey {
-                key_code: 0,
-                chars: String::new(),
-                flags: 0,
-                is_key_down: true,
-                is_outside_mouse_down: false,
-                app_chord_id: id,
-            });
+            let delivered = send_payload(
+                &state,
+                CapturedKey {
+                    key_code: 0,
+                    chars: String::new(),
+                    flags: 0,
+                    is_key_down: true,
+                    is_outside_mouse_down: false,
+                    app_chord_id: id,
+                },
+            );
             if delivered {
-                let mut ups = state.swallowed_ups.lock().unwrap_or_else(|p| p.into_inner());
+                let mut ups = state
+                    .swallowed_ups
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
                 ups.insert(vk);
                 return LRESULT(1);
             }
@@ -361,6 +374,68 @@ unsafe fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRES
     // falls past this and swallows typing into the overlay below.)
     if state.shortcut_only.load(Ordering::Acquire) {
         return pass();
+    }
+
+    // Reset is local to full stealth typing with the default binding. A rebind
+    // must return Ctrl+R to the foreground browser; app_chords are OS-global.
+    if is_key_down && ctrl && !alt && !modifier_held(VK_SHIFT) && vk == 0x52 {
+        let held = state
+            .swallowed_ups
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&vk);
+        if held {
+            return LRESULT(1); // finish an already-swallowed press even after a rebind
+        }
+        if !state.reset_chord_enabled.load(Ordering::Acquire) {
+            return pass();
+        }
+        let delivered = send_payload(
+            &state,
+            CapturedKey {
+                key_code: 15, // macOS R keycode, shared with the renderer
+                chars: String::new(),
+                flags: 1 << 18, // macOS CTRL bit layout
+                is_key_down: true,
+                is_outside_mouse_down: false,
+                app_chord_id: String::new(),
+            },
+        );
+        if delivered {
+            state
+                .swallowed_ups
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(vk);
+            return LRESULT(1);
+        }
+        return pass(); // never swallow when there is no live callback
+    }
+
+    // Plain Ctrl+V is paste into the unfocused overlay, not the foreground
+    // application. App chords above retain priority; Ctrl+Shift+V, AltGr+V,
+    // and all other shortcuts keep their existing pass-through behavior.
+    if is_key_down && ctrl && !alt && !modifier_held(VK_SHIFT) && vk == 0x56 {
+        let delivered = send_payload(
+            &state,
+            CapturedKey {
+                key_code: 9, // macOS V keycode, reserved for the paste gesture
+                chars: String::new(),
+                flags: 1 << 18, // macOS CTRL flag layout, for the shared JS bridge
+                is_key_down: true,
+                is_outside_mouse_down: false,
+                app_chord_id: String::new(),
+            },
+        );
+        if delivered {
+            state
+                .swallowed_ups
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(vk);
+            return LRESULT(1);
+        }
+        return pass(); // no callback: never eat the user's paste
     }
 
     if (ctrl || alt) && !altgr {
@@ -405,14 +480,17 @@ unsafe fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRES
     // Send BOTH keydown and keyup (renderer filters on isKeyDown), matching the
     // macOS tap. If delivery could not even be attempted (no live callback),
     // DON'T swallow — a swallowed key with nowhere to go is lost input.
-    let delivered = send_payload(&state, CapturedKey {
-        key_code,
-        chars,
-        flags,
-        is_key_down,
-        is_outside_mouse_down: false,
-        app_chord_id: String::new(),
-    });
+    let delivered = send_payload(
+        &state,
+        CapturedKey {
+            key_code,
+            chars,
+            flags,
+            is_key_down,
+            is_outside_mouse_down: false,
+            app_chord_id: String::new(),
+        },
+    );
     if !delivered {
         return pass();
     }
@@ -960,7 +1038,9 @@ fn hook_worker(state: Arc<HookState>, session_id: u64, ready_tx: mpsc::Sender<bo
         // Low-level MOUSE hook for outside-click stop. If it fails, keyboard
         // stealth still works; the user just loses click-away auto-stop (Esc /
         // idle / hotkey still disengage).
-        guard.mouse = match unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), hmod, 0) } {
+        guard.mouse = match unsafe {
+            SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), hmod, 0)
+        } {
             Ok(h) => Some(h),
             Err(e) => {
                 eprintln!("[keyboard_hook_windows] WH_MOUSE_LL install failed (outside-click stop disabled): {e:?}");
@@ -983,7 +1063,9 @@ fn hook_worker(state: Arc<HookState>, session_id: u64, ready_tx: mpsc::Sender<bo
             )
         };
         if guard.fg.0 == 0 {
-            eprintln!("[keyboard_hook_windows] SetWinEventHook failed (Alt+Tab auto-stop disabled)");
+            eprintln!(
+                "[keyboard_hook_windows] SetWinEventHook failed (Alt+Tab auto-stop disabled)"
+            );
         }
     }
 
@@ -1107,10 +1189,19 @@ impl StealthKeyboardTap {
         // Publish the mode + chord table BEFORE the worker installs the hook, so
         // the very first keystroke already sees them. Also clear any stale
         // swallowed-up tracking from a prior session.
-        self.state.shortcut_only.store(shortcut_only, Ordering::Release);
-        *self.state.app_chords.lock().unwrap_or_else(|p| p.into_inner()) =
-            app_chords_from_inputs(app_chords);
-        self.state.swallowed_ups.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.state
+            .shortcut_only
+            .store(shortcut_only, Ordering::Release);
+        *self
+            .state
+            .app_chords
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = app_chords_from_inputs(app_chords);
+        self.state
+            .swallowed_ups
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
 
         // Join any prior worker still winding down before publishing active,
         // so its cleanup store(false) can't race our store(true).
@@ -1120,24 +1211,34 @@ impl StealthKeyboardTap {
         }
 
         self.state.active.store(true, Ordering::Release);
-        *self.state.callback.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(callback));
+        *self
+            .state
+            .callback
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(callback));
 
         // New session id. The worker captures it and only tears down shared
         // state if it is still current — so a worker detached on a timeout can't
         // clobber a newer session. fetch_add returns the previous value; +1 is
         // this session's id.
-        let session_id = self.state.session_id.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        let session_id = self
+            .state
+            .session_id
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
 
         // Seed the CapsLock / NumLock toggle state HERE, on the JS main thread,
         // which pumps input so GetKeyState reports the true toggle. The worker
         // thread cannot read this reliably (it pumps no keyboard input); the
         // hook then keeps it current by flipping on each lock-key press.
-        self.state
-            .caps_on
-            .store((unsafe { GetKeyState(VK_CAPITAL.0 as i32) } & 0x0001) != 0, Ordering::Release);
-        self.state
-            .num_on
-            .store((unsafe { GetKeyState(VK_NUMLOCK.0 as i32) } & 0x0001) != 0, Ordering::Release);
+        self.state.caps_on.store(
+            (unsafe { GetKeyState(VK_CAPITAL.0 as i32) } & 0x0001) != 0,
+            Ordering::Release,
+        );
+        self.state.num_on.store(
+            (unsafe { GetKeyState(VK_NUMLOCK.0 as i32) } & 0x0001) != 0,
+            Ordering::Release,
+        );
 
         // Confirm the hook actually installs before reporting success. Without
         // this, start() returns true the moment the thread spawns, so a hook
@@ -1151,7 +1252,11 @@ impl StealthKeyboardTap {
             .spawn(move || hook_worker(state, session_id, ready_tx))
             .map_err(|e| {
                 self.state.active.store(false, Ordering::Release);
-                *self.state.callback.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                *self
+                    .state
+                    .callback
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = None;
                 Error::new(
                     Status::GenericFailure,
                     format!("failed to spawn keyboard-hook worker: {e}"),
@@ -1170,7 +1275,11 @@ impl StealthKeyboardTap {
                 // Worker reported an install failure and has already returned.
                 self.state.active.store(false, Ordering::Release);
                 let _ = handle.join();
-                *self.state.callback.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                *self
+                    .state
+                    .callback
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = None;
                 Ok(false)
             }
             Err(_) => {
@@ -1184,10 +1293,22 @@ impl StealthKeyboardTap {
                     }
                 }
                 drop(handle);
-                *self.state.callback.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                *self
+                    .state
+                    .callback
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = None;
                 Ok(false)
             }
         }
+    }
+
+    /// Set before start and on each Reset rebind; the shortcut-only guard ignores it.
+    #[napi]
+    pub fn set_reset_chord_enabled(&self, enabled: bool) {
+        self.state
+            .reset_chord_enabled
+            .store(enabled, Ordering::Release);
     }
 
     /// No-op on Windows (accepted for API parity — see `start`).
@@ -1209,7 +1330,11 @@ impl StealthKeyboardTap {
             }
         }
         // Drop the JS callback so V8 can GC it.
-        *self.state.callback.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *self
+            .state
+            .callback
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
 
         // Wait for the worker to finish unhooking (so a fast start() after this
         // installs cleanly and the WM_KEYBOARD_LL hook is provably removed).

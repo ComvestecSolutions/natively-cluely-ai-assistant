@@ -1456,7 +1456,22 @@ export class WindowHelper {
     const forwardSupported = process.platform !== 'linux';
     const overlayIgnore = passthrough || (forwardSupported && !this.overlayHoverInteractive);
 
+    // A hover changes the hit-test but must not end stealth typing. The native
+    // mouse-down callback stops only if a real click reaches beneath the overlay.
+    // Publish ignore=true BEFORE Electron forwards clicks; publish false AFTER
+    // it becomes interactive, avoiding a click-through gap in either direction.
+    const setNativeMousePolicy = (ignores: boolean) => {
+      if (process.platform !== 'darwin') return;
+      try {
+        const { StealthKeyboardManager } = require('./services/StealthKeyboardManager');
+        StealthKeyboardManager.getInstance().setOverlayIgnoresMouseEvents(ignores);
+      } catch (error) {
+        console.error('[WindowHelper] could not update native click-through state:', error);
+      }
+    };
+
     if (overlayIgnore) {
+      setNativeMousePolicy(true);
       // forward: true — pointer events are still delivered to the OS layer
       // beneath, AND mousemove keeps streaming to the renderer, which is what
       // lets the hover hit-test flip the window back to interactive before
@@ -1472,6 +1487,7 @@ export class WindowHelper {
       this.overlayWindow.setIgnoreMouseEvents(true, { forward: true });
     } else {
       this.overlayWindow.setIgnoreMouseEvents(false);
+      setNativeMousePolicy(false);
       // Restore full interactivity when capturing clicks.
       // Windows: skip — the overlay is under the no-activate policy
       // (attachNoActivate → WS_EX_NOACTIVATE). setFocusable(true) here would

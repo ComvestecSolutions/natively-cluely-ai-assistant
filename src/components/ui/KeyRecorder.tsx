@@ -4,13 +4,14 @@ import { isRepresentableKey } from '../../utils/keyboardUtils';
 
 interface KeyRecorderProps {
     currentKeys: string[];
-    onSave: (keys: string[]) => void;
+    onSave: (keys: string[]) => void | Promise<string | void>;
     className?: string;
 }
 
 export const KeyRecorder: React.FC<KeyRecorderProps> = ({ currentKeys, onSave, className }) => {
     const [isRecording, setIsRecording] = useState(false);
     const [recordedKeys, setRecordedKeys] = useState<string[]>([]);
+    const [error, setError] = useState('');
     const inputRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
@@ -62,7 +63,9 @@ export const KeyRecorder: React.FC<KeyRecorderProps> = ({ currentKeys, onSave, c
         if (mainKey) {
             setRecordedKeys([...modifiers, mainKey]);
             setIsRecording(false);
-            onSave([...modifiers, mainKey]);
+            Promise.resolve(onSave([...modifiers, mainKey])).then(message => {
+                setError(message || '');
+            }).catch(() => setError('Could not assign this shortcut. Please try again.'));
         } else {
             // Just modifiers pressed so far
             setRecordedKeys([...modifiers]);
@@ -72,8 +75,9 @@ export const KeyRecorder: React.FC<KeyRecorderProps> = ({ currentKeys, onSave, c
     return (
         <div
             className={`relative flex items-center gap-1.5 group ${className || ''}`}
-            onClick={() => setIsRecording(true)}
+            onClick={() => { setError(''); setIsRecording(true); }}
         >
+            {error && <span role="alert" className="absolute top-full right-0 z-10 w-56 text-xs text-amber-400 bg-bg-input border border-amber-500/30 rounded-md p-2">{error}</span>}
             {isRecording ? (
                 <div
                     ref={inputRef}

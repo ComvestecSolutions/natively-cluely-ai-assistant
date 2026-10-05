@@ -26,6 +26,8 @@ export const DEFAULT_KEYBINDS: KeybindConfig[] = [
     { id: 'general:toggle-mouse-passthrough', label: 'Toggle Mouse Passthrough', accelerator: 'CommandOrControl+Shift+B', isGlobal: true, defaultAccelerator: 'CommandOrControl+Shift+B' },
     { id: 'general:process-screenshots', label: 'Process Screenshots', accelerator: 'CommandOrControl+Enter', isGlobal: true, defaultAccelerator: 'CommandOrControl+Enter' },
     { id: 'general:capture-and-process', label: 'Capture Screen & Ask AI (Global)', accelerator: 'CommandOrControl+Shift+Enter', isGlobal: true, defaultAccelerator: 'CommandOrControl+Shift+Enter' },
+    // Reset is local to the focused chat or the explicitly engaged stealth-typing tap.
+    // A no-activate overlay may be visible while the user reloads a foreground browser.
     { id: 'general:reset-cancel', label: 'Reset / Cancel', accelerator: 'CommandOrControl+R', isGlobal: false, defaultAccelerator: 'CommandOrControl+R' },
     { id: 'general:take-screenshot', label: 'Take Screenshot', accelerator: 'CommandOrControl+H', isGlobal: true, defaultAccelerator: 'CommandOrControl+H' },
     { id: 'general:selective-screenshot', label: 'Selective Screenshot', accelerator: 'CommandOrControl+Shift+H', isGlobal: true, defaultAccelerator: 'CommandOrControl+Shift+H' },
@@ -74,6 +76,18 @@ export const DEFAULT_KEYBINDS: KeybindConfig[] = [
     { id: 'window:move-left', label: 'Move Window Left', accelerator: 'CommandOrControl+Shift+Left', isGlobal: true, defaultAccelerator: 'CommandOrControl+Shift+Left' },
     { id: 'window:move-right', label: 'Move Window Right', accelerator: 'CommandOrControl+Shift+Right', isGlobal: true, defaultAccelerator: 'CommandOrControl+Shift+Right' },
 ];
+
+// Reserve unmodified clipboard-editing chords even when a window never takes focus.
+// Both explicit platform modifiers and CommandOrControl can arrive through IPC or
+// from an older keybinds.json; never register them as global shortcuts.
+function isClipboardEditingAccelerator(accelerator: string): boolean {
+    const parts = accelerator.split('+').map(part => part.trim().toLowerCase());
+    if (parts.length !== 2) return false;
+    const modifiers = ['commandorcontrol', 'cmdorctrl', 'control', 'ctrl', 'command', 'cmd', 'meta', 'super'];
+    const editingKeys = ['c', 'v', 'x'];
+    return (modifiers.includes(parts[0]) && editingKeys.includes(parts[1])) ||
+        (modifiers.includes(parts[1]) && editingKeys.includes(parts[0]));
+}
 
 export class KeybindManager {
     private static instance: KeybindManager;
@@ -247,6 +261,12 @@ export class KeybindManager {
                         // a user who is already crash-looping, without making them
                         // hand-edit keybinds.json.
                         if (fileKb.accelerator && fileKb.accelerator.trim() !== ''
+                            && isClipboardEditingAccelerator(fileKb.accelerator)) {
+                            console.warn(`[KeybindManager] Restoring safe default for protected clipboard chord on ${fileKb.id}`);
+                            fileKb.accelerator = current.defaultAccelerator;
+                            hadConflicts = true;
+                        }
+                        if (fileKb.accelerator && fileKb.accelerator.trim() !== ''
                             && !isRegisterableAccelerator(fileKb.accelerator)) {
                             console.warn(`[KeybindManager] Discarding unusable accelerator for ${fileKb.id}: ${JSON.stringify(fileKb.accelerator)}`);
                             fileKb.accelerator = '';
@@ -309,8 +329,14 @@ export class KeybindManager {
         return Array.from(this.keybinds.values());
     }
 
-    public setKeybind(id: string, accelerator: string) {
-        if (!this.keybinds.has(id)) return;
+    public setKeybind(id: string, accelerator: string): boolean {
+        if (!this.keybinds.has(id)) return false;
+
+        if (isClipboardEditingAccelerator(accelerator)) {
+            console.warn(`[KeybindManager] Rejected protected clipboard chord for ${id}`);
+            this.broadcastUpdate();
+            return false;
+        }
 
         // Refuse an accelerator Electron cannot convert rather than persisting it
         // and discovering the problem from a thrown TypeError later. Keeping the
@@ -322,9 +348,10 @@ export class KeybindManager {
             // so returning silently would leave it displaying a shortcut main
             // never accepted. Push the authoritative table back instead.
             this.broadcastUpdate();
-            return;
+            return false;
         }
 
+        const previousResetChord = this.getKeybind('general:reset-cancel');
         const currentKb = this.keybinds.get(id)!;
         const oldAccelerator = currentKb.accelerator || '';
 
@@ -351,7 +378,9 @@ export class KeybindManager {
 
         this.save();
         this.registerGlobalShortcuts(); // Re-register if it was a global one
+        if (this.getKeybind('general:reset-cancel') !== previousResetChord) this.notifyResetChordChanged();
         this.broadcastUpdate();
+        return true;
     }
 
     public resetKeybinds() {
@@ -360,6 +389,7 @@ export class KeybindManager {
         SettingsManager.getInstance().set('globalShortcutsEnabled', true);
         this.save();
         this.registerGlobalShortcuts();
+        this.notifyResetChordChanged();
         this.broadcastUpdate();
     }
 
@@ -695,9 +725,9 @@ export class KeybindManager {
 
         ipcMain.handle('keybinds:set', (_, id: string, accelerator: string) => {
             console.log(`[KeybindManager] Set ${id} -> ${accelerator}`);
-            this.setKeybind(id, accelerator);
-            this.notifyChordsChanged();
-            return true;
+            const accepted = this.setKeybind(id, accelerator);
+            if (accepted) this.notifyChordsChanged();
+            return accepted;
         });
 
         // Snapshot companion to the keybinds:registration-failed push. A
@@ -761,6 +791,17 @@ export class KeybindManager {
             StealthKeyboardManager.getInstance().refreshShortcutGuard();
         } catch (e) {
             console.error('[KeybindManager] notifyChordsChanged failed:', e);
+        }
+    }
+
+    private notifyResetChordChanged(): void {
+        if (process.platform !== 'win32' && process.platform !== 'darwin') return;
+        try {
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const { StealthKeyboardManager } = require('./StealthKeyboardManager');
+            StealthKeyboardManager.getInstance().refreshResetChord();
+        } catch (e) {
+            console.error('[KeybindManager] notifyResetChordChanged failed:', e);
         }
     }
 }

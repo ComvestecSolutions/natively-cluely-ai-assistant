@@ -66,6 +66,18 @@ test('Win/Super/Command-modified chords are excluded', async () => {
   assert.equal(acceleratorToWin32Chord('Meta+H', 'x'), null);
 });
 
+test('Windows guard never swallows OS copy, paste or cut, including custom bindings', async () => {
+  const { acceleratorToWin32Chord, buildChordTable } = await load();
+  for (const key of ['C', 'V', 'X']) {
+    for (const modifier of ['Control', 'CommandOrControl', 'CmdOrCtrl']) {
+      const accelerator = `${modifier}+${key}`;
+      assert.equal(acceleratorToWin32Chord(accelerator, 'chat:answer'), null, accelerator);
+      assert.deepEqual(buildChordTable([{ id: 'chat:answer', accelerator, isGlobal: true }]), []);
+    }
+    assert.ok(acceleratorToWin32Chord(`Control+Shift+${key}`, 'chat:answer'));
+  }
+});
+
 test('bare keys and modifier-less accelerators are excluded', async () => {
   const { acceleratorToWin32Chord } = await load();
   assert.equal(acceleratorToWin32Chord('Enter', 'x'), null);

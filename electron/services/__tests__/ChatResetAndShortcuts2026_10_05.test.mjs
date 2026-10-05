@@ -1311,11 +1311,15 @@ for (const platform of ['darwin', 'win32']) {
       const expected = backendDefaults.filter(kb => kb.isGlobal && (enabled ? mode === 'overlay' || ['general:toggle-visibility', 'general:toggle-mouse-passthrough', 'general:take-screenshot', 'general:selective-screenshot', 'general:capture-and-process', 'general:capture-dom'].includes(kb.id) : kb.id === 'general:toggle-visibility'));
       assert.deepEqual([...registered.keys()].sort(), expected.map(kb => kb.accelerator).sort());
       assert.deepEqual(Array.from(nativeTable(), chord => chord.id).sort(), isMac ? [] : expected.map(kb => kb.id).sort());
-      assert.ok(!registered.has('CommandOrControl+R'), 'reset stays focus-local');
+      assert.equal(registered.has('CommandOrControl+R'), false, 'reset must not steal foreground refresh in either mode');
+      assert.ok(!Array.from(nativeTable(), chord => chord.id).includes('general:reset-cancel'), 'Windows shortcut-only guard must not intercept reset');
     }
     receiver.activeMode = 'overlay';
     receiver.getGlobalShortcutsEnabled = () => true;
     register();
+    assert.equal(registered.get('CommandOrControl+R'), undefined, `${platform} has no OS-wide reset callback`);
+    assert.deepEqual(fired, [], 'reset must be dispatched locally or by the engaged stealth tap');
+    fired.length = 0;
     const queued = registered.get('CommandOrControl+1');
     receiver.getGlobalShortcutsEnabled = () => false;
     queued();

@@ -183,9 +183,21 @@ struct TapState {
     /// dance for raw `*mut`. Loaded with Acquire so the callback always
     /// sees a valid port after the worker publishes it.
     port: AtomicU64,
+    /// Swallow the matching V key-up even if Cmd was released first.
+    paste_v_down: AtomicBool,
+    /// A held Cmd+R resets once; swallow its key-up even after Cmd is released.
+    reset_r_down: AtomicBool,
+    /// Only intercept Cmd+R while Reset still has its default binding.
+    reset_chord_enabled: AtomicBool,
     /// Latest overlay bounds in global display coordinates. Mouse-down events
     /// outside this rect stop stealth typing while passing the click through.
     overlay_bounds: Mutex<Option<OverlayBounds>>,
+    /// Electron's actual ignore-mouse-events state (includes transparent margins).
+    /// Only a mouse-down, never a hover update, may end the typing session.
+    overlay_ignores_mouse_events: AtomicBool,
+    /// Prevent any keys after an outside click from being swallowed while the
+    /// stop notification waits in V8's callback queue.
+    outside_mouse_down_pending: AtomicBool,
     /// Threadsafe callback into V8. Set on start(), cleared on stop(). The
     /// option indirection lets stop() drop the tsfn handle so JS can GC the
     /// closure without keeping the worker thread's strong ref alive past
@@ -298,11 +310,7 @@ unsafe extern "C" fn tap_callback(
     }
 }
 
-fn tap_callback_inner(
-    event_type: u32,
-    event: *mut c_void,
-    state: Arc<TapState>,
-) -> *mut c_void {
+fn tap_callback_inner(event_type: u32, event: *mut c_void, state: Arc<TapState>) -> *mut c_void {
     // CGEventType values: 10 = keyDown, 11 = keyUp, 12 = flagsChanged,
     // 0xFFFFFFFE = tapDisabledByTimeout, 0xFFFFFFFF = tapDisabledByUserInput.
     // The "disabled by timeout" event fires if our callback was too slow on a
@@ -328,7 +336,9 @@ fn tap_callback_inner(
     }
 
     // Re-check active flag to guard against post-stop callback fires.
-    if !state.active.load(Ordering::Acquire) {
+    if !state.active.load(Ordering::Acquire)
+        || state.outside_mouse_down_pending.load(Ordering::Acquire)
+    {
         // Pass the event through if we're shutting down — better to leak a
         // keystroke into the foreground app than to swallow one after the
         // user thinks stealth mode is off.
@@ -339,24 +349,34 @@ fn tap_callback_inner(
     const RIGHT_MOUSE_DOWN: u32 = 3;
     const OTHER_MOUSE_DOWN: u32 = 25;
 
-    if matches!(event_type, LEFT_MOUSE_DOWN | RIGHT_MOUSE_DOWN | OTHER_MOUSE_DOWN) {
+    if matches!(
+        event_type,
+        LEFT_MOUSE_DOWN | RIGHT_MOUSE_DOWN | OTHER_MOUSE_DOWN
+    ) {
         let bounds = {
-            let guard = state.overlay_bounds.lock().unwrap_or_else(|p| p.into_inner());
+            let guard = state
+                .overlay_bounds
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             *guard
         };
-        if let Some(bounds) = bounds {
-            let point = unsafe { core_graphics_get_location(event) };
-            if !point_in_bounds(point, bounds) {
-                let payload = CapturedKey {
-                    key_code: 0,
-                    chars: String::new(),
-                    flags: 0,
-                    is_key_down: false,
-                    is_outside_mouse_down: true,
-                    app_chord_id: String::new(),
-                };
-                send_payload_to_js(&state, payload);
-            }
+        let point = unsafe { core_graphics_get_location(event) };
+        let ignores = state.overlay_ignores_mouse_events.load(Ordering::Acquire);
+        if should_stop_on_mouse_down(ignores, point, bounds) {
+            // Do not wait for the JS thread to process stop(): key events can
+            // arrive while V8 is busy, and must already reach the foreground.
+            state
+                .outside_mouse_down_pending
+                .store(true, Ordering::Release);
+            let payload = CapturedKey {
+                key_code: 0,
+                chars: String::new(),
+                flags: 0,
+                is_key_down: false,
+                is_outside_mouse_down: true,
+                app_chord_id: String::new(),
+            };
+            send_payload_to_js(&state, payload);
         }
         return event;
     }
@@ -364,6 +384,13 @@ fn tap_callback_inner(
     // Extract keystroke metadata. CGEventField::KEYBOARD_EVENT_KEYCODE = 9.
     let key_code = unsafe { core_graphics_get_int_field(event, 9) } as u32;
     let flags = unsafe { core_graphics_get_flags(event) };
+
+    if event_type == 11 && key_code == 9 && state.paste_v_down.swap(false, Ordering::AcqRel) {
+        return ptr::null_mut();
+    }
+    if event_type == 11 && key_code == 15 && state.reset_r_down.swap(false, Ordering::AcqRel) {
+        return ptr::null_mut();
+    }
 
     // ── PASS-THROUGH FILTER (R3) ──
     //
@@ -374,11 +401,10 @@ fn tap_callback_inner(
     // User report: "shortcuts of the macbook aren't working when natively
     // meeting interface is active."
     //
-    // Fix: only swallow plain typing keys. Pass through (return event) any
-    // event with a system modifier (Cmd / Ctrl / Option / Fn), any F-key,
-    // and any modifier-flagsChanged event. The OS routes those normally to
-    // the foreground app while non-modified character keys still get routed
-    // into Natively's input.
+    // Fix: swallow plain typing, plain Cmd+V (paste into the unfocused overlay),
+    // and plain Cmd+R (reset while typing is engaged). Pass other system-modifier
+    // chords (Cmd / Ctrl / Option / Fn), F-keys and modifier-flagsChanged events
+    // to the foreground app.
     //
     // Trade-off: Cmd+Backspace / Cmd+A / Cmd+Enter no longer reach the
     // renderer's switch statement. Plain Enter still submits (case 36),
@@ -390,6 +416,50 @@ fn tap_callback_inner(
     const CTRL: u32 = 1 << 18;
     const FN: u32 = 1 << 23;
     const SYSTEM_MODIFIER_MASK: u32 = CMD | OPT | CTRL | FN;
+
+    // Paste is the one Cmd chord that belongs to the unfocused overlay while
+    // the tap is active. Preserve every other system shortcut (including copy).
+    // Shift+Cmd+V and other combined modifiers still reach the foreground app.
+    const SHIFT: u32 = 1 << 17;
+    if event_type == 10 && key_code == 9 && (flags & (SYSTEM_MODIFIER_MASK | SHIFT)) == CMD {
+        state.paste_v_down.store(true, Ordering::Release);
+        send_payload_to_js(
+            &state,
+            CapturedKey {
+                key_code: 9,
+                chars: String::new(),
+                flags: CMD,
+                is_key_down: true,
+                is_outside_mouse_down: false,
+                app_chord_id: String::new(),
+            },
+        );
+        return ptr::null_mut();
+    }
+
+    // Cmd+R belongs to the unfocused overlay only with the default Reset binding.
+    // A rebind passes it through, as do Cmd+Shift+R and all other Cmd shortcuts.
+    if event_type == 10 && key_code == 15 && (flags & (SYSTEM_MODIFIER_MASK | SHIFT)) == CMD {
+        if !state.reset_chord_enabled.load(Ordering::Acquire)
+            && !state.reset_r_down.load(Ordering::Acquire)
+        {
+            return event;
+        }
+        if !state.reset_r_down.swap(true, Ordering::AcqRel) {
+            send_payload_to_js(
+                &state,
+                CapturedKey {
+                    key_code: 15,
+                    chars: String::new(),
+                    flags: CMD,
+                    is_key_down: true,
+                    is_outside_mouse_down: false,
+                    app_chord_id: String::new(),
+                },
+            );
+        }
+        return ptr::null_mut();
+    }
 
     if (flags & SYSTEM_MODIFIER_MASK) != 0 {
         return event;
@@ -410,9 +480,30 @@ fn tap_callback_inner(
     // rationale for arrow keys: they're navigation, not text.
     if matches!(
         key_code,
-        48 | 64 | 79 | 80 | 90 | 96 | 97 | 98 | 99 | 100 | 101 | 103
-            | 105 | 106 | 107 | 109 | 111 | 113 | 118 | 120 | 122
-            | 123 | 124 | 125 | 126
+        48 | 64
+            | 79
+            | 80
+            | 90
+            | 96
+            | 97
+            | 98
+            | 99
+            | 100
+            | 101
+            | 103
+            | 105
+            | 106
+            | 107
+            | 109
+            | 111
+            | 113
+            | 118
+            | 120
+            | 122
+            | 123
+            | 124
+            | 125
+            | 126
     ) {
         return event;
     }
@@ -557,6 +648,35 @@ fn point_in_bounds(point: CGPoint, bounds: OverlayBounds) -> bool {
         && point.y < bounds.y + bounds.height
 }
 
+#[inline]
+fn should_stop_on_mouse_down(ignores: bool, point: CGPoint, bounds: Option<OverlayBounds>) -> bool {
+    // The bounds describe the window's rectangle, not its interactive target.
+    // When Electron forwards mouse events beneath it, even an in-bounds click
+    // belongs to the foreground app. Unknown bounds fail closed on mouse-down.
+    ignores || bounds.map_or(true, |b| !point_in_bounds(point, b))
+}
+
+#[cfg(test)]
+mod mouse_down_tests {
+    use super::*;
+
+    #[test]
+    fn only_actual_mouse_down_through_overlay_or_outside_ends_typing() {
+        let bounds = OverlayBounds {
+            x: 10.0,
+            y: 20.0,
+            width: 100.0,
+            height: 50.0,
+        };
+        let inside = CGPoint { x: 30.0, y: 30.0 };
+        let outside = CGPoint { x: 130.0, y: 30.0 };
+        assert!(!should_stop_on_mouse_down(false, inside, Some(bounds)));
+        assert!(should_stop_on_mouse_down(true, inside, Some(bounds)));
+        assert!(should_stop_on_mouse_down(false, outside, Some(bounds)));
+        assert!(should_stop_on_mouse_down(false, inside, None));
+    }
+}
+
 // ─── Worker thread: owns the runloop while the tap is alive ──────────────
 
 fn tap_worker(state: Arc<TapState>) {
@@ -652,7 +772,12 @@ impl StealthKeyboardTap {
                 active: AtomicBool::new(false),
                 runloop: Mutex::new(None),
                 port: AtomicU64::new(0),
+                paste_v_down: AtomicBool::new(false),
+                reset_r_down: AtomicBool::new(false),
+                reset_chord_enabled: AtomicBool::new(false),
                 overlay_bounds: Mutex::new(None),
+                overlay_ignores_mouse_events: AtomicBool::new(false),
+                outside_mouse_down_pending: AtomicBool::new(false),
                 callback: Mutex::new(None),
             }),
             worker: Mutex::new(None),
@@ -722,17 +847,29 @@ impl StealthKeyboardTap {
                 None
             }
         });
-        *self.state.overlay_bounds.lock().unwrap_or_else(|p| p.into_inner()) = overlay_bounds;
+        *self
+            .state
+            .overlay_bounds
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = overlay_bounds;
 
         // Now safely publish the active state.
+        self.state
+            .outside_mouse_down_pending
+            .store(false, Ordering::Release);
+        self.state.paste_v_down.store(false, Ordering::Release);
+        self.state.reset_r_down.store(false, Ordering::Release);
         self.state.active.store(true, Ordering::Release);
 
         // ROUND 2 FIX (#6): poison-safe lock. Without this, a prior panic
         // that poisoned the callback Mutex would make .unwrap() panic here,
         // leaving active=true with no worker — permanently broken until
         // process restart.
-        *self.state.callback.lock().unwrap_or_else(|p| p.into_inner()) =
-            Some(Arc::new(callback));
+        *self
+            .state
+            .callback
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(callback));
 
         let state = self.state.clone();
         let handle = thread::Builder::new()
@@ -745,8 +882,16 @@ impl StealthKeyboardTap {
                 // a strong ref to the JS closure (memory leak) and blocking
                 // V8 from GC-ing the closure even after JS dropped its ref.
                 self.state.active.store(false, Ordering::Release);
-                *self.state.overlay_bounds.lock().unwrap_or_else(|p| p.into_inner()) = None;
-                *self.state.callback.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                *self
+                    .state
+                    .overlay_bounds
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = None;
+                *self
+                    .state
+                    .callback
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = None;
                 Error::new(
                     Status::GenericFailure,
                     format!("failed to spawn tap worker thread: {e}"),
@@ -787,7 +932,27 @@ impl StealthKeyboardTap {
                 None
             }
         });
-        *self.state.overlay_bounds.lock().unwrap_or_else(|p| p.into_inner()) = overlay_bounds;
+        *self
+            .state
+            .overlay_bounds
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = overlay_bounds;
+    }
+
+    /// Hover updates only the hit-test state; the callback decides on mouse-down.
+    #[napi]
+    pub fn set_overlay_ignores_mouse_events(&self, ignores: bool) {
+        self.state
+            .overlay_ignores_mouse_events
+            .store(ignores, Ordering::Release);
+    }
+
+    /// Set before start and on each Reset rebind, without restarting the tap.
+    #[napi]
+    pub fn set_reset_chord_enabled(&self, enabled: bool) {
+        self.state
+            .reset_chord_enabled
+            .store(enabled, Ordering::Release);
     }
 
     /// Disengage the tap. After this returns, the next keystroke will
@@ -818,9 +983,17 @@ impl StealthKeyboardTap {
                 unsafe { CFRunLoopStop(handle.0) };
             }
         }
-        *self.state.overlay_bounds.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *self
+            .state
+            .overlay_bounds
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
         // Drop the JS callback handle so V8 can GC its closure.
-        *self.state.callback.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *self
+            .state
+            .callback
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
 
         // Wait for the worker thread to fully finish cleanup (releasing CF
         // resources, dropping its Arc on user_info, clearing runloop/port

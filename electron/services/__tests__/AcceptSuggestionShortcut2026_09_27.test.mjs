@@ -52,6 +52,49 @@ before(() => {
   km = mod.KeybindManager.getInstance();
 });
 
+test('rebind rejection restores Settings and explains protected clipboard shortcuts', () => {
+  const hook = read('src/hooks/useShortcuts.ts');
+  const recorder = read('src/components/ui/KeyRecorder.tsx');
+  assert.match(hook, /accepted === false[\s\S]*?getKeybinds\(\)[\s\S]*?Copy, Paste and Cut shortcuts are reserved/);
+  assert.match(recorder, /Promise\.resolve\(onSave\([\s\S]*?setError\(message \|\| ''\)/);
+  assert.match(recorder, /role="alert"/);
+});
+
+test('custom global OS editing chords are refused without losing the previous binding', () => {
+  const original = km.getKeybind('chat:answer');
+  km.setMode('overlay');
+  try {
+    for (const key of ['C', 'V', 'X']) {
+      for (const modifier of ['CommandOrControl', 'Control', 'Command']) {
+        const accelerator = `${modifier}+${key}`;
+        assert.equal(km.setKeybind('chat:answer', accelerator), false, accelerator);
+        assert.equal(km.getKeybind('chat:answer'), original);
+        assert.ok(!registered.has(accelerator));
+      }
+    }
+    assert.equal(km.setKeybind('chat:answer', 'CommandOrControl+Shift+V'), true);
+    assert.equal(km.getKeybind('chat:answer'), 'CommandOrControl+Shift+V');
+  } finally {
+    km.setKeybind('chat:answer', original);
+    km.setMode('launcher');
+  }
+});
+
+test('persisted clipboard collision is repaired before registration on next launch', () => {
+  const keybindFile = path.join(userData, 'keybinds.json');
+  const previous = fs.existsSync(keybindFile) ? fs.readFileSync(keybindFile, 'utf8') : null;
+  try {
+    fs.writeFileSync(keybindFile, JSON.stringify([{ id: 'chat:answer', accelerator: 'Control+V' }]));
+    const { KeybindManager } = require(path.resolve(repoRoot, 'dist-electron/electron/services/KeybindManager.js'));
+    const fresh = new KeybindManager();
+    assert.equal(fresh.getKeybind('chat:answer'), 'CommandOrControl+5');
+    assert.equal(JSON.parse(fs.readFileSync(keybindFile, 'utf8')).find(k => k.id === 'chat:answer').accelerator, 'CommandOrControl+5');
+  } finally {
+    if (previous === null) fs.rmSync(keybindFile, { force: true });
+    else fs.writeFileSync(keybindFile, previous);
+  }
+});
+
 describe('Use Suggestion is a global shortcut', () => {
   test('defined as chat:acceptSuggestion, Cmd/Ctrl+8, global', () => {
     const kb = DEFAULT_KEYBINDS.find((k) => k.id === 'chat:acceptSuggestion');

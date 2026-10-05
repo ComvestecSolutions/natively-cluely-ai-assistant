@@ -61,7 +61,11 @@ pub struct AppChordInput {
 
 impl AppChordInput {
     pub fn into_app_chord(self) -> AppChord {
-        AppChord { vk: self.vk, mods: self.mods, id: self.id }
+        AppChord {
+            vk: self.vk,
+            mods: self.mods,
+            id: self.id,
+        }
     }
 }
 
@@ -69,7 +73,10 @@ impl AppChordInput {
 /// the JS side (`buildChordTable`) has already filtered to the safe subset, and
 /// `match_app_chord` re-checks the subset defensively at match time.
 pub fn app_chords_from_inputs(inputs: Vec<AppChordInput>) -> Vec<AppChord> {
-    inputs.into_iter().map(AppChordInput::into_app_chord).collect()
+    inputs
+        .into_iter()
+        .map(AppChordInput::into_app_chord)
+        .collect()
 }
 
 /// True if `vk` is a completing key used by Natively's default Windows binds.
@@ -98,7 +105,12 @@ pub fn is_safe_mods(vk: u32, mods: u32) -> bool {
 /// chord table (e.g. an `Alt` chord that slipped past the JS filter) can never
 /// make the hook swallow something it shouldn't.
 pub fn match_app_chord(chords: &[AppChord], vk: u32, mods: u32) -> Option<&str> {
-    if !is_supported_app_vk(vk) || !is_safe_mods(vk, mods) {
+    // Defence in depth against a stale/custom JS chord table while the
+    // shortcut-only hook is active and the foreground app owns the clipboard.
+    if (mods == MOD_CTRL && matches!(vk, 0x43 | 0x56 | 0x58))
+        || !is_supported_app_vk(vk)
+        || !is_safe_mods(vk, mods)
+    {
         return None;
     }
     chords
@@ -112,25 +124,53 @@ mod tests {
     use super::*;
 
     fn chord(vk: u32, mods: u32, id: &str) -> AppChord {
-        AppChord { vk, mods, id: id.to_string() }
+        AppChord {
+            vk,
+            mods,
+            id: id.to_string(),
+        }
+    }
+
+    #[test]
+    fn never_matches_foreground_clipboard_editing_even_if_table_contains_it() {
+        for vk in [0x43, 0x56, 0x58] {
+            let table = vec![chord(vk, MOD_CTRL, "chat:answer")];
+            assert_eq!(match_app_chord(&table, vk, MOD_CTRL), None);
+            let shifted = vec![chord(vk, MOD_CTRL | MOD_SHIFT, "custom")];
+            assert_eq!(
+                match_app_chord(&shifted, vk, MOD_CTRL | MOD_SHIFT),
+                Some("custom")
+            );
+        }
     }
 
     #[test]
     fn matches_ctrl_enter_exactly() {
         let table = vec![chord(0x0D, MOD_CTRL, "general:process-screenshots")];
-        assert_eq!(match_app_chord(&table, 0x0D, MOD_CTRL), Some("general:process-screenshots"));
+        assert_eq!(
+            match_app_chord(&table, 0x0D, MOD_CTRL),
+            Some("general:process-screenshots")
+        );
     }
 
     #[test]
     fn ctrl_enter_does_not_fire_ctrl_shift_enter_bind() {
         // Distinct shortcuts: exact modifier match, not subset.
-        let table = vec![chord(0x0D, MOD_CTRL | MOD_SHIFT, "general:capture-and-process")];
+        let table = vec![chord(
+            0x0D,
+            MOD_CTRL | MOD_SHIFT,
+            "general:capture-and-process",
+        )];
         assert_eq!(match_app_chord(&table, 0x0D, MOD_CTRL), None);
     }
 
     #[test]
     fn ctrl_shift_enter_matches_its_own_bind() {
-        let table = vec![chord(0x0D, MOD_CTRL | MOD_SHIFT, "general:capture-and-process")];
+        let table = vec![chord(
+            0x0D,
+            MOD_CTRL | MOD_SHIFT,
+            "general:capture-and-process",
+        )];
         assert_eq!(
             match_app_chord(&table, 0x0D, MOD_CTRL | MOD_SHIFT),
             Some("general:capture-and-process")
@@ -143,7 +183,10 @@ mod tests {
             chord(0x31, MOD_CTRL, "chat:whatToAnswer"), // Ctrl+1
             chord(0x35, MOD_CTRL, "chat:answer"),       // Ctrl+5
         ];
-        assert_eq!(match_app_chord(&table, 0x31, MOD_CTRL), Some("chat:whatToAnswer"));
+        assert_eq!(
+            match_app_chord(&table, 0x31, MOD_CTRL),
+            Some("chat:whatToAnswer")
+        );
         assert_eq!(match_app_chord(&table, 0x35, MOD_CTRL), Some("chat:answer"));
         assert_eq!(match_app_chord(&table, 0x36, MOD_CTRL), None); // Ctrl+6 not in table
     }
@@ -158,7 +201,10 @@ mod tests {
     #[test]
     fn ctrl_alt_arrow_matches_horizontal_scroll() {
         let table = vec![chord(0x25, MOD_CTRL | MOD_ALT, "chat:scrollLeft")];
-        assert_eq!(match_app_chord(&table, 0x25, MOD_CTRL | MOD_ALT), Some("chat:scrollLeft"));
+        assert_eq!(
+            match_app_chord(&table, 0x25, MOD_CTRL | MOD_ALT),
+            Some("chat:scrollLeft")
+        );
     }
 
     #[test]

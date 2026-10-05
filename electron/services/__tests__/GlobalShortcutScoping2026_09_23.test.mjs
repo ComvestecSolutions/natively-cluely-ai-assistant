@@ -2,7 +2,9 @@
 //
 // Issue #517 (salvaged from PR #591): Natively's OS-wide shortcuts swallowed
 // browser/editor chords — Cmd/Ctrl+R (reload) and Cmd/Ctrl+Shift+Arrow (word
-// selection) among them — and there was no way to turn them off.
+// selection) among them — and there was no way to turn them off. Reset is
+// focus-local or captured by the explicitly engaged typing tap; an unfocused
+// overlay must not take reload away from the foreground browser/IDE.
 //
 // Runs the REAL compiled KeybindManager against a stub `electron` module that
 // records what is registered with globalShortcut. The Win32 chord table (the
@@ -52,10 +54,13 @@ before(() => {
 const invoke = (ch, ...args) => ipcHandlers.get(ch)({}, ...args);
 
 describe('global shortcut scoping (#517)', () => {
-  test('Reset / Cancel (Cmd/Ctrl+R) is never registered OS-wide', () => {
-    km.setMode('overlay');
-    assert.ok(registered.has('CommandOrControl+1'), 'overlay mode should register the chat shortcuts');
-    assert.ok(!registered.has('CommandOrControl+R'), 'Cmd/Ctrl+R must stay with the focused app (browser reload)');
+  test('Reset / Cancel never steals browser reload when stealth typing is disengaged', () => {
+    for (const mode of ['overlay', 'launcher']) {
+      km.setMode(mode);
+      assert.ok(!registered.has('CommandOrControl+R'), `${mode}: foreground app retains reload`);
+      assert.ok(!km.getGlobalChordTable().some(c => c.id === 'general:reset-cancel'), `${mode}: Windows shortcut guard cannot swallow reload`);
+      assert.ok(!km.getAllKeybinds().find(k => k.id === 'general:reset-cancel').isGlobal);
+    }
   });
 
   test('window:move-* is not registered OS-wide in launcher mode', () => {

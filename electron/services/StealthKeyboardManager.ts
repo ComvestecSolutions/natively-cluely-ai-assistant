@@ -1,4 +1,4 @@
-import { BrowserWindow, shell, systemPreferences } from 'electron';
+import { BrowserWindow, clipboard, shell, systemPreferences } from 'electron';
 import type { CapturedKey, OverlayBoundsInput } from '../audio/nativeModuleLoader';
 import { isVerboseLogging } from '../verboseLog';
 
@@ -62,6 +62,7 @@ export class StealthKeyboardManager {
     /// enforce "hook engaged ⟹ overlay visible" on Windows (see start()).
     private overlayWindow: BrowserWindow | null = null;
     private overlayBoundsProvider: (() => OverlayBoundsInput | null) | null = null;
+    private overlayIgnoresMouseEvents = false;
     /// Monotonic counter incremented on every setOverlayWindow call. The
     /// 'closed' listener captures the token at registration time and only
     /// nulls overlayWebContents if the token still matches. Without this,
@@ -108,12 +109,24 @@ export class StealthKeyboardManager {
         return StealthKeyboardManager.instance;
     }
 
-    /**
-     * Register the overlay BrowserWindow as the sole recipient of
-     * captured-key broadcasts. Called from WindowHelper after the overlay
-     * is created. State broadcasts (active/inactive) still fan out to all
-     * windows (cheap, low-sensitivity); only key events are scoped.
-     */
+    /** Mirror Electron's hit-test policy to the macOS tap. Hover alone is not
+     * a click: the native mouse-down callback decides when to end typing. */
+    public setOverlayIgnoresMouseEvents(ignores: boolean): void {
+        if (process.platform !== 'darwin') return;
+        this.overlayIgnoresMouseEvents = ignores;
+        try {
+            if (typeof this.tap?.setOverlayIgnoresMouseEvents === 'function') {
+                this.tap.setOverlayIgnoresMouseEvents(ignores);
+            } else if (ignores && this.active) {
+                this.stop(); // older native binary: fail closed rather than capture after a click
+            }
+        } catch (error) {
+            console.error('[StealthKeyboardManager] could not update native click-through state:', error);
+            if (ignores && this.active) this.stop();
+        }
+    }
+
+    /** The current overlay bounds used by the native mouse-down classifier. */
     public setOverlayBoundsProvider(provider: (() => OverlayBoundsInput | null) | null): void {
         this.overlayBoundsProvider = provider;
     }
@@ -159,9 +172,20 @@ export class StealthKeyboardManager {
         if (!win) {
             this.overlayWebContents = null;
             this.overlayWindow = null;
+            this.setOverlayBoundsProvider(null);
             return;
         }
         this.overlayWindow = !win.isDestroyed() ? win : null;
+        if (process.platform === 'darwin') {
+            // The native mouse-down callback needs the live OS frame, not an
+            // assumed panel rectangle. Use the same window that receives keys.
+            this.setOverlayBoundsProvider(() => win.isDestroyed() ? null : win.getBounds());
+            const pushIfCurrent = () => {
+                if (this.overlayRegistrationToken === myToken) this.pushBoundsToTap();
+            };
+            win.on('move', pushIfCurrent);
+            win.on('resize', pushIfCurrent);
+        }
         // ROUND 2 FIX (#5): Issue a fresh registration token so any
         // previously-registered window's 'closed' handler can detect that
         // it's been superseded and skip the null-out. Identity comparison
@@ -175,6 +199,7 @@ export class StealthKeyboardManager {
             if (this.overlayRegistrationToken === myToken) {
                 this.overlayWebContents = null;
                 this.overlayWindow = null;
+                this.setOverlayBoundsProvider(null);
                 // The sink is gone — stop capturing. Without this, a hook
                 // engaged when the overlay window is destroyed would keep
                 // swallowing keystrokes system-wide with nowhere to deliver
@@ -301,6 +326,9 @@ export class StealthKeyboardManager {
      */
     public start(): boolean {
         if (!this.tap) return false;
+        // An older binary cannot classify a click through an ignored overlay.
+        if (process.platform === 'darwin' && this.overlayIgnoresMouseEvents &&
+            typeof this.tap.setOverlayIgnoresMouseEvents !== 'function') return false;
         if (this.active) return true;
 
         // Full stealth typing and the shortcut-guard share the single native
@@ -342,6 +370,7 @@ export class StealthKeyboardManager {
         try {
             const overlayBounds = this.getOverlayBoundsForTap();
             const appChords = this.getAppChordTable();
+            this.refreshResetChord();
             ok = this.tap.start((err: Error | null, ev: CapturedKey) => {
                 if (err) {
                     console.error('[StealthKeyboardManager] tap callback error:', err);
@@ -586,6 +615,26 @@ export class StealthKeyboardManager {
         }
     }
 
+    /** Only the unchanged default binding may take R away from the foreground app. */
+    private isDefaultResetChordBound(): boolean {
+        try {
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const { KeybindManager } = require('./KeybindManager');
+            const keys = KeybindManager.getInstance().getKeybind('general:reset-cancel')
+                ?.split('+').map((part: string) => part.trim().toLowerCase());
+            return keys?.length === 2 && keys.includes('commandorcontrol') && keys.includes('r');
+        } catch (e) {
+            console.error('[StealthKeyboardManager] reset chord lookup failed:', e);
+            return false;
+        }
+    }
+
+    /** Update the active native hook immediately after a rebind, without restarting typing. */
+    public refreshResetChord(): void {
+        if (!this.tap) return;
+        this.tap.setResetChordEnabled(this.isDefaultResetChordBound());
+    }
+
     /** Fire an app shortcut the native hook swallowed, via KeybindManager. */
     private dispatchAppChord(actionId: string): void {
         try {
@@ -628,6 +677,28 @@ export class StealthKeyboardManager {
         // Drop captured events that arrive after stop().
         if (!this.active) return;
         this.armIdleTimer();
+
+        // The native hooks swallow only the plain paste chord in full stealth
+        // mode. The overlay has no DOM focus, so an OS paste would otherwise go
+        // to the foreground app. Read only on key-down with a live overlay sink;
+        // the clipboard text stays in the local input until the user submits it.
+        const pasteFlag = process.platform === 'darwin' ? 1 << 20 : process.platform === 'win32' ? 1 << 18 : 0;
+        if (pasteFlag && ev.keyCode === 9 && ev.flags === pasteFlag) {
+            if (ev.isKeyDown && this.overlayWebContents && !this.overlayWebContents.isDestroyed()) {
+                try {
+                    // Bound the payload before IPC (the input has no maxlength).
+                    // Normalize single-line whitespace to a separator, not deletion:
+                    // "foo\nbar" must not silently become "foobar". 100k UTF-16
+                    // units is generous for chat but prevents unbounded IPC traffic.
+                    const clipped = clipboard.readText().slice(0, 100_000).replace(/[\uD800-\uDBFF]$/u, '');
+                    const text = clipped.replace(/\s+/gu, ' ').trim();
+                    if (text) this.sendKeyToOverlay({ ...ev, keyCode: 0, chars: text, flags: 0 });
+                } catch {
+                    console.warn('[StealthKeyboardManager] could not read clipboard for paste');
+                }
+            }
+            return;
+        }
         this.sendKeyToOverlay(ev);
     }
 
