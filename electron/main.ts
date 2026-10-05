@@ -1968,6 +1968,7 @@ export class AppState {
           await this.captureScreenAndProcess();
 
         } else if (actionId === 'general:capture-dom') {
+          const contextEpoch = this.intelligenceManager.getContextEpoch();
           // One hotkey, the right capture: if the companion browser extension is
           // connected, ask it to grab the active tab's page context (delivered to
           // the overlay via /dom). If it isn't reachable — not in a browser, SW
@@ -1991,6 +1992,7 @@ export class AppState {
             // would fall straight through to a screenshot. waitForExtension resolves
             // immediately when one is already connected.
             const extReady = svc.isRunning() && (await svc.waitForExtension());
+            if (this.intelligenceManager.getContextEpoch() !== contextEpoch) return;
             if (extReady) {
               const result = await svc.requestDomCapture();
               captured = result.ok;
@@ -2010,6 +2012,7 @@ export class AppState {
             domFailureReason = String(e?.message || e);
             console.warn('[Main] DOM capture error — falling back to screenshot:', e?.message || e);
           }
+          if (this.intelligenceManager.getContextEpoch() !== contextEpoch) return;
           if (!captured) {
             // Tell the overlay WHY the page capture became a screenshot. The
             // fallback is by design, but doing it silently made the hotkey look
@@ -2030,10 +2033,12 @@ export class AppState {
             // one click in the extension popup, not by screen-recording settings.
             try {
               await this.captureScreenAndProcess();
+              if (this.intelligenceManager.getContextEpoch() !== contextEpoch) return;
               // Only now is "a screenshot was attached instead" true — sending
               // the notice before the screenshot would lie when it also fails.
               this.sendToWindow(noticeWindow(), PAGE_CAPTURE_FALLBACK_CHANNEL, fallbackNotice);
             } catch (shotErr: any) {
+              if (this.intelligenceManager.getContextEpoch() !== contextEpoch) return;
               this.sendToWindow(
                 noticeWindow(),
                 PAGE_CAPTURE_FALLBACK_CHANNEL,
@@ -7112,6 +7117,12 @@ export class AppState {
     // block says must never reach the renderer — it clobbers the just-finalized
     // bubble.
     let pendingFlushHandle: NodeJS.Immediate | null = null;
+    this.intelligenceManager.on('conversation_reset', () => {
+      if (pendingFlushHandle) clearImmediate(pendingFlushHandle);
+      pendingFlushHandle = null;
+      batchFlushScheduled = false;
+      tokenBatches.clear();
+    });
     const flushBatchesNow = () => {
       if (pendingFlushHandle) {
         clearImmediate(pendingFlushHandle);
@@ -7445,6 +7456,26 @@ export class AppState {
     return this.intelligenceManager
   }
 
+  public async resetConversationTransientState(): Promise<void> {
+    this.simpleAutoAnswer.onMeetingStop();
+    this.autoAnswerUsage.stopAwaitingAnswer();
+    this.phoneImages = [];
+    PhoneMirrorService.getInstance().publishMeetingState(this.isMeetingActive, true);
+    const ragManager = this.ragManager;
+    const meetingGeneration = this._meetingGeneration;
+    if (ragManager?.isLiveIndexingActive()) {
+      // Stop drains pending embeds. Purging before that drain would let old
+      // evidence be written back under the reused live-meeting id.
+      await ragManager.stopLiveIndexing();
+      if (this.ragManager !== ragManager || this._meetingGeneration !== meetingGeneration) return;
+      ragManager.deleteMeetingData('live-meeting-current');
+      if (this.isMeetingActive) {
+        ragManager.startLiveIndexing('live-meeting-current');
+        ragManager.feedLiveTranscript(this.intelligenceManager.getCurrentMeetingTranscript());
+      }
+    }
+  }
+
   public getThemeManager(): ThemeManager {
     return this.themeManager
   }
@@ -7741,8 +7772,10 @@ export class AppState {
    * screenshot fallback share one path.
    */
   private async captureScreenAndProcess(): Promise<void> {
+    const contextEpoch = this.intelligenceManager.getContextEpoch();
     const screenshotPath = await this.takeScreenshot(false);
     const preview = await this.getImagePreview(screenshotPath);
+    if (this.intelligenceManager.getContextEpoch() !== contextEpoch) return;
     // Ensure the window is visible so the user can see the response without stealing focus
     this.showMainWindow(true);
     // win.focus() can cause macOS to re-activate the app. Re-hide the dock

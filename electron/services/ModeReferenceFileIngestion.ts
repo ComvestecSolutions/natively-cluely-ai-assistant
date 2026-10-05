@@ -71,7 +71,15 @@ export const ingestModeReferenceFile = async (
     extractedPageCount: extracted.extractedPageCount,
   });
 
-  options.onIndexStatus?.('indexing', file.id);
+  // Renderer notifications are observational: a closed window must not turn an
+  // already-persisted upload into a failure or leave indexing unstarted.
+  const notifyIndexStatus = (status: 'indexing' | 'done'): void => {
+    try { options.onIndexStatus?.(status, file.id); }
+    catch (error: any) {
+      console.warn('[ModeReferenceFileIngestion] index status notification failed:', error?.message);
+    }
+  };
+  notifyIndexStatus('indexing');
   void (async () => {
     try {
       await manager.indexReferenceFile(file);
@@ -83,7 +91,7 @@ export const ingestModeReferenceFile = async (
     } catch (error: any) {
       console.warn('[ModeReferenceFileIngestion] index failed (lexical fallback remains):', error?.message);
     } finally {
-      options.onIndexStatus?.('done', file.id);
+      notifyIndexStatus('done');
     }
   })();
 

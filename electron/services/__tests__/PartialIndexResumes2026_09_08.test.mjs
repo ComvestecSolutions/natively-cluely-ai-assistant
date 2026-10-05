@@ -190,19 +190,19 @@ describe('GAP-3 — batches are bounded by tokens, not just item count', () => {
 });
 
 describe('GAP-4 / retry — bounded concurrency and a server-directed backoff', () => {
-  test('file indexing is gated process-wide, not per-file', () => {
+  test('file indexing shares provider/database gates across bundles', () => {
     assert.match(SRC, /class IndexConcurrencyGate/);
-    assert.match(SRC, /const indexGate = new IndexConcurrencyGate\(MODE_INDEX_MAX_CONCURRENT_FILES\)/);
-    const fn = SRC.slice(SRC.indexOf('public async indexFile('));
-    assert.match(fn.slice(0, 900), /await indexGate\.acquire\(\)/);
-    assert.match(fn.slice(0, 900), /finally \{ indexGate\.release\(\); \}/);
+    assert.match(SRC, /new IndexConcurrencyGate\(MODE_INDEX_MAX_CONCURRENT_FILES\)/);
+    assert.match(SRC, /__nativelyModeIndexingProvidersV1__/);
+    const fn = SRC.slice(SRC.indexOf('public async indexFile('), SRC.indexOf('private referenceFileExists('));
+    assert.match(fn, /await indexGate\.acquire\(\)/);
+    assert.match(fn, /finally \{ indexGate\.release\(\); \}/);
   });
 
   test('the gate is released even when indexing throws', () => {
-    const fn = SRC.slice(SRC.indexOf('public async indexFile('));
-    const body = fn.slice(0, 900);
+    const body = SRC.slice(SRC.indexOf('public async indexFile('), SRC.indexOf('private referenceFileExists('));
     // A leaked permit would wedge indexing for the rest of the session.
-    assert.match(body, /try \{ await this\.indexFileInner\(file\); \}\s*\n\s*finally \{ indexGate\.release\(\); \}/);
+    assert.match(body, /try \{ if \(canIndex\(\)\) await this\.indexFileInner\(file, canIndex\); \}\s*\n\s*finally \{ indexGate\.release\(\); \}/);
   });
 
   test('a sub-batch retries, bounded and jittered', () => {

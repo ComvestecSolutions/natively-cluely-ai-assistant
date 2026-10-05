@@ -475,6 +475,7 @@ export class IntelligenceEngine extends EventEmitter {
      */
     private automaticGenerationId: number | null = null;
     private nextRunIsAutomatic = false;
+    private automaticFastModeOverride: { previous: boolean } | null = null;
     /**
      * Generation id of the engine's own SPECULATIVE prefetch, or null. Without
      * it, isManualAnswerActive read the prefetch (mode 'what_to_say', no
@@ -1136,16 +1137,20 @@ export class IntelligenceEngine extends EventEmitter {
         // had reported it dispatched, leaving its prefetch orphaned (2026-09-26).
         if (!trigger.automatic && trigger.confidence !== undefined && trigger.confidence < 0.5) return;
 
+        const contextEpoch = this.session.getContextEpoch();
         if (trigger.automatic) { this.automaticTriggerPending = true; this.automaticTriggerCancelled = false; }
         try {
             await this.handleSuggestionTriggerInner(trigger);
         } finally {
-            if (trigger.automatic) { this.automaticTriggerPending = false; this.automaticTriggerCancelled = false; }
+            if (trigger.automatic && this.session.getContextEpoch() === contextEpoch) { this.automaticTriggerPending = false; this.automaticTriggerCancelled = false; }
         }
     }
 
     private async handleSuggestionTriggerInner(trigger: SuggestionTrigger): Promise<void> {
+        const contextEpoch = this.session.getContextEpoch();
+        const generationId = this.currentGenerationId;
         const plannerDecision = await this.planSuggestionTrigger(trigger);
+        if (this.session.getContextEpoch() !== contextEpoch || this.currentGenerationId !== generationId) return;
         // A user barge-in landed while we were at the planner: the user is
         // answering the question themselves — do not stream over them.
         if (trigger.automatic && this.automaticTriggerCancelled) {
@@ -1255,16 +1260,25 @@ export class IntelligenceEngine extends EventEmitter {
         // NATIVELY_AUTO_ANSWER_FAST=on enables it.
         const fastAuto = trigger.automatic === true
             && (process.env.NATIVELY_AUTO_ANSWER_FAST || '').toLowerCase() === 'on';
-        const previousFastMode = this.llmHelper.getGroqFastTextMode?.() ?? false;
-        if (fastAuto && !previousFastMode) {
+        const previousFastMode = this.automaticFastModeOverride?.previous ?? (this.llmHelper.getGroqFastTextMode?.() ?? false);
+        // A successor automatic answer takes ownership without treating the
+        // predecessor's temporary hint as the user's persistent preference.
+        const fastModeOverride = fastAuto && !previousFastMode ? { previous: previousFastMode } : null;
+        if (fastModeOverride) {
+            this.automaticFastModeOverride = fastModeOverride;
             try { this.llmHelper.setGroqFastTextMode(true); } catch { /* routing hint only */ }
         }
+        const pendingAnswer = this.runWhatShouldISay(trigger.lastQuestion, trigger.confidence ?? undefined);
+        const answerGenerationId = this.currentGenerationId;
         try {
-            await this.runWhatShouldISay(trigger.lastQuestion, trigger.confidence ?? undefined);
+            await pendingAnswer;
         } finally {
-            this.nextRunIsAutomatic = false;
-            if (fastAuto && !previousFastMode) {
-                try { this.llmHelper.setGroqFastTextMode(false); } catch { /* routing hint only */ }
+            if (this.session.getContextEpoch() === contextEpoch && this.currentGenerationId === answerGenerationId) {
+                this.nextRunIsAutomatic = false;
+            }
+            if (fastModeOverride && this.automaticFastModeOverride === fastModeOverride) {
+                this.automaticFastModeOverride = null;
+                try { this.llmHelper.setGroqFastTextMode(fastModeOverride.previous); } catch { /* routing hint only */ }
             }
         }
     }
@@ -1697,7 +1711,9 @@ export class IntelligenceEngine extends EventEmitter {
             this.assistCancellationToken.abort();
         }
 
-        this.assistCancellationToken = new AbortController();
+        const controller = new AbortController();
+        const generationId = ++this.currentGenerationId;
+        this.assistCancellationToken = controller;
         this.setMode('assist');
 
         try {
@@ -1712,33 +1728,33 @@ export class IntelligenceEngine extends EventEmitter {
                 return null;
             }
 
-            const controller = this.assistCancellationToken;
             // V3 (Phase 6): a confidently-resolved transcript question hands the
             // turn to the decision layer; no resolvable question keeps legacy
             // proactive behaviour byte-for-byte.
             const assistV3 = await this.buildV3ForTranscriptSurface();
+            if (controller.signal.aborted || this.currentGenerationId !== generationId || this.assistCancellationToken !== controller) return null;
             const insight = await this.assistLLM.generate(context, controller.signal, assistV3 ?? undefined);
 
-            if (controller.signal.aborted) {
-                this.setMode('idle');
-                return null;
-            }
+            if (controller.signal.aborted || this.currentGenerationId !== generationId || this.assistCancellationToken !== controller) return null;
 
             if (insight) {
                 this.emit('assist_update', insight);
             }
+            if (controller.signal.aborted || this.currentGenerationId !== generationId || this.assistCancellationToken !== controller) return null;
             this.setMode('idle');
             return insight;
 
         } catch (error) {
+            if (controller.signal.aborted || this.currentGenerationId !== generationId || this.assistCancellationToken !== controller) return null;
             if ((error as Error).name === 'AbortError') {
                 return null;
             }
             this.emit('error', error as Error, 'assist');
+            if (this.currentGenerationId !== generationId) return null;
             this.setMode('idle');
             return null;
         } finally {
-            this.assistCancellationToken = null;
+            if (this.assistCancellationToken === controller) this.assistCancellationToken = null;
         }
     }
 
@@ -1851,7 +1867,11 @@ export class IntelligenceEngine extends EventEmitter {
     }
 
     async runWhatShouldISay(question?: string, confidence: number = 0.8, imagePaths?: string[], options?: { speculative?: boolean; skipCooldown?: boolean; screenContext?: ScreenContext; promptInstruction?: string; activeSkill?: { id: string; name: string; promptBlock: string }; domContext?: string; forceFresh?: boolean }): Promise<string | null> {
-        const answer = await this.runWhatShouldISayInner(question, confidence, imagePaths, options);
+        const contextEpoch = this.session.getContextEpoch();
+        const pendingAnswer = this.runWhatShouldISayInner(question, confidence, imagePaths, options);
+        const generationId = this.currentGenerationId;
+        const answer = await pendingAnswer;
+        if (this.session.getContextEpoch() !== contextEpoch || (!options?.speculative && this.currentGenerationId !== generationId)) return null;
         if (!options?.speculative) {
             this.recordLiveTurn(answer, options?.screenContext, question, imagePaths?.length ?? 0, imagePaths);
         }
@@ -1932,7 +1952,9 @@ export class IntelligenceEngine extends EventEmitter {
             // here, even one that resolves to false, lagged that state by a
             // microtask and read as "idle" while the stream was starting.
             // `false && await x` short-circuits without awaiting.
+            const generationBeforeRouter = this.currentGenerationId;
             const routerSkip = IntelligenceEngine.routerAvailableSync() && await this.routerSaysStaySilent(question);
+            if (this.currentGenerationId !== generationBeforeRouter) return null;
             if (routerSkip) {
                 // The same state the post-generation sentinel path leaves
                 // behind. Skipping any of it would make the engine behave
@@ -3985,9 +4007,10 @@ export class IntelligenceEngine extends EventEmitter {
                             return typeof d === 'string' && d.trim() ? d : undefined;
                         } catch { return undefined; }
                     })();
-                    const _ctx = this.v3ModeRetrievalContext(_screenDescription);
+                    const _ctx = this.v3ModeRetrievalContext(_screenDescription, String(wtaTurnQuestion || ''));
                     if (!_ctx) return undefined;
                     const _v3 = await buildV3Prompt({
+                        isSuperseded: isWtaSuperseded,
                         surface: 'what-to-answer',
                         // The user's own spoken line was chosen above: its "we" is theirs.
                         questionSpeaker: questionSpokenByUser && !question?.trim() ? 'user' : 'other',
@@ -4979,8 +5002,8 @@ export class IntelligenceEngine extends EventEmitter {
                 // Aborted mid-stream — don't update session or emit final event.
                 // If we opened a streaming row, discard it so the superseding
                 // generation's row is the only one (no orphaned partial answer).
-                if (openedStreamRow) this.emit('suggested_answer_discard', 'superseded');
-                if (isSpeculative && this.ownsSpeculativeSlot(generationId)) {
+                if (openedStreamRow && this.currentGenerationId === generationId) this.emit('suggested_answer_discard', 'superseded');
+                if (isSpeculative && this.currentGenerationId === generationId && this.ownsSpeculativeSlot(generationId)) {
                     this.speculativeText = null;
                     this.speculativeTextExpiry = Infinity;
                     // Stamp lastTriggerTime so the real trigger that caused this abort
@@ -6947,6 +6970,7 @@ export class IntelligenceEngine extends EventEmitter {
             // compatible with all existing consumers (code-hint, brainstorm,
             // legacy answerLLM, etc.).
             this.emit('suggested_answer', finalWtaAnswer, question || 'What to Answer', confidence, generationId);
+            if (isWtaSuperseded()) return null;
             // Compile-only syntax check of fenced JavaScript (observe-only: the
             // turn trace + telemetry record it, the answer is never changed).
             try {
@@ -7067,8 +7091,8 @@ export class IntelligenceEngine extends EventEmitter {
             // request or reset replaced this turn.
             if (isWtaSuperseded()) {
                 recordWtaCancellation();
-                if (isSpeculative && this.ownsSpeculativeSlot(generationId)) { this.speculativeText = null; this.speculativeTextExpiry = Infinity; }
-                if (openedStreamRow) this.emit('suggested_answer_discard', 'superseded');
+                if (isSpeculative && this.currentGenerationId === generationId && this.ownsSpeculativeSlot(generationId)) { this.speculativeText = null; this.speculativeTextExpiry = Infinity; }
+                if (openedStreamRow && this.currentGenerationId === generationId) this.emit('suggested_answer_discard', 'superseded');
                 return null;
             }
             try {
@@ -7084,6 +7108,7 @@ export class IntelligenceEngine extends EventEmitter {
             // the only artifact, not an orphaned half-streamed answer.
             if (openedStreamRow) this.emit('suggested_answer_discard', 'error');
             this.emit('error', error as Error, 'what_to_say');
+            if (isWtaSuperseded()) return null;
             this.setMode('idle');
             // A provider failure must not be dressed as "Could you repeat that?"
             // (2026-09-07): a dead key, a 429 or an outage read as the app not
@@ -7132,6 +7157,7 @@ export class IntelligenceEngine extends EventEmitter {
         const superseded = () => abortSignal?.aborted === true || this.currentGenerationId !== generationId;
         try {
             const { verifyCodingAnswer } = await import('./llm/codeVerification/verifyCodingAnswer');
+            if (superseded()) return;
             const outcome = await verifyCodingAnswer({
                 answer: shownAnswer,
                 question,
@@ -7185,6 +7211,7 @@ export class IntelligenceEngine extends EventEmitter {
                 const { answer, note, reVerifiedPassed } = outcome.corrected;
                 // Strip the hidden spec before the corrected answer is displayed.
                 const { stripVerificationSpec } = await import('./llm/codingContract');
+                if (superseded()) return;
                 this.emit('code_correction', {
                     question,
                     answer: stripVerificationSpec(answer),
@@ -7212,7 +7239,7 @@ export class IntelligenceEngine extends EventEmitter {
     // the active mode. WTA and runManualAnswer previously each carried a copy of
     // this block; a third copy for the proactive surfaces is where drift starts,
     // so all of them now call this.
-    private v3ModeRetrievalContext(screenDescription?: string): {
+    private v3ModeRetrievalContext(screenDescription?: string, question = ''): {
         raw: string; modeUniqueId: string | null; modeName: string | null; meetingId: string | null;
         attachedSourceCount: number;
         attachedFileNames: string[];
@@ -7233,11 +7260,30 @@ export class IntelligenceEngine extends EventEmitter {
             const { ModesManager } = require('./services/ModesManager');
             const _mm = ModesManager.getInstance();
             const _mi = _mm.getActiveModeInfo?.() ?? null;
-            const _files = _mi?.id ? (_mm.getReferenceFiles?.(_mi.id) ?? []) : [];
+            const candidateFiles = _mi?.id ? (_mm.getReferenceFiles?.(_mi.id) ?? []) : [];
             const raw = (_mi as any)?.templateType ?? 'general';
             // Announced, not silent — see resolveModeIdOrWarn (2026-08-09).
             const _modeId = resolveModeIdOrWarn(_mi ? raw : null, 'engine/transcript-surface', { quietWhenAbsent: true });
             const policy = resolveModePolicy(_modeId);
+            const { collectV3ProfileSources, permittedV3ProfileSources, permittedV3TurnPools, gateV3TurnRetrievalPort } = require('./services/knowledge/v3ProfileSources');
+            const sourceContract = _mi?.sourceContract ?? (_mi?.id ? _mm.getOrMigrateSourceContract?.(_mi.id) : null);
+            const { resolveTurnSourceDecision } = require('./llm/turnSourceDecision');
+            const { resolveExplicitSourceRequests } = require('./intelligence/context-os/explicitSourceSwitch');
+            const explicitRequests = resolveExplicitSourceRequests(question);
+            let hasLiveTranscript = false;
+            let hasMeetingRag = false;
+            try {
+                const { chunkLiveTranscript } = require('./context-intelligence/retrieval/live-transcript-port');
+                hasLiveTranscript = chunkLiveTranscript(this.session?.getFullTranscript?.() ?? [], (sp: string) => this.session.mapSpeakerToRole(sp)).length > 0;
+            } catch { /* optional meeting availability */ }
+            try { hasMeetingRag = Boolean(this.meetingRagProvider?.()?.getLiveMeetingId?.()); } catch { /* optional meeting availability */ }
+            const availability = { hasReferenceFiles: candidateFiles.length > 0, hasLiveTranscript: hasLiveTranscript || hasMeetingRag, hasMeetingRag };
+            const preflight = resolveTurnSourceDecision({ sourceContract, explicitRequests, availability: {
+                ...availability,
+                hasProfileFacts: policy.profileSources.includes('RESUME') || policy.profileSources.includes('PROFILE_FACT'),
+                hasJobDescription: policy.profileSources.includes('JOB_DESCRIPTION'),
+            } });
+            const _files = permittedV3TurnPools(preflight).references ? candidateFiles : [];
             // Deep-test D10: custom/general modes gain the source types their own
             // attachments evidence (candidate résumé → CANDIDATE_FILE, JD →
             // JOB_DESCRIPTION). Same list feeds the bridge so plan and port agree.
@@ -7255,17 +7301,26 @@ export class IntelligenceEngine extends EventEmitter {
 
             // Profile Intelligence hydration (2026-07-31 source-routing fix):
             // the active résumé/target JD are the PRIMARY pool for modes that
-            // opt in via policy.profileSources — mode attachments supplement,
-            // never gate. Same construction as the ipcHandlers manual-chat
+            // opt in via policy.profileSources AND the persisted source contract.
+            // Mode attachments supplement, never gate. Same as ipcHandlers manual-chat
             // site; additive, so a failure degrades to attachments only.
             let profilePort: unknown = null;
             let profileSourceCount = 0;
             let resolvedProfileSources: Array<{ role: string; id: string }> = [];
+            let profileAvailability = { hasProfileFacts: false, hasJobDescription: false };
             try {
-                if (policy.profileSources?.length) {
-                    const { collectV3ProfileSources } = require('./services/knowledge/v3ProfileSources');
-                    const collected = collectV3ProfileSources(this.llmHelper.getKnowledgeOrchestrator?.() ?? null);
-                    if (collected.docs.length) {
+                const candidates = permittedV3ProfileSources(policy.profileSources, sourceContract, preflight);
+                if (candidates.length) {
+                    const collected = collectV3ProfileSources(this.llmHelper.getKnowledgeOrchestrator?.() ?? null, candidates);
+                    // A comparison requires every requested family. Optimistic
+                    // preflight authorizes reads, never partial evidence admission.
+                    profileAvailability = {
+                        hasProfileFacts: collected.counts.profileResume + collected.counts.profileFact > 0,
+                        hasJobDescription: collected.counts.profileJd > 0,
+                    };
+                    const admitted = resolveTurnSourceDecision({ sourceContract, explicitRequests, availability: { ...availability, ...profileAvailability } });
+                    const profileSources = permittedV3ProfileSources(candidates, sourceContract, admitted);
+                    if (profileSources.length && collected.docs.length) {
                         const { createProfileRetrievalPort } = require('./context-intelligence/retrieval/profile-retrieval-port');
                         // Semantic arm over the documents' raw text (see v3ProfileSources).
                         const { buildProfileRawRetriever } = require('./services/knowledge/v3ProfileSources');
@@ -7276,7 +7331,7 @@ export class IntelligenceEngine extends EventEmitter {
                         profilePort = createProfileRetrievalPort({
                             docs: collected.docs,
                             allowedSourceTypes: policy.allowedSourceTypes,
-                            profileSources: policy.profileSources,
+                            profileSources,
                             userId: 'local',
                             ...(profileRawRetriever ? { rawRetriever: profileRawRetriever } : {}),
                         });
@@ -7302,7 +7357,9 @@ export class IntelligenceEngine extends EventEmitter {
             // returns the id the turn's scope must carry for that filter to
             // admit the JIT chunks.
             const meetingId = (this.session as any)?.getMeetingMetadata?.()?.id ?? null;
-            let port: unknown = modePort;
+            const { combineRetrievalPorts } = require('./context-intelligence/retrieval/meeting-retrieval-port');
+            const meetingPorts: unknown[] = [];
+            let screenPort: unknown = null;
             let scopeMeetingId: string | null = null;
             // False when the try block below fails, exactly like scopeMeetingId
             // (task 7b, issue #552) — an additive failure here must degrade to
@@ -7310,9 +7367,7 @@ export class IntelligenceEngine extends EventEmitter {
             // meeting" by default.
             let inLiveMeeting = false;
             try {
-                const { combineRetrievalPorts } = require('./context-intelligence/retrieval/meeting-retrieval-port');
                 const { resolveMeetingEvidence } = require('./context-intelligence/retrieval/meeting-evidence');
-                const ports: unknown[] = [modePort, ...(profilePort ? [profilePort] : [])];
                 const meeting = resolveMeetingEvidence({
                     rag: this.meetingRagProvider?.() ?? null,
                     segments: (this.session as any)?.getFullTranscript?.() ?? [],
@@ -7322,7 +7377,7 @@ export class IntelligenceEngine extends EventEmitter {
                     tokenBudget: policy.contextBudget.evidenceTokens,
                     roleOf: (sp: string) => this.session.mapSpeakerToRole(sp),
                 });
-                ports.push(...meeting.ports);
+                meetingPorts.push(...meeting.ports);
                 scopeMeetingId = meeting.scopeMeetingId;
                 inLiveMeeting = meeting.inLiveMeeting;
                 // The user's SCREEN, as evidence (2026-09-11). Manual chat has built a
@@ -7335,15 +7390,37 @@ export class IntelligenceEngine extends EventEmitter {
                 // factory, same fail-closed scope as the manual-chat site.
                 if (screenDescription && screenDescription.trim()) {
                     const { createScreenRetrievalPort } = require('./context-intelligence/retrieval/screen-retrieval-port');
-                    const screenPort = createScreenRetrievalPort({
+                    screenPort = createScreenRetrievalPort({
                         description: screenDescription,
                         userId: 'local',
                         sessionId: this.conversationSessionId(),
                     });
-                    if (screenPort) ports.push(screenPort);
                 }
-                if (ports.length > 1) port = combineRetrievalPorts(ports as never[]);
-            } catch { /* meeting/profile combination is additive — mode port alone still answers */ }
+            } catch (meetingErr) {
+                console.warn('[V3] meeting evidence failed — retaining mode/profile evidence:', (meetingErr as Error)?.message ?? meetingErr);
+            }
+
+            // Re-resolve with material actually available, then gate EVERY pool.
+            // Candidate availability remains distinct from admitted file counts.
+            const turnDecision = resolveTurnSourceDecision({ sourceContract, explicitRequests, availability: {
+                hasReferenceFiles: candidateFiles.length > 0,
+                ...profileAvailability,
+                hasLiveTranscript: inLiveMeeting,
+                hasMeetingRag: Boolean(scopeMeetingId),
+            } });
+            const turnPools = permittedV3TurnPools(turnDecision);
+            const admittedFiles = turnPools.references ? _files : [];
+            if (!turnPools.profileResume && !turnPools.profileJd) {
+                profilePort = null; profileSourceCount = 0; resolvedProfileSources = [];
+            }
+            const ports = [
+                gateV3TurnRetrievalPort(modePort, 'mode', turnDecision),
+                ...(profilePort ? [gateV3TurnRetrievalPort(profilePort as never, 'profile', turnDecision)] : []),
+                ...meetingPorts.map(p => gateV3TurnRetrievalPort(p as never, 'meeting', turnDecision)),
+                ...(screenPort ? [gateV3TurnRetrievalPort(screenPort as never, 'screen', turnDecision)] : []),
+            ];
+            const port = combineRetrievalPorts(ports);
+            inLiveMeeting = inLiveMeeting && (turnPools.liveTranscript || turnPools.meetingRag);
 
             return {
                 raw,
@@ -7352,12 +7429,12 @@ export class IntelligenceEngine extends EventEmitter {
                 // The scope id the evidence needs, falling back to the metadata
                 // id for a meeting that carries one but has no JIT chunks yet.
                 meetingId: scopeMeetingId ?? meetingId,
-                attachedSourceCount: _files.length,
-                attachedFileNames: (_files as Array<{ fileName?: string }>).map((f) => f.fileName ?? '').filter(Boolean),
-                attachedCorpusTokens: referenceCorpusTokens(_files as Array<{ content?: string }>),
+                attachedSourceCount: admittedFiles.length,
+                attachedFileNames: (admittedFiles as Array<{ fileName?: string }>).map((f) => f.fileName ?? '').filter(Boolean),
+                attachedCorpusTokens: referenceCorpusTokens(admittedFiles as Array<{ content?: string }>),
                 profileSourceCount,
                 resolvedProfileSources,
-                extraAllowedSourceTypes: extraSourceTypes,
+                extraAllowedSourceTypes: admittedFiles.length ? extraSourceTypes : [],
                 inLiveMeeting,
                 port,
                 // Bounded live-transcript window for the composer's labelled
@@ -7367,7 +7444,7 @@ export class IntelligenceEngine extends EventEmitter {
                 // source decision, and evidence still comes only from the port.
                 // Speech only, whole lines — see speechWindowForPrompt.
                 conversationWindow: (sec: number) =>
-                    speechWindowForPrompt(String((this.session as any)?.getFormattedContext?.(sec) ?? '')),
+                    turnPools.liveTranscript ? speechWindowForPrompt(String((this.session as any)?.getFormattedContext?.(sec) ?? '')) : '',
             };
         } catch { return null; }
     }
@@ -7397,6 +7474,7 @@ export class IntelligenceEngine extends EventEmitter {
          */
         pinned?: { question: string; surface?: 'assist' | 'screenshot'; source?: 'screenshot' | 'transcript' | 'manual' },
     ): Promise<{ system: string; user: string } | null> {
+        const generationId = this.currentGenerationId;
         try {
             const { isContextIntelligenceV3Enabled } = require('./context-intelligence/contracts/flag');
             if (!isContextIntelligenceV3Enabled()) return null;
@@ -7423,10 +7501,11 @@ export class IntelligenceEngine extends EventEmitter {
             });
             if (!resolved.resolvedQuestion || resolved.requiresClarification || resolved.confidence < 0.6) return null;
 
-            const ctx = this.v3ModeRetrievalContext();
+            const ctx = this.v3ModeRetrievalContext(undefined, resolved.resolvedQuestion);
             if (!ctx) return null;
             const { buildV3Prompt } = require('./context-intelligence/orchestration/engine-bridge');
             const _v3 = await buildV3Prompt({
+                isSuperseded: () => this.currentGenerationId !== generationId,
                 surface: pinned?.surface ?? 'assist',
                 // Low-confidence query rewrite: the user's fast model, 1.5 s hard cap.
                 queryRewriter: require('./context-intelligence/retrieval/rewriter-binding').bindQueryRewriter(this.llmHelper),
@@ -7486,6 +7565,7 @@ export class IntelligenceEngine extends EventEmitter {
         }
 
         this.setMode('follow_up');
+        let generationId = this.currentGenerationId;
 
         try {
             if (!this.followUpLLM) {
@@ -7514,6 +7594,7 @@ export class IntelligenceEngine extends EventEmitter {
                         const line = 'Switching sources needs a fresh question — ask it directly and I\'ll answer from ' +
                             (switchTo === 'profile' ? 'your profile.' : switchTo === 'reference_files' ? 'the uploaded material.' : 'the conversation.');
                         this.emit('refined_answer', line, intent);
+                        if (this.currentGenerationId !== generationId) return null;
                         this.setMode('idle');
                         return line;
                     }
@@ -7537,7 +7618,7 @@ export class IntelligenceEngine extends EventEmitter {
                 } catch { return null; }
             })();
 
-            const generationId = ++this.currentGenerationId;
+            generationId = ++this.currentGenerationId;
             let fullRefined = "";
             const followUpOptions = {
                 ...(followUpContractRule ? { contractRule: followUpContractRule } : {}),
@@ -7562,7 +7643,9 @@ export class IntelligenceEngine extends EventEmitter {
                 fullRefined += token;
             }
 
-            if (!streamAborted && fullRefined) {
+            if (streamAborted || this.currentGenerationId !== generationId) return null;
+
+            if (fullRefined) {
                 // The deterministic half of "do not mutate the diagram": a block
                 // the model shortened or dropped is put back as it was. The
                 // corrected text is the authoritative final the renderer swaps in.
@@ -7577,6 +7660,7 @@ export class IntelligenceEngine extends EventEmitter {
                 }
                 this.session.addAssistantMessage(fullRefined, undefined, 'what_to_answer');
                 this.emit('refined_answer', fullRefined, intent);
+                if (this.currentGenerationId !== generationId) return null;
 
                 const intentMap: Record<string, string> = {
                     'expand': 'Expand Answer',
@@ -7602,7 +7686,9 @@ export class IntelligenceEngine extends EventEmitter {
             return fullRefined;
 
         } catch (error) {
+            if (this.currentGenerationId !== generationId) return null;
             this.emit('error', error as Error, 'follow_up');
+            if (this.currentGenerationId !== generationId) return null;
             this.setMode('idle');
             return null;
         }
@@ -7666,6 +7752,7 @@ export class IntelligenceEngine extends EventEmitter {
     async runRecap(): Promise<string | null> {
         console.log('[IntelligenceEngine] runRecap called');
         this.setMode('recap');
+        let generationId = this.currentGenerationId;
 
         try {
             if (!this.recapLLM) {
@@ -7678,6 +7765,7 @@ export class IntelligenceEngine extends EventEmitter {
             if (!context) {
                 console.warn('[IntelligenceEngine] No context available for recap');
                 this.setMode('idle');
+                if (this.currentGenerationId !== generationId) return null;
                 // Emit the normal completion event (not silence) so a caller that
                 // already opened a streaming placeholder — e.g. the recap hotkey
                 // fired with an empty transcript, trivially reachable in Ambient
@@ -7698,7 +7786,7 @@ export class IntelligenceEngine extends EventEmitter {
                 if (recapContract) recapContractRule = contextOs.buildRecapContractRule(recapContract);
             } catch { /* Context OS is additive — never break recap */ }
 
-            const generationId = ++this.currentGenerationId;
+            generationId = ++this.currentGenerationId;
             let fullSummary = "";
             const stream = this.recapLLM.generateStream(context, recapContractRule ? { contractRule: recapContractRule } : undefined);
             let streamAborted = false;
@@ -7714,9 +7802,12 @@ export class IntelligenceEngine extends EventEmitter {
                 fullSummary += token;
             }
 
+            if (streamAborted || this.currentGenerationId !== generationId) return null;
+
             // Only emit final if not aborted
-            if (!streamAborted && fullSummary && this.currentGenerationId === generationId) {
+            if (fullSummary && this.currentGenerationId === generationId) {
                 this.emit('recap', fullSummary);
+                if (this.currentGenerationId !== generationId) return null;
 
                 // Track recap as an assistant message so "make it shorter" / other
                 // refinements can target it via FollowUpLLM (which reads the last
@@ -7738,7 +7829,9 @@ export class IntelligenceEngine extends EventEmitter {
             return fullSummary;
 
         } catch (error) {
+            if (this.currentGenerationId !== generationId) return null;
             this.emit('error', error as Error, 'recap');
+            if (this.currentGenerationId !== generationId) return null;
             this.setMode('idle');
             return null;
         }
@@ -7751,6 +7844,7 @@ export class IntelligenceEngine extends EventEmitter {
     async runClarify(): Promise<string | null> {
         console.log('[IntelligenceEngine] runClarify called');
         this.setMode('clarify');
+        let generationId = this.currentGenerationId;
 
         try {
             if (!this.clarifyLLM) {
@@ -7763,9 +7857,10 @@ export class IntelligenceEngine extends EventEmitter {
             // If no transcript/manual turn yet, use a generic prompt — the LLM will ask a scoping question
             const context = rawContext || '[No transcript or recent manual answer available yet. Generate an opening clarifying question to understand the scope and constraints of the upcoming problem.]';
 
-            const generationId = ++this.currentGenerationId;
+            generationId = ++this.currentGenerationId;
             let fullClarification = "";
             const clarifyV3 = await this.buildV3ForTranscriptSurface('clarify');
+            if (this.currentGenerationId !== generationId) return null;
             const stream = this.clarifyLLM.generateStream(context, clarifyV3 ?? undefined);
             let streamAborted = false;
 
@@ -7780,14 +7875,12 @@ export class IntelligenceEngine extends EventEmitter {
                 fullClarification += token;
             }
 
-            if (streamAborted) {
-                this.setMode('idle');
-                return null;
-            }
+            if (streamAborted || this.currentGenerationId !== generationId) return null;
 
             // Only update history and emit final if not aborted
             if (fullClarification && this.currentGenerationId === generationId) {
                 this.emit('clarify', fullClarification);
+                if (this.currentGenerationId !== generationId) return null;
                 this.session.addAssistantMessage(fullClarification, undefined, 'what_to_answer');
 
                 this.session.pushUsage({
@@ -7805,7 +7898,9 @@ export class IntelligenceEngine extends EventEmitter {
             return fullClarification;
 
         } catch (error) {
+            if (this.currentGenerationId !== generationId) return null;
             this.emit('error', error as Error, 'clarify');
+            if (this.currentGenerationId !== generationId) return null;
             this.setMode('idle');
             return null;
         }
@@ -7818,6 +7913,7 @@ export class IntelligenceEngine extends EventEmitter {
     async runFollowUpQuestions(): Promise<string | null> {
         console.log('[IntelligenceEngine] runFollowUpQuestions called');
         this.setMode('follow_up_questions');
+        let generationId = this.currentGenerationId;
 
         try {
             if (!this.followUpQuestionsLLM) {
@@ -7830,6 +7926,7 @@ export class IntelligenceEngine extends EventEmitter {
             if (!context) {
                 console.warn('[IntelligenceEngine] No transcript or recent manual answer available for follow-up questions');
                 this.setMode('idle');
+                if (this.currentGenerationId !== generationId) return null;
                 // Emit the normal completion event so a caller with an open
                 // streaming placeholder — trivially reachable in Ambient AI
                 // Chat, which has no meeting transcript — gets it resolved
@@ -7838,7 +7935,7 @@ export class IntelligenceEngine extends EventEmitter {
                 return null;
             }
 
-            const generationId = ++this.currentGenerationId;
+            generationId = ++this.currentGenerationId;
             let fullQuestions = "";
             const stream = this.followUpQuestionsLLM.generateStream(context);
             let streamAborted = false;
@@ -7854,13 +7951,11 @@ export class IntelligenceEngine extends EventEmitter {
                 fullQuestions += token;
             }
 
-            if (streamAborted) {
-                this.setMode('idle');
-                return null;
-            }
+            if (streamAborted || this.currentGenerationId !== generationId) return null;
 
             if (fullQuestions && this.currentGenerationId === generationId) {
                 this.emit('follow_up_questions_update', fullQuestions);
+                if (this.currentGenerationId !== generationId) return null;
                 this.session.pushUsage({
                     type: 'followup_questions',
                     timestamp: Date.now(),
@@ -7874,7 +7969,9 @@ export class IntelligenceEngine extends EventEmitter {
             return fullQuestions;
 
         } catch (error) {
+            if (this.currentGenerationId !== generationId) return null;
             this.emit('error', error as Error, 'follow_up_questions');
+            if (this.currentGenerationId !== generationId) return null;
             this.setMode('idle');
             return null;
         }
@@ -7888,12 +7985,17 @@ export class IntelligenceEngine extends EventEmitter {
         // The FOURTH V3 surface ('manual-chat' via pathTag 'engine'). It reads
         // the ring at the buildV3Prompt call below and, like the other two live
         // surfaces, had no writer — so its own answers never became history.
-        const manualAnswer = await this.runManualAnswerInner(question);
+        const contextEpoch = this.session.getContextEpoch();
+        const pendingAnswer = this.runManualAnswerInner(question);
+        const generationId = this.currentGenerationId;
+        const manualAnswer = await pendingAnswer;
+        if (this.session.getContextEpoch() !== contextEpoch || this.currentGenerationId !== generationId) return null;
         this.recordLiveTurn(manualAnswer, undefined, question);
         return manualAnswer;
     }
 
     private async runManualAnswerInner(question: string): Promise<string | null> {
+        const generationId = ++this.currentGenerationId;
         this.emit('manual_answer_started');
         this.setMode('manual');
 
@@ -7966,9 +8068,10 @@ export class IntelligenceEngine extends EventEmitter {
                     const { buildV3Prompt } = require('./context-intelligence/orchestration/engine-bridge');
                     // Phase 6: this adoption originally passed NO retrieval port —
                     // the decision layer was live but BLIND. Shared plumbing now.
-                    const _ctx = this.v3ModeRetrievalContext();
+                    const _ctx = this.v3ModeRetrievalContext(undefined, question);
                     if (!_ctx) return null;
                     return await buildV3Prompt({
+                        isSuperseded: () => this.currentGenerationId !== generationId,
                         surface: 'manual-chat',
                         diagramTurn: (() => {
                             try {
@@ -8018,6 +8121,7 @@ export class IntelligenceEngine extends EventEmitter {
                 } catch { return null; }
             })();
 
+            if (this.currentGenerationId !== generationId) return null;
             if (_v3) {
                 // V3 owns the system prompt entirely; the legacy universal prompt
                 // and the raw context blob are both bypassed.
@@ -8037,6 +8141,7 @@ export class IntelligenceEngine extends EventEmitter {
                     : this.session.getFormattedContext(120);
                 answer = await this.answerLLM.generate(question, context, answerPlan, undefined, manualDiagramTurn);
             }
+            if (this.currentGenerationId !== generationId) return null;
             const _manualSignals = require('./llm/codingPromptSignals').resolveCodingPromptSignals({
                 answerType: answerPlan.answerType,
                 question: answerPlan.question || question || '',
@@ -8065,6 +8170,7 @@ export class IntelligenceEngine extends EventEmitter {
                 // plan and the pushUsage({source: 'manual_chat'}) call below.
                 this.session.addAssistantMessage(answer, undefined, 'manual_chat');
                 this.emit('manual_answer_result', answer, question);
+                if (this.currentGenerationId !== generationId) return null;
 
                 this.session.pushUsage({
                     type: 'chat',
@@ -8079,7 +8185,9 @@ export class IntelligenceEngine extends EventEmitter {
             return answer;
 
         } catch (error) {
+            if (this.currentGenerationId !== generationId) return null;
             this.emit('error', error as Error, 'manual');
+            if (this.currentGenerationId !== generationId) return null;
             this.setMode('idle');
             return null;
         }
@@ -8100,6 +8208,7 @@ export class IntelligenceEngine extends EventEmitter {
         }
 
         this.setMode('code_hint');
+        let generationId = this.currentGenerationId;
 
         try {
             if (!this.codeHintLLM) {
@@ -8121,7 +8230,7 @@ export class IntelligenceEngine extends EventEmitter {
 
             console.log(`[IntelligenceEngine] Code hint — question source: ${questionContext ? (questionSource ?? 'passed') : 'none'}, transcript lines: ${transcriptContext ? transcriptContext.split('\n').length : 0}, images: ${imagePaths?.length ?? 0}`);
 
-            const generationId = ++this.currentGenerationId;
+            generationId = ++this.currentGenerationId;
             let fullHint = "";
             // V3 for code hint. The bridge named this surface in its own scope
             // from the start and it was the one of five never connected, so a
@@ -8134,6 +8243,7 @@ export class IntelligenceEngine extends EventEmitter {
             const codeHintV3 = await this.buildV3ForTranscriptSurface('code-hint', questionContext
                 ? { question: questionContext, surface: 'screenshot', source: questionSource === 'transcript' ? 'transcript' : 'screenshot' }
                 : undefined);
+            if (this.currentGenerationId !== generationId) return null;
             const stream = this.codeHintLLM.generateStream(
                 imagePaths,
                 questionContext ?? undefined,
@@ -8155,10 +8265,7 @@ export class IntelligenceEngine extends EventEmitter {
                 fullHint += token;
             }
 
-            if (streamAborted) {
-                this.setMode('idle');
-                return null;
-            }
+            if (streamAborted || this.currentGenerationId !== generationId) return null;
 
             if (!fullHint || fullHint.trim().length < 5) {
                 fullHint = "I couldn't detect any code in the screenshot. Try screenshotting your code editor directly.";
@@ -8174,11 +8281,14 @@ export class IntelligenceEngine extends EventEmitter {
             });
 
             this.emit('suggested_answer', fullHint, 'Code Hint', 1.0);
+            if (this.currentGenerationId !== generationId) return null;
             this.setMode('idle');
             return fullHint;
 
         } catch (error) {
+            if (this.currentGenerationId !== generationId) return null;
             this.emit('error', error as Error, 'code_hint');
+            if (this.currentGenerationId !== generationId) return null;
             this.setMode('idle');
             return null;
         }
@@ -8195,6 +8305,7 @@ export class IntelligenceEngine extends EventEmitter {
         }
 
         this.setMode('brainstorm');
+        let generationId = this.currentGenerationId;
 
         try {
             if (!this.brainstormLLM) {
@@ -8218,9 +8329,10 @@ export class IntelligenceEngine extends EventEmitter {
             if (resolvedProblem) {
                 context = `<problem_statement>\n${resolvedProblem}\n</problem_statement>\n\n${context}`;
             }
-            const generationId = ++this.currentGenerationId;
+            generationId = ++this.currentGenerationId;
             let fullResult = "";
             const brainstormV3 = await this.buildV3ForTranscriptSurface('brainstorm');
+            if (this.currentGenerationId !== generationId) return null;
             // When the active task is a system design, "brainstorm" means
             // alternative designs — with the one worth picking drawn. No design
             // on the table ⇒ null ⇒ brainstorm exactly as before.
@@ -8248,8 +8360,7 @@ export class IntelligenceEngine extends EventEmitter {
                 fullResult += token;
             }
 
-            if (streamAborted) {
-                this.setMode('idle');
+            if (streamAborted || this.currentGenerationId !== generationId) {
                 return null;
             }
 
@@ -8267,11 +8378,14 @@ export class IntelligenceEngine extends EventEmitter {
             });
 
             this.emit('suggested_answer', fullResult, 'Brainstorming Approaches', 1.0);
+            if (this.currentGenerationId !== generationId) return null;
             this.setMode('idle');
             return fullResult;
 
         } catch (error) {
+            if (this.currentGenerationId !== generationId) return null;
             this.emit('error', error as Error, 'brainstorm');
+            if (this.currentGenerationId !== generationId) return null;
             this.setMode('idle');
             return null;
         }
@@ -8429,6 +8543,11 @@ export class IntelligenceEngine extends EventEmitter {
      * Reset engine state (cancels any in-flight operations)
      */
     reset(): void {
+        if (this.automaticFastModeOverride) {
+            const previousFastMode = this.automaticFastModeOverride.previous;
+            this.automaticFastModeOverride = null;
+            try { this.llmHelper.setGroqFastTextMode(previousFastMode); } catch { /* routing hint only */ }
+        }
         this.activeMode = 'idle';
         this.currentGenerationId++; // Increment to break all active LLM streams
         if (this.whatToAnswerCancellationToken) {
@@ -8464,5 +8583,27 @@ export class IntelligenceEngine extends EventEmitter {
      */
     clearWtaDiversityHistory(): void {
         this.wtaDiversityGuard.reset();
+    }
+
+    /** A fresh chat, unlike a provider swap: retain the meeting/mode binding, not its turns. */
+    resetConversationState(): void {
+        this.reset();
+        this.clearWtaDiversityHistory();
+        this.lastTranscriptTime = 0;
+        this.lastTriggerTime = 0;
+        this.lastTriggerQuestion = null;
+        this.questionLedgerShadow = null;
+        this.lastTrace = null;
+        this.automaticGenerationId = null;
+        this.nextRunIsAutomatic = false;
+        this.automaticTriggerPending = false;
+        this.automaticTriggerCancelled = true;
+        this.speculativeGenerationId = null;
+        this.currentAutoCandidateId = null;
+        this.speculativeQuestionId = null;
+        this.speculativeDesignNote = null;
+        this.speculativeAdoptHook = null;
+        // Keep the selected mode/session identity so its trigger packs still work.
+        if (this.dynamicActionEngine) this.dynamicActionEngine = new DynamicActionEngine();
     }
 }

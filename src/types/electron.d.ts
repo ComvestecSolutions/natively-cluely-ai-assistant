@@ -264,7 +264,10 @@ export interface ElectronAPI {
   onDisguiseChanged: (callback: (mode: 'terminal' | 'settings' | 'activity' | 'none') => void) => () => void
   setOpenAtLogin: (open: boolean) => Promise<{ success: boolean; error?: string }>
   getOpenAtLogin: () => Promise<boolean>
-  onSettingsVisibilityChange: (callback: (isVisible: boolean) => void) => () => void
+  onSettingsVisibilityChange: (callback: (isVisible: boolean, panel: 'settings' | 'courses' | 'modes') => void) => () => void
+  onSettingsWindowShown: (callback: (panel: 'settings' | 'courses' | 'modes') => void) => () => void
+  getSettingsPopupState: () => Promise<{ panel: 'settings' | 'courses' | 'modes'; isVisible: boolean; heightBudget: number }>
+  onSettingsPopupHeightBudget: (callback: (height: number) => void) => () => void
   closeSettingsWindow: () => Promise<void>
   closeAdvancedSettings: () => Promise<void>
   openSettingsTab: (tab: string) => Promise<void>
@@ -895,7 +898,7 @@ export interface ElectronAPI {
   ensureOllamaRunning: () => Promise<{ success: boolean; reason?: string; [k: string]: unknown }>;
 
   // Settings Window
-  toggleSettingsWindow: (coords?: { x: number; y: number }) => Promise<void>;
+  toggleSettingsWindow: (coords?: { x?: number; y?: number; panel?: 'settings' | 'courses' | 'modes' }) => Promise<void>;
 
   // Groq Fast Text Mode
   getGroqFastTextMode: () => Promise<{ enabled: boolean }>;

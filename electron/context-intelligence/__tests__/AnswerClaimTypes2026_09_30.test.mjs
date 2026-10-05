@@ -15,6 +15,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { createRequire } from 'node:module';
+import vm from 'node:vm';
+import ts from 'typescript';
 
 const base = path.resolve(process.cwd(), 'dist-electron/electron');
 const ci = path.join(base, 'context-intelligence');
@@ -62,12 +65,37 @@ describe('Sales grounds company claims', () => {
 describe('typed overlay turns see the meeting', () => {
   test('the typed V3 call passes the speech window on the live surface only', () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), 'electron/ipcHandlers.ts'), 'utf8');
-    const i = src.indexOf("surface: 'manual-chat',");
-    assert.ok(i > 0);
-    const call = src.slice(i, i + 4000);
-    assert.match(call, /conversationSummary: answerSurface === 'live' \? \(\(\) => \{/);
-    assert.match(call, /getFormattedContext\?\.\(180\)/);
-    assert.match(call, /speechWindowForPrompt\(formatted\)/);
+    const ast = ts.createSourceFile('ipcHandlers.ts', src, ts.ScriptTarget.Latest, true);
+    const expressions = [];
+    const visit = node => {
+      if (ts.isCallExpression(node) && node.expression.getText(ast) === 'buildV3Prompt') {
+        const input = node.arguments[0];
+        if (input && ts.isObjectLiteralExpression(input)) {
+          const props = input.properties.filter(ts.isPropertyAssignment);
+          const surface = props.find(p => p.name.getText(ast) === 'surface');
+          const summary = props.find(p => p.name.getText(ast) === 'conversationSummary');
+          if (surface && ts.isStringLiteral(surface.initializer) && surface.initializer.text === 'manual-chat' && summary) expressions.push(summary.initializer.getText(ast));
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(ast);
+    assert.equal(expressions.length, 1, 'execute the actual manual V3 call property, not a replica');
+    const js = ts.transpileModule(`module.exports = function(answerSurface, v3TurnPools, appState) { return (${expressions[0]}); };`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
+    const require = createRequire(import.meta.url);
+    const speech = require(path.join(base, 'llm/conversationHistoryPolicy.js'));
+    const module = { exports: {} };
+    vm.runInNewContext(js, { module, require: id => { assert.equal(id, './llm/conversationHistoryPolicy'); return speech; } });
+    const formatted = Array.from({ length: 200 }, (_, i) => `[Them]: Meeting line ${i} ${'details '.repeat(30)}`).join('\n');
+    for (const [surface, permitted, expectedReads] of [['live', true, 1], ['live', false, 0], ['chat', true, 0], ['chat', false, 0]]) {
+      let reads = 0;
+      const appState = { getIntelligenceManager: () => ({ getFormattedContext: seconds => { reads += 1; assert.equal(seconds, 180); return formatted; } }) };
+      const summary = module.exports(surface, { liveTranscript: permitted }, appState);
+      assert.equal(reads, expectedReads, `${surface}, consent=${permitted}: forbidden speech must not even be read`);
+      assert.equal(summary, expectedReads ? speech.speechWindowForPrompt(formatted) : undefined);
+    }
+    assert.equal(module.exports('live', { liveTranscript: true }, { getIntelligenceManager: () => ({ getFormattedContext: () => '   ' }) }), undefined);
+    assert.equal(module.exports('live', { liveTranscript: true }, { getIntelligenceManager: () => { throw new Error('meeting unavailable'); } }), undefined);
   });
 });
 

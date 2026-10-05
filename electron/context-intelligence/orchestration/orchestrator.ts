@@ -26,6 +26,7 @@ import { classifyTurn, isBareFollowUp, stripSttFillers, isProspectiveJobQuestion
 import type { AnswerTrace, RetrievalAttemptTrace } from '../observability/answer-trace';
 import { mergeRewrittenEvidence, type QueryRewriter, type QueryRewriteOutcome } from '../retrieval/llm-query-rewrite';
 import { SMALL_CORPUS_MAX_TOKENS } from '../retrieval/mode-retrieval-port';
+import { getConversationResetEpoch } from '../question/conversation-state-store';
 
 export interface AnswerRequest {
   requestId: string;
@@ -889,7 +890,9 @@ export function evaluateAnswerability(
 export async function orchestrate(
   req: AnswerRequest,
   retrieval?: RetrievalPort,
+  isSuperseded?: () => boolean,
 ): Promise<OrchestratorResult> {
+  const resetEpoch = getConversationResetEpoch();
   // performance.now(), NOT Date.now(). This is a desktop app that sleeps in the
   // middle of a turn all the time — a lid closed between here and the trace
   // literal would otherwise report a four-hour retrieval. A monotonic clock
@@ -1416,7 +1419,7 @@ export async function orchestrate(
       };
     }
 
-    advanceConversationState({
+    if (getConversationResetEpoch() === resetEpoch && !isSuperseded?.()) advanceConversationState({
       sessionId: req.sessionId,
       scope: decision.scope,
       // The ORIGINAL question, never the referent-rewritten one (deep-test D9):

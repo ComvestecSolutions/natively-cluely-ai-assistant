@@ -114,16 +114,17 @@ describe('Defect G contract: modes:set-active invalidates the chat-stream regist
     );
   });
 
-  test('invalidation happens BEFORE setActiveMode flips the mode', () => {
+  test('invalidation follows successful persistence without yielding or broadcasting first', () => {
     const handlerBody = sliceSafeHandleBlock(ipcSource, 'modes:set-active');
     const invalidateIdx = handlerBody.indexOf('abortAndInvalidateChatStreams(_chatStreamsBySender)');
     const setActiveIdx = handlerBody.indexOf('ModesManager.getInstance().setActiveMode');
     assert.ok(invalidateIdx >= 0, 'invalidation call must exist');
     assert.ok(setActiveIdx >= 0, 'setActiveMode call must exist');
-    assert.ok(
-      invalidateIdx < setActiveIdx,
-      `registry invalidation (index ${invalidateIdx}) must run before setActiveMode (index ${setActiveIdx})`,
-    );
+    assert.ok(setActiveIdx < invalidateIdx, 'a failed mode write must leave the registry intact');
+    assert.doesNotMatch(handlerBody.slice(setActiveIdx, invalidateIdx), /\bawait\b/,
+      'the old answer must not interleave between mode persistence and registry invalidation');
+    assert.ok(invalidateIdx < handlerBody.indexOf("win.webContents.send('mode-changed'"),
+      'registry invalidation must precede the user-visible mode broadcast');
   });
 });
 

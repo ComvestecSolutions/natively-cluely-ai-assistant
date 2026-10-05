@@ -1,0 +1,56 @@
+diff --git a/premium/src/ModesSettings.tsx b/premium/src/ModesSettings.tsx
+--- a/premium/src/ModesSettings.tsx
++++ b/premium/src/ModesSettings.tsx
+@@ -251,10 +251,22 @@ export function ModesSettings({ onClose }: ModesSettingsProps) {
+-    const res = await api().modesCreate?.({
+-      name: `${source.name} copy`,
+-      templateType: source.templateType,
+-    });
+-    if (!res?.success || !res.mode?.id) {
+-      setError(res?.error ?? 'Failed to duplicate mode');
+-      return;
+-    }
+-    if (source.customContext) {
+-      await api().modesUpdate?.(res.mode.id, { customContext: source.customContext });
++    try {
++      const res = await api().modesCreate?.({
++        name: `${source.name} copy`,
++        templateType: source.templateType,
++      });
++      if (!res?.success || !res.mode?.id) {
++        setError(res?.error ?? 'Failed to duplicate mode');
++        return;
++      }
++      if (source.customContext) {
++        try {
++          const copied = await api().modesUpdate?.(res.mode.id, { customContext: source.customContext });
++          if (!copied?.success) throw new Error(copied?.error ?? 'Failed to copy prompt');
++        } catch (e: any) {
++          setError(`Mode copy was created, but its prompt could not be copied: ${e?.message ?? 'Failed to copy prompt'}`);
++          return;
++        }
++      }
++      await refreshModes();
++      setSelectedId(res.mode.id);
++    } catch (e: any) {
++      setError(e?.message ?? 'Failed to duplicate mode');
+@@ -262,2 +273,0 @@ export function ModesSettings({ onClose }: ModesSettingsProps) {
+-    await refreshModes();
+-    setSelectedId(res.mode.id);
+@@ -267,3 +277,10 @@ export function ModesSettings({ onClose }: ModesSettingsProps) {
+-    const res = await api().modesUpdate?.(id, { customContext });
+-    if (!res?.success) {
+-      setError(res?.error ?? 'Failed to save prompt');
++    try {
++      const res = await api().modesUpdate?.(id, { customContext });
++      if (!res?.success) {
++        setError(res?.error ?? 'Failed to save prompt');
++        return;
++      }
++      // Re-fetch only after persistence succeeds, preserving failed drafts/errors.
++      await refreshModes();
++    } catch (e: any) {
++      setError(e?.message ?? 'Failed to save prompt');
+@@ -271,2 +287,0 @@ export function ModesSettings({ onClose }: ModesSettingsProps) {
+-    // Re-fetch to update customContext everywhere.
+-    await refreshModes();

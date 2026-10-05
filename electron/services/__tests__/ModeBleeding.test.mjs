@@ -130,11 +130,11 @@ describe('BUG-MODE-BLEEDING: Async post-call summary mode snapshot', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Test 2: setActiveMode clears session context before switching modes
+// Test 2: a committed mode switch clears session context before yielding
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('BUG-MODE-BLEEDING: Mode-context clearing on mode switch', () => {
-  test('modes:set-active IPC clears session context before calling setActiveMode', () => {
+  test('modes:set-active IPC clears session context synchronously after committing', () => {
     const sourcePath = path.resolve(__dirname, '../../ipcHandlers.ts');
     const source = fs.readFileSync(sourcePath, 'utf8');
 
@@ -144,13 +144,18 @@ describe('BUG-MODE-BLEEDING: Mode-context clearing on mode switch', () => {
 
     const handlerBody = sliceSafeHandleBlock(source, 'modes:set-active');
 
-    // Must call clearSessionContext before setActiveMode
+    // Failed persistence must preserve context; successful persistence must
+    // clear it without yielding to another turn.
     const clearIndex = handlerBody.indexOf('clearSessionContext');
     const setActiveIndex = handlerBody.indexOf('ModesManager.getInstance().setActiveMode');
 
     assert.ok(clearIndex >= 0, 'clearSessionContext should be called in modes:set-active handler');
-    assert.ok(clearIndex < setActiveIndex,
-      `clearSessionContext (index ${clearIndex}) must be called before setActiveMode (index ${setActiveIndex})`);
+    assert.ok(setActiveIndex >= 0 && setActiveIndex < clearIndex,
+      'clearSessionContext must follow the successful persistence call');
+    assert.doesNotMatch(handlerBody.slice(setActiveIndex, clearIndex), /\bawait\b/,
+      'another turn must not interleave between persistence and context clearing');
+    assert.ok(clearIndex < handlerBody.indexOf("win.webContents.send('mode-changed'"),
+      'session context must be cleared before broadcasting the new mode');
   });
 
   test('SessionTracker has clearSessionContext method', () => {
@@ -177,7 +182,7 @@ describe('BUG-MODE-BLEEDING: Mode-context clearing on mode switch', () => {
   // follow-up recall) records each turn's mode but never checks it back on
   // read, so a follow-up in a NEW mode could recall a DIFFERENT mode's
   // prior answer unless it's also cleared on switch.
-  test('modes:set-active IPC also clears _manualConversationMemory before calling setActiveMode', () => {
+  test('modes:set-active IPC clears manual memory synchronously after committing', () => {
     const sourcePath = path.resolve(__dirname, '../../ipcHandlers.ts');
     const source = fs.readFileSync(sourcePath, 'utf8');
 
@@ -187,8 +192,12 @@ describe('BUG-MODE-BLEEDING: Mode-context clearing on mode switch', () => {
     const setActiveIndex = handlerBody.indexOf('ModesManager.getInstance().setActiveMode');
 
     assert.ok(clearConvMemIndex >= 0, '_manualConversationMemory.clearAllSessions() should be called in modes:set-active handler');
-    assert.ok(clearConvMemIndex < setActiveIndex,
-      `_manualConversationMemory.clearAllSessions() (index ${clearConvMemIndex}) must be called before setActiveMode (index ${setActiveIndex})`);
+    assert.ok(setActiveIndex >= 0 && setActiveIndex < clearConvMemIndex,
+      'manual memory must be cleared only after successful persistence');
+    assert.doesNotMatch(handlerBody.slice(setActiveIndex, clearConvMemIndex), /\bawait\b/,
+      'another turn must not interleave before manual memory is cleared');
+    assert.ok(clearConvMemIndex < handlerBody.indexOf("win.webContents.send('mode-changed'"),
+      'manual memory must be cleared before broadcasting the new mode');
   });
 
   test('ConversationMemoryService has a clearAllSessions method', () => {

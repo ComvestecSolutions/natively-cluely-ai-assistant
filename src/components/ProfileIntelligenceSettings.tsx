@@ -2472,14 +2472,21 @@ export function ProfileIntelligenceSettings({
                     onClick={async () => {
                         if (!profileStatus.hasProfile || !hasProfileAccess) return;
                         const newState = !profileStatus.profileMode;
+                        setProfileError('');
                         try {
-                            await window.electronAPI?.profileSetMode?.(newState);
+                            const result = await window.electronAPI?.profileSetMode?.(newState);
+                            if (!result?.success) {
+                                setProfileError(result?.error || 'Failed to update Persona Engine');
+                                return;
+                            }
                             // Armed next to the state change, not before the
                             // await: data-on only flips when this resolves, and
                             // is-init must not land in an earlier render.
                             piToggleInit.arm();
                             setProfileStatus(prev => ({ ...prev, profileMode: newState }));
-                        } catch { /**/ }
+                        } catch (e: any) {
+                            setProfileError(e?.message || 'Failed to update Persona Engine');
+                        }
                     }}
                     className={`t-toggle t-toggle-lg w-11 h-6 shrink-0 rounded-full p-[3px] flex items-center ${piToggleInit.className}`}
                 >
@@ -2540,12 +2547,19 @@ export function ProfileIntelligenceSettings({
                                 // The button is disabled mid-ingest rather than lying.
                                 if (profileUploading) return;
                                 if (!(await askConfirm({ title: 'Delete your resume and its extracted data?', confirmLabel: 'Delete' }))) return;
+                                setProfileError('');
                                 try {
-                                    await window.electronAPI?.profileDelete?.();
+                                    const result = await window.electronAPI?.profileDelete?.();
+                                    if (!result?.success) {
+                                        setProfileError(result?.error || 'Failed to delete resume');
+                                        return;
+                                    }
                                     setProfileStatus({ hasProfile: false, profileMode: false });
                                     const freshData = await window.electronAPI?.profileGetProfile?.();
                                     setProfileData(freshData ?? null);
-                                } catch { /**/ }
+                                } catch (e: any) {
+                                    setProfileError(e?.message || 'Failed to delete resume');
+                                }
                             }}
                         >
                             <X size={12} />
@@ -2649,12 +2663,19 @@ export function ProfileIntelligenceSettings({
                                 // Same lie as the resume X — the abort flag only silenced
                                 // this renderer while main finished the JD ingest.
                                 if (jdUploading) return;
+                                setJdError('');
                                 try {
-                                    await window.electronAPI?.profileDeleteJD?.();
+                                    const result = await window.electronAPI?.profileDeleteJD?.();
+                                    if (!result?.success) {
+                                        setJdError(result?.error || 'Failed to delete job description');
+                                        return;
+                                    }
                                     const data = await window.electronAPI?.profileGetProfile?.();
                                     setProfileData(data ?? null);
                                     setCompanyDossier(null);
-                                } catch { /**/ }
+                                } catch (e: any) {
+                                    setJdError(e?.message || 'Failed to delete job description');
+                                }
                             }}
                         >
                             <X size={12} />

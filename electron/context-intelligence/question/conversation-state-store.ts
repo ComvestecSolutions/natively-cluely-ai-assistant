@@ -27,6 +27,7 @@ import {
 } from './conversation-state';
 
 const STORE_KEY = '__nativelyV3ConversationStateV1__';
+const RESET_EPOCH_KEY = '__nativelyV3ConversationResetEpochV1__';
 const MAX_SESSIONS = 32;
 
 type Store = Map<string, ConversationState>;
@@ -254,8 +255,17 @@ export function resolveAgainstSession(
   return resolveReference(question, getConversationState(sessionId), scope);
 }
 
+/** Shared across entry bundles, like the store: pending retrieval must not undo a fresh-chat reset. */
+export function getConversationResetEpoch(): number {
+  const g = globalThis as unknown as Record<string, unknown>;
+  return (g[RESET_EPOCH_KEY] as number | undefined) ?? 0;
+}
+
 /** Mode switches and session resets must not carry referents across. */
 export function clearConversationState(sessionId?: string): void {
-  if (sessionId === undefined) store().clear();
-  else store().delete(sessionId);
+  if (sessionId === undefined) {
+    store().clear();
+    const g = globalThis as unknown as Record<string, unknown>;
+    g[RESET_EPOCH_KEY] = getConversationResetEpoch() + 1;
+  } else store().delete(sessionId);
 }

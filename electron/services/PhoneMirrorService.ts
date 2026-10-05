@@ -602,12 +602,12 @@ export class PhoneMirrorService {
    * summary being on the desktop. Tracked even while stopped, so enabling the
    * mirror mid-meeting (or after one) reports it.
    */
-  publishMeetingState(active: boolean): void {
+  publishMeetingState(active: boolean, resetConversation: boolean = false): void {
     const starting = active && !this.meetingActive;
     const ending = !active && this.meetingActive;
     this.meetingActive = active;
-    if (starting || ending) {
-      this.meetingEnded = ending;
+    if (starting || ending || resetConversation) {
+      if (starting || ending) this.meetingEnded = ending;
       // The last meeting's answers and transcript must not greet a phone that
       // connects (or is already open) now.
       this.transcriptFinals = [];
@@ -622,8 +622,22 @@ export class PhoneMirrorService {
       this.livePartial = null;
       this.cancelLiveRender();
     }
+    if (resetConversation) {
+      // Revoke capture request ids before settling their callers: late /dom
+      // deliveries then hit the existing duplicate gate, not the fresh chat.
+      this.openCaptureReqIds.clear();
+      for (const { resolve, timer } of this.pendingCaptures.values()) {
+        clearTimeout(timer);
+        resolve({ ok: false, reason: 'conversation-reset' });
+      }
+      this.pendingCaptures.clear();
+      this.attachments = [];
+      this.attachmentPaths = [];
+      this.shots.clear();
+      this.broadcast({ type: 'attachments', items: [] });
+    }
     if (!this.isRunning()) return;
-    this.broadcast({ type: 'meeting', active, reset: starting || ending });
+    this.broadcast({ type: 'meeting', active, reset: starting || ending || resetConversation });
   }
 
   /**

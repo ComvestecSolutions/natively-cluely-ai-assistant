@@ -16,29 +16,27 @@
 // Live-reproduced during a real upload of a 66-page PDF into a custom
 // document-grounded mode (Session 2026-07-26 shadow-observation testing).
 //
-// Source-pinned: constructing a real ingestModeReferenceFile() call
-// requires a real ModesManager backed by DatabaseManager, which is
-// ABI-mismatched in this dev environment (established baseline throughout
-// this test suite) — so this proves both halves of the fix by reading the
-// source directly, mirroring ModeUploadHardening.test.mjs's own convention
-// for testing this exact file.
+// The backend return contract is source-pinned. The renderer regression runs
+// the current upload callback and reference-file section, substituting only
+// hooks/IPC. It also runs an unsafe in-memory mutation to prove the assertions
+// catch missing content guards, rather than pinning the old editor's spelling.
 
-import { test, describe } from 'node:test';
+import { test, describe, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { modesEditorPath, referenceEditorHarness } from './modeReferenceEditorHarness.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const repoRoot = path.resolve(__dirname, '../../..');
+
 const ingestionSrc = fs.readFileSync(
   path.resolve(__dirname, '../ModeReferenceFileIngestion.ts'),
   'utf8',
 );
-const modesSettingsSrc = fs.readFileSync(
-  path.resolve(repoRoot, 'premium/src/ModesSettings.tsx'),
-  'utf8',
-);
+const modesSettingsSrc = fs.readFileSync(modesEditorPath, 'utf8');
+after(() => assert.equal(fs.readFileSync(modesEditorPath, 'utf8'), modesSettingsSrc,
+  'callback/render tests must never replace the local premium scaffold'));
 
 describe('ModeReferenceFileIngestResult includes content (the actual bug)', () => {
   test('the interface declares a required `content: string` field', () => {
@@ -57,8 +55,45 @@ describe('ModeReferenceFileIngestResult includes content (the actual bug)', () =
 });
 
 describe('ModesSettings.tsx render site is defensive even if a future backend regression omits content again', () => {
-  test('file.content.length is accessed with optional chaining + a numeric fallback, not a bare unguarded access', () => {
-    assert.doesNotMatch(modesSettingsSrc, /\(file\.content\.length \/ 1000\)/, 'the old unguarded access must be gone');
-    assert.match(modesSettingsSrc, /\(\(file\.content\?\.length \?\? 0\) \/ 1000\)/, 'must guard with optional chaining + a numeric fallback so a missing content field can never crash the render');
+  for (const platform of ['darwin', 'win32']) {
+    for (const blobAvailable of [true, false]) {
+      for (const [label, content] of [['missing', undefined], ['null', null], ['empty', ''], ['Unicode', 'résumé']]) {
+        test(`${platform}: upload/render handles ${label} content ${blobAvailable ? 'with Blob' : 'through the fallback'}`, async () => {
+          const file = { id: 'uploaded', fileName: 'Uploaded reference.txt', ...(content === undefined ? {} : { content }) };
+          const h = referenceEditorHarness({ platform, file, blobAvailable });
+          await h.upload();
+          assert.deepEqual(h.calls.uploads, ['selected-mode']);
+          assert.equal(h.calls.reads, 1, 'the callback must rehydrate authoritative files');
+          const markup = h.markup();
+          assert.match(markup, /Uploaded reference\.txt/);
+          const expected = content ? (blobAvailable ? '8 B' : '6 B') : '0 KB';
+          assert.ok(markup.includes(expected), 'missing content needs a numeric zero fallback; valid Unicode text needs a real size');
+        });
+      }
+    }
+
+    for (const cancelled of [true, false]) {
+      test(`${platform}: ${cancelled ? 'cancelled' : 'refused'} upload keeps existing file rows`, async () => {
+        const existing = { id: 'existing', fileName: 'Existing reference.txt', content: 'Retained' };
+        const h = referenceEditorHarness({
+          platform, initialFiles: [existing], file: { id: 'unused', fileName: 'Must not appear.txt' },
+          uploadResult: cancelled ? { cancelled: true } : { success: false, error: 'write_refused' },
+        });
+        await h.upload();
+        assert.equal(h.calls.reads, 0);
+        const markup = h.markup();
+        assert.match(markup, /Existing reference\.txt/);
+        assert.doesNotMatch(markup, /Must not appear/);
+        if (!cancelled) assert.match(markup, /write_refused/);
+      });
+    }
+  }
+
+  test('the actual render rejects an unsafe in-memory content.length mutation', async () => {
+    const h = referenceEditorHarness({
+      platform: 'win32', file: { id: 'uploaded', fileName: 'Missing content.txt' }, unsafeSize: true,
+    });
+    await h.upload();
+    assert.throws(() => h.markup(), /length/, 'removing the content safeguard must make the regression signal go red');
   });
 });

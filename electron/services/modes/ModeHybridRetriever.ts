@@ -7,6 +7,7 @@ import { ModeReferenceFile } from '../ModesManager';
 import { VectorStore, ScoredChunk } from '../../rag/VectorStore';
 import { EmbeddingPipeline } from '../../rag/EmbeddingPipeline';
 import Database from 'better-sqlite3';
+import { resolve } from 'node:path';
 import { buildDocumentMap, resolveTargetSections, sectionAwareChunksFromMap, selectTableOfContentsEntries, sentenceAwareWindows, tabularChunks } from './DocumentMap';
 import { wordsOf, buildLexicalStats, queryWeights, weightedOverlapScore, anchorTerms, anchorCoverage, corpusAnchorsQuestion, smallPoolAnchorsQuestion, isProbeFunctionWord, type LexicalStats } from './lexicalTokens';
 import { CHUNKER_VERSION, semanticChunks, normalizeLineEndings } from './semanticChunker';
@@ -266,15 +267,37 @@ class IndexConcurrencyGate {
   async acquire(): Promise<void> {
     if (this.active < this.limit) { this.active++; return; }
     await new Promise<void>((resolve) => this.waiters.push(resolve));
-    this.active++;
   }
   release(): void {
-    this.active = Math.max(0, this.active - 1);
     const next = this.waiters.shift();
+    // Transfer the occupied slot before waking a waiter; new arrivals cannot steal it.
     if (next) next();
+    else this.active = Math.max(0, this.active - 1);
   }
 }
-const indexGate = new IndexConcurrencyGate(MODE_INDEX_MAX_CONCURRENT_FILES);
+interface ModeIndexingProviderState {
+  generation: number;
+  gates: Map<string | Database.Database, IndexConcurrencyGate>;
+}
+
+function getModeIndexingProviderState(pipeline: EmbeddingPipeline): ModeIndexingProviderState {
+  const shared = globalThis as unknown as {
+    __nativelyModeIndexingProvidersV1__?: WeakMap<EmbeddingPipeline, ModeIndexingProviderState>;
+  };
+  const providers = shared.__nativelyModeIndexingProvidersV1__ ??= new WeakMap();
+  let state = providers.get(pipeline);
+  if (!state) {
+    state = { generation: 0, gates: new Map() };
+    providers.set(pipeline, state);
+  }
+  return state;
+}
+
+/** Replaced pipelines lose write ownership in every independently bundled retriever. */
+export function invalidateModeReferenceIndexingPipeline(pipeline: EmbeddingPipeline): void {
+  getModeIndexingProviderState(pipeline).generation++;
+}
+
 const MIN_COMBINED_SCORE = 0.15;
 
 const FTS_WEIGHT = 0.4;  // alpha for combined score: alpha * fts + (1-alpha) * vector
@@ -372,7 +395,8 @@ function hashContent(content: string): string {
     // Use a polynomial hash similar to what compilers do for string hashing
     // This gives different hashes for similar-but-different content
     let hash = 0;
-    const str = content.slice(0, 10000); // Only hash first 10k chars for speed
+    // Tail edits of the same length must invalidate vectors and cached chunks too.
+    const str = content;
     for (let i = 0; i < str.length; i++) {
         // 31 * hash + char - same as Java's String.hashCode
         hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
@@ -435,6 +459,9 @@ interface ChunkCandidate {
 
 export class ModeHybridRetriever {
     private embeddingPipeline: EmbeddingPipeline;
+    private readonly indexingProviderState: ModeIndexingProviderState;
+    private readonly indexingGeneration: number;
+    private readonly indexGate: IndexConcurrencyGate;
     private vectorStore: VectorStore;
     private db: Database.Database;
     // Per-file chunk cache keyed by file id. Chunking a reference file is pure and
@@ -457,6 +484,17 @@ export class ModeHybridRetriever {
         this.db = db;
         this.vectorStore = vectorStore;
         this.embeddingPipeline = embeddingPipeline;
+        this.indexingProviderState = getModeIndexingProviderState(embeddingPipeline);
+        this.indexingGeneration = this.indexingProviderState.generation;
+        // Separate bundle connections to the same file share a gate. Anonymous
+        // and in-memory databases must stay isolated by connection identity.
+        const databaseKey = db.name && db.name !== ':memory:' ? resolve(db.name) : db;
+        let gate = this.indexingProviderState.gates.get(databaseKey);
+        if (!gate) {
+            gate = new IndexConcurrencyGate(MODE_INDEX_MAX_CONCURRENT_FILES);
+            this.indexingProviderState.gates.set(databaseKey, gate);
+        }
+        this.indexGate = gate;
         this.ensureIndexTable();
     }
 
@@ -597,7 +635,7 @@ export class ModeHybridRetriever {
      * status 'failed' (embedding outage → 'lexical_only') and retrieval
      * degrades to lexical for that file.
      */
-    private inflightIndex = new Map<string, Promise<void>>();
+    private inflightIndex = new Map<string, { hash: string; promise: Promise<void>; cancellation: { cancelled: boolean } }>();
 
     // T13 / D4.6 — "at session start, re-embed any file whose vectors sit in a
     // non-primary space" is ALREADY IMPLEMENTED, and a second implementation was
@@ -614,19 +652,43 @@ export class ModeHybridRetriever {
     // threshold, so there is nothing for a repair pass to find.
 
     public async indexFile(file: ModeReferenceFile): Promise<void> {
+        // Capture the version before yielding; callers may update their file object.
+        file = { ...file };
+        const hash = indexHash(file.content);
+        const indexGate = this.indexGate;
+        // Profile/course pseudo-files intentionally have no reference-file row.
+        // A real upload that loses its row while awaiting the provider must never
+        // write it back, including when another bundled retriever deletes it.
+        const persistedReference = file.id.startsWith('ref_') || this.referenceFileExists(file.id);
         const existing = this.inflightIndex.get(file.id);
-        if (existing) return existing;
-        // Bounded process-wide (GAP-4). Five simultaneous uploads used to start
-        // five independent batch loops against one API key; the gate makes the
-        // extra ones wait rather than compete, and the single-flight map above
-        // still collapses a double-upload of the SAME file to one job.
-        const job = (async () => {
+        if (existing?.hash === hash) return existing.promise;
+        const cancellation = existing?.cancellation ?? { cancelled: false };
+        const job = { hash, promise: Promise.resolve(), cancellation };
+        const canIndex = (): boolean => !cancellation.cancelled
+            && this.indexingGeneration === this.indexingProviderState.generation
+            && (!persistedReference || this.referenceFileExists(file.id));
+        // Register the queue's tail immediately: A → B → A must not collapse
+        // the last A into the first job and then leave B as the final index.
+        job.promise = (async () => {
+            if (existing) await existing.promise;
+            if (!canIndex()) return;
             await indexGate.acquire();
-            try { await this.indexFileInner(file); }
+            try { if (canIndex()) await this.indexFileInner(file, canIndex); }
             finally { indexGate.release(); }
-        })().finally(() => this.inflightIndex.delete(file.id));
+        })().finally(() => {
+            if (this.inflightIndex.get(file.id) === job) this.inflightIndex.delete(file.id);
+        });
         this.inflightIndex.set(file.id, job);
-        return job;
+        return job.promise;
+    }
+
+    private referenceFileExists(fileId: string): boolean {
+        try {
+            return !!this.db.prepare('SELECT id FROM mode_reference_files WHERE id = ?').get(fileId);
+        } catch {
+            // Standalone/synthetic indexes need not have the ordinary upload table.
+            return false;
+        }
     }
 
     /**
@@ -645,9 +707,11 @@ export class ModeHybridRetriever {
     private async embedSubBatchWithRetry(
         slice: string[],
         label: string,
+        canIndex: () => boolean,
     ): Promise<{ embeddings: number[][]; space: string | null }> {
         let lastErr: any = null;
         for (let attempt = 0; attempt <= MODE_INDEX_BATCH_RETRIES; attempt++) {
+            if (!canIndex()) throw new Error('Reference-file indexing cancelled');
             try {
                 const result = await this.embeddingPipeline.getEmbeddingsWithFallback(slice);
                 if (!Array.isArray(result.embeddings) || result.embeddings.length !== slice.length) {
@@ -659,7 +723,7 @@ export class ModeHybridRetriever {
                 // `retryable === false` is the server's explicit verdict on a
                 // permanent rejection. Anything undefined is treated as
                 // retryable, which is the pre-existing assumption.
-                if (err?.retryable === false || err?.permanentAuthFailure) throw err;
+                if (!canIndex() || err?.retryable === false || err?.permanentAuthFailure) throw err;
                 if (attempt >= MODE_INDEX_BATCH_RETRIES) break;
                 const declared = Number(err?.retryAfter) > 0 ? Number(err.retryAfter) * 1000 : null;
                 const backoff = declared ?? Math.min(1000 * Math.pow(2, attempt), MODE_INDEX_RETRY_CAP_MS);
@@ -671,7 +735,7 @@ export class ModeHybridRetriever {
         throw lastErr;
     }
 
-    private async indexFileInner(file: ModeReferenceFile): Promise<void> {
+    private async indexFileInner(file: ModeReferenceFile, canIndex: () => boolean): Promise<void> {
         const content = (file.content || '').trim();
         if (!content) return;
         // Versioned (T9): this is the value compared against the stored state, so
@@ -772,6 +836,7 @@ export class ModeHybridRetriever {
             } catch { /* fall through to lexical_only below */ }
         }
 
+        if (!canIndex()) return;
         if (!this.isEmbeddingAvailable() || !activeSpace) {
             // No embedder: persist chunk TEXT (lexical retrieval still wins a
             // re-chunk per query) and mark lexical_only so prewarm retries later.
@@ -819,7 +884,8 @@ export class ModeHybridRetriever {
                 : configuredBatch;
             const plan = planEmbedBatches(chunks, INDEX_BATCH, MODE_INDEX_EMBED_BATCH_CHARS);
             if (plan.length === 1) {
-                const result = await this.embedSubBatchWithRetry(chunks, file.fileName);
+                const result = await this.embedSubBatchWithRetry(chunks, file.fileName, canIndex);
+                if (!canIndex()) return;
                 const embeddings = result.embeddings;
                 const wrote = this.persistChunks(file.id, chunks, embeddings, result.space);
                 // Derived from the rows, not from what the loop believed it had.
@@ -845,11 +911,13 @@ export class ModeHybridRetriever {
                 for (const slice of plan) {
                     const start = embeddedVectors.length;
                     try {
-                        const result = await this.embedSubBatchWithRetry(slice, file.fileName);
+                        const result = await this.embedSubBatchWithRetry(slice, file.fileName, canIndex);
+                        if (!canIndex()) return;
                         embeddedVectors.push(...result.embeddings);
                         embeddingSpace = result.space;
                         console.log(`[ModeHybridRetriever] ${file.fileName}: embedded ${embeddedVectors.length}/${chunks.length} chunks`);
                     } catch (batchErr) {
+                        if (!canIndex()) return;
                         failedOffset = start;
                         console.warn(`[ModeHybridRetriever] ${file.fileName}: sub-batch at offset ${start} failed after retries (${batchErr instanceof Error ? batchErr.message : batchErr}); keeping ${embeddedVectors.length} embedded + rest lexical. embedded_chunk_count makes the tail resumable.`);
                         break;
@@ -897,6 +965,7 @@ export class ModeHybridRetriever {
                 }
             }
         } catch (e) {
+            if (!canIndex()) return;
             console.warn(`[ModeHybridRetriever] indexFile failed for ${file.fileName}:`, e instanceof Error ? e.message : e);
             // Keep the chunk text for lexical retrieval; mark failed for retry.
             this.persistChunks(file.id, chunks, null, null);
@@ -993,6 +1062,8 @@ export class ModeHybridRetriever {
     }
 
     public removeFileIndex(fileId: string): void {
+        const job = this.inflightIndex.get(fileId);
+        if (job) job.cancellation.cancelled = true;
         try {
             this.db.prepare('DELETE FROM mode_reference_chunks WHERE file_id = ?').run(fileId);
         } catch (e) {

@@ -712,7 +712,11 @@ interface ElectronAPI {
   ensureOllamaRunning: () => Promise<{ success: boolean; reason?: string; [k: string]: unknown }>;
 
   // Settings Window
-  toggleSettingsWindow: (coords?: { x: number; y: number }) => Promise<void>;
+  toggleSettingsWindow: (coords?: { x?: number; y?: number; panel?: 'settings' | 'courses' | 'modes' }) => Promise<void>;
+  getSettingsPopupState: () => Promise<{ panel: 'settings' | 'courses' | 'modes'; isVisible: boolean; heightBudget: number }>;
+  onSettingsPopupHeightBudget: (callback: (height: number) => void) => () => void;
+  onSettingsVisibilityChange: (callback: (isVisible: boolean, panel: 'settings' | 'courses' | 'modes') => void) => () => void;
+  closeSettingsWindow: () => Promise<void>;
 
   // Groq Fast Text Mode
   getGroqFastTextMode: () => Promise<{ enabled: boolean }>;
@@ -848,7 +852,7 @@ interface ElectronAPI {
   onGeminiStreamError: (callback: (error: string, meta?: { streamId?: number | null; source?: string }) => void) => () => void;
 
   onUndetectableChanged: (callback: (state: boolean) => void) => () => void;
-  onSettingsWindowShown: (callback: () => void) => () => void;
+  onSettingsWindowShown: (callback: (panel: 'settings' | 'courses' | 'modes') => void) => () => void;
   onGroqFastTextChanged: (callback: (enabled: boolean) => void) => () => void;
   onModelChanged: (callback: (modelId: string) => void) => () => void;
   /** The model dropdown window was just shown (it is reused, never remounted). */
@@ -1727,8 +1731,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     };
   },
 
-  onSettingsVisibilityChange: (callback: (isVisible: boolean) => void) => {
-    const subscription = (_: any, isVisible: boolean) => callback(isVisible);
+  onSettingsVisibilityChange: (callback: (isVisible: boolean, panel: 'settings' | 'courses' | 'modes') => void) => {
+    const subscription = (_: any, isVisible: boolean, panel: 'settings' | 'courses' | 'modes' = 'settings') => callback(isVisible, panel);
     ipcRenderer.on('settings-visibility-changed', subscription);
     return () => {
       ipcRenderer.removeListener('settings-visibility-changed', subscription);
@@ -2562,8 +2566,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
   ensureOllamaRunning: () => ipcRenderer.invoke('ensure-ollama-running'),
 
   // Settings Window
-  toggleSettingsWindow: (coords?: { x: number; y: number }) =>
+  toggleSettingsWindow: (coords?: { x?: number; y?: number; panel?: 'settings' | 'courses' | 'modes' }) =>
     ipcRenderer.invoke('toggle-settings-window', coords),
+  getSettingsPopupState: () => ipcRenderer.invoke('get-settings-popup-state'),
+  onSettingsPopupHeightBudget: (callback: (height: number) => void) => {
+    const subscription = (_: any, height: number) => callback(height);
+    ipcRenderer.on('settings-popup-height-budget', subscription);
+    return () => ipcRenderer.removeListener('settings-popup-height-budget', subscription);
+  },
+  closeSettingsWindow: () => ipcRenderer.invoke('close-settings-window'),
 
   // Groq Fast Text Mode
   getGroqFastTextMode: () => ipcRenderer.invoke('get-groq-fast-text-mode'),
@@ -2692,8 +2703,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // app start and only hidden/shown afterwards, so mount-time fetches go stale.
   // The focus-refresh path never fires for the overlay-anchored popover — it is
   // shown with showInactive(). This event fires on EVERY show, both paths.
-  onSettingsWindowShown: (callback: () => void) => {
-    const subscription = () => callback();
+  onSettingsWindowShown: (callback: (panel: 'settings' | 'courses' | 'modes') => void) => {
+    const subscription = (_: any, panel: 'settings' | 'courses' | 'modes' = 'settings') => callback(panel);
     ipcRenderer.on('settings-window-shown', subscription);
     return () => {
       ipcRenderer.removeListener('settings-window-shown', subscription);

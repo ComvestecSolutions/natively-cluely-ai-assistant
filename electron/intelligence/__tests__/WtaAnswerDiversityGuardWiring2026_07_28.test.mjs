@@ -16,13 +16,17 @@
 // answerDiversityGuard flag, so flag-ON now delivers what its own name promises.
 //
 // These tests exercise the REAL compiled applyAnswerContract/AnswerDiversityGuard directly
-// (not a re-run of the engine), pinning the contract IntelligenceEngine now relies on.
+// and execute the on-disk manager/engine reset paths against real guard/session storage.
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+import vm from 'node:vm';
+import ts from 'typescript';
+import { transformSync } from 'esbuild';
 
 import {
   applyAnswerContract,
@@ -180,21 +184,79 @@ describe('IntelligenceEngine source wiring (static check — no engine instantia
   });
 });
 
-describe('IntelligenceManager source wiring (static check)', () => {
-  const managerSrc = fs.readFileSync(path.resolve(__dirname, '../../IntelligenceManager.ts'), 'utf8');
+describe('IntelligenceManager reset behavior through the real reset paths', () => {
+  const require = createRequire(import.meta.url);
+  const { SessionTracker } = require('../../../dist-electron/electron/SessionTracker.js');
+  const conversationStore = require('../../../dist-electron/electron/context-intelligence/question/conversation-state-store.js');
 
-  test('reset() (genuine session teardown) calls engine.clearWtaDiversityHistory()', () => {
-    const resetStart = managerSrc.indexOf('reset(): void {');
-    assert.ok(resetStart >= 0, 'IntelligenceManager.reset() should exist');
-    const resetBody = managerSrc.slice(resetStart, managerSrc.indexOf('\n    }', resetStart));
-    assert.match(resetBody, /this\.engine\.clearWtaDiversityHistory\(\)/);
+  function bindResetMethods(receiver, filename, names) {
+    const source = ts.createSourceFile(filename, fs.readFileSync(path.resolve(__dirname, filename), 'utf8'), ts.ScriptTarget.Latest, true);
+    const declaration = source.statements.find(ts.isClassDeclaration);
+    assert.ok(declaration, `reset owner class missing: ${filename}`);
+    for (const name of names) {
+      const method = declaration.members.find(node => ts.isMethodDeclaration(node) && node.name.getText(source) === name);
+      assert.ok(method, `production reset method missing: ${name}`);
+      const text = method.getText(source).replace(/^(?:public|private)\s+/, '');
+      const js = transformSync(`(function ${text})`, { loader: 'ts', target: 'es2022' }).code;
+      receiver[name] = vm.runInNewContext(js, {
+        Date, clearTimeout,
+        require: id => {
+          assert.equal(id, './context-intelligence/question/conversation-state-store');
+          return conversationStore;
+        },
+      }).bind(receiver);
+    }
+  }
+
+  function rig() {
+    const guard = new AnswerDiversityGuard(20);
+    const session = new SessionTracker();
+    const stream = new AbortController();
+    const engine = {
+      wtaDiversityGuard: guard, activeMode: 'what_to_say', currentGenerationId: 7,
+      whatToAnswerCancellationToken: stream,
+      whatToAnswerBackgroundCancellationTokens: new Set(),
+      currentSessionId: 'meeting-1', currentDynamicActionModeId: 'technical',
+      currentDynamicActionTemplateType: 'technical_interview', meetingConversationId: 'meeting-1',
+    };
+    bindResetMethods(engine, '../../IntelligenceEngine.ts', ['reset', 'clearWtaDiversityHistory', 'resetConversationState']);
+    const manager = { engine, session, emit() {} };
+    bindResetMethods(manager, '../../IntelligenceManager.ts', ['reset', 'resetEngine']);
+    session.addTranscript({ speaker: 'interviewer', text: 'Old conversation', timestamp: Date.now(), final: true });
+    assert.equal(session.getFullTranscript().length, 1, 'seed must contain a stored turn before either reset');
+    const answer = 'I would frame it as ownership of the migration from design through rollout.';
+    const answerType = 'behavioral_question_answer';
+    guard.record(answer, answerType, 'Describe your ownership style.');
+    const repetition = () => guard.check(answer, answerType, 'Tell me about a difficult production incident.').repeated;
+    assert.equal(repetition(), true, 'seed must detect repetition before either reset');
+    return { manager, engine, session, guard, stream, repetition };
+  }
+
+  test('reset() clears diversity history, turns and in-flight work while preserving mode/session bindings', () => {
+    const { manager, engine, session, guard, stream, repetition } = rig();
+    manager.reset();
+    assert.equal(guard.size, 0, 'genuine session teardown must clear the actual guard');
+    assert.equal(repetition(), false, 'the next chat must not collide with an old answer');
+    assert.equal(session.getFullTranscript().length, 0);
+    assert.equal(session.getContextEpoch(), 1);
+    assert.equal(stream.signal.aborted, true);
+    assert.equal(engine.currentGenerationId, 8);
+    assert.equal(engine.activeMode, 'idle');
+    assert.equal(engine.currentSessionId, 'meeting-1');
+    assert.equal(engine.currentDynamicActionModeId, 'technical');
+    assert.equal(engine.currentDynamicActionTemplateType, 'technical_interview');
+    assert.equal(engine.meetingConversationId, 'meeting-1');
   });
 
-  test('resetEngine() (API-key/provider swap) does NOT clear wtaDiversityGuard history', () => {
-    const start = managerSrc.indexOf('resetEngine(): void {');
-    assert.ok(start >= 0, 'resetEngine() should exist');
-    const body = managerSrc.slice(start, managerSrc.indexOf('\n    }', start));
-    assert.doesNotMatch(body, /clearWtaDiversityHistory|wtaDiversityGuard/,
-      'resetEngine() promises "WITHOUT touching session state" — the guard history must survive an API-key swap mid-meeting');
+  test('resetEngine() cancels in-flight work without clearing diversity history or session turns', () => {
+    const { manager, engine, session, guard, stream, repetition } = rig();
+    manager.resetEngine();
+    assert.equal(guard.size, 1, 'provider-only reset must retain the actual guard history');
+    assert.equal(repetition(), true, 'the same meeting must still catch repeated answers');
+    assert.equal(session.getFullTranscript().length, 1);
+    assert.equal(session.getContextEpoch(), 0);
+    assert.equal(stream.signal.aborted, true);
+    assert.equal(engine.currentGenerationId, 8);
+    assert.equal(engine.activeMode, 'idle');
   });
 });

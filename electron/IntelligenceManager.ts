@@ -459,9 +459,9 @@ export class IntelligenceManager extends EventEmitter {
     }
 
     reset(): void {
+        this.emit('conversation_reset');
+        this.engine.resetConversationState();
         this.session.reset();
-        this.engine.reset();
-        this.engine.clearWtaDiversityHistory();
         // V3 conversation state (referents, active topic, previous source ids)
         // outlived every reset: it is keyed by meeting id, and outside a
         // meeting that key is a constant, so an ad-hoc session accumulated

@@ -11,17 +11,20 @@ const compiled = ts.transpileModule(readFileSync(new URL('../courses/CoursePinBa
 
 // Executes the component's actual hooks and handlers with scheduled IPC and DOM
 // stand-ins. This tests renderer behavior, not Electron focus or native capture.
-function harness(initialCourses = []) {
+function harness(initialCourses = [], props = {}, initialPins = []) {
     const slots = [];
     const effects = [];
     const subscribers = new Set();
     const observers = [];
     const focus = [];
     const writes = [];
+    const popupCalls = [];
+    const shown = new Set();
+    const visibility = new Set();
     let cursor = 0;
     let tree;
     let list = initialCourses;
-    let pins = [];
+    let pins = initialPins;
     let listCalls = 0;
     let resolveWrite;
     let rejectWrite;
@@ -50,7 +53,12 @@ function harness(initialCourses = []) {
     const chip = { focus: () => focus.push('trigger') };
     const popover = { scrollHeight: 160, querySelector: () => ({ focus: () => focus.push('row') }) };
     const document = { ...target(), documentElement: panel };
-    const window = { ...target(), innerWidth: 600, innerHeight: 400, electronAPI: {
+    const window = { ...target(), screenX: 100, screenY: 100, innerWidth: 600, innerHeight: 400, electronAPI: {
+        toggleSettingsWindow: async (request) => { popupCalls.push(request); },
+        closeSettingsWindow: async () => { popupCalls.push('close'); },
+        onSettingsWindowShown: (callback) => { shown.add(callback); return () => shown.delete(callback); },
+        onSettingsVisibilityChange: (callback) => { visibility.add(callback); return () => visibility.delete(callback); },
+        getSettingsPopupState: async () => ({ panel: 'settings', isVisible: false }),
         coursesList: async () => { ++listCalls; return typeof list === 'function' ? list() : list; },
     } };
     const sameDeps = (old, deps) => old && deps && deps.length === old.length && deps.every((value, i) => Object.is(value, old[i]));
@@ -114,7 +122,7 @@ function harness(initialCourses = []) {
     };
     const render = () => {
         cursor = 0;
-        tree = module.exports.default({ compact: true, panelRef: { current: panel } });
+        tree = module.exports.default({ compact: false, ...props, panelRef: { current: panel } });
         for (const node of nodes()) {
             if (node.props.ref) node.props.ref.current = node.props.role === 'dialog' ? popover : node.type === 'button' ? chip : root;
         }
@@ -131,7 +139,9 @@ function harness(initialCourses = []) {
     const open = async () => { button().props.onClick(); render(); await settle(); };
     render();
     return {
-        window, document, observers, focus, writes, subscribers, nodes, button, rows, render, settle, open,
+        window, document, observers, focus, writes, subscribers, nodes, button, rows, render, settle, open, popupCalls,
+                show(panel) { for (const callback of shown) callback(panel); },
+                visibility(visible, panel) { for (const callback of visibility) callback(visible, panel); },
         setList(value) { list = value; },
         setPins(value) { pins = value; },
         get listCalls() { return listCalls; },
@@ -146,6 +156,46 @@ function harness(initialCourses = []) {
         unmount() { slots.forEach((slot) => slot?.cleanup?.()); },
     };
 }
+
+test('compact chat control is icon-only, anchors below chat, and tracks only the courses panel', async () => {
+    const h = harness([{ id: 'one', enabled: true }], { compact: true });
+    await h.settle();
+    assert.equal(h.button().props['aria-label'], 'Courses, 1 selected');
+    assert.equal(h.rows().length, 0);
+    assert.equal(h.nodes().some((node) => node.props.role === 'dialog'), false);
+    assert.equal(h.button().children.some((child) => typeof child === 'string'), false, 'no visible label/chevron');
+    h.button().props.onClick({ currentTarget: { getBoundingClientRect: () => ({ left: 250 }) } });
+    assert.equal(JSON.stringify(h.popupCalls[0]), JSON.stringify({ panel: 'courses', x: 350, y: 508 }));
+    h.visibility(true, 'courses'); h.render();
+    assert.equal(h.button().props['aria-expanded'], true);
+    h.visibility(true, 'settings'); h.render();
+    assert.equal(h.button().props['aria-expanded'], false);
+    h.visibility(false, 'courses'); h.render();
+    assert.equal(h.button().props['aria-expanded'], false);
+    h.unmount();
+});
+
+test('actual popup content refreshes on every courses show, with acknowledged toggles and shared pins', async () => {
+    const h = harness([{ id: 'legacy', enabled: false }], { popupContent: true }, ['legacy']);
+    await h.settle();
+    assert.equal(h.button(), undefined, 'the shared shell owns the popup, not an inline trigger');
+    assert.equal(h.rows()[0].props['aria-checked'], true);
+    h.show('settings'); await h.settle();
+    assert.equal(h.listCalls, 1);
+    h.show('courses'); await h.settle();
+    assert.equal(h.listCalls, 2);
+    h.rows()[0].props.onClick(); h.render();
+    assert.deepEqual(h.writes, [['legacy', false]]);
+    assert.equal(h.rows()[0].props['aria-checked'], true);
+    h.succeed('legacy', false); await h.settle();
+    assert.equal(h.rows()[0].props['aria-checked'], false);
+    h.setList([{ id: 'new', enabled: true }]);
+    h.show('courses'); await h.settle();
+    assert.equal(h.rows()[0].props['aria-label'], 'new');
+    h.nodes().find((node) => node.props['aria-label'] === 'Close courses').props.onClick();
+    assert.deepEqual(h.popupCalls, ['close']);
+    h.unmount();
+});
 
 test('actual component refreshes on every open and shared notifications update mounted rows', async () => {
     const h = harness([{ id: 'one', name: 'Course one', enabled: true }, { id: 'legacy', enabled: false }]);

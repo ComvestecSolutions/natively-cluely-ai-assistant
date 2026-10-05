@@ -21,6 +21,7 @@ const labelFor = (course: PinnableCourse): string =>
 
 interface CoursePinBarProps {
     compact?: boolean;
+    popupContent?: boolean;
     panelRef?: React.RefObject<HTMLElement | null>;
     interfaceTheme?: MeetingInterfaceTheme;
     surfaceStyle?: React.CSSProperties;
@@ -35,13 +36,14 @@ interface PopoverPosition {
 }
 
 const CoursePinBar: React.FC<CoursePinBarProps> = ({
-    compact = false, panelRef, interfaceTheme = 'default', surfaceStyle, controlStyle,
+    compact = false, popupContent = false, panelRef, interfaceTheme = 'default', surfaceStyle, controlStyle,
 }) => {
     const [courses, setCourses] = useState<PinnableCourse[]>([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [writeError, setWriteError] = useState<string | null>(null);
     const [open, setOpen] = useState(false);
+    const [popupOpen, setPopupOpen] = useState(false);
     const [pins, setPins] = useState<string[]>(getCoursePinIds);
     const [pending, setPending] = useState<string[]>([]);
     const [position, setPosition] = useState<PopoverPosition | null>(null);
@@ -98,6 +100,27 @@ const CoursePinBar: React.FC<CoursePinBarProps> = ({
     useEffect(() => {
         if (open) void refresh();
     }, [open, refresh]);
+
+    useEffect(() => {
+        if (!popupContent) return;
+        return window.electronAPI?.onSettingsWindowShown?.((panel) => {
+            if (panel === 'courses') void refresh();
+        });
+    }, [popupContent, refresh]);
+
+    useEffect(() => {
+        if (!compact) return;
+        let alive = true;
+        let revision = 0;
+        const unsubscribe = window.electronAPI?.onSettingsVisibilityChange?.((visible, panel) => {
+            ++revision;
+            setPopupOpen(visible && panel === 'courses');
+        });
+        window.electronAPI?.getSettingsPopupState?.().then((state) => {
+            if (alive && revision === 0) setPopupOpen(state.isVisible && state.panel === 'courses');
+        }).catch(() => {});
+        return () => { alive = false; unsubscribe?.(); };
+    }, [compact]);
 
     useEffect(() => {
         if (!open) return;
@@ -194,7 +217,91 @@ const CoursePinBar: React.FC<CoursePinBarProps> = ({
 
     const notice = writeError ?? error;
     const activeCount = courses.filter((course) => isCourseGroundingEnabled(course, pins)).length;
-    const close = () => { setOpen(false); chipRef.current?.focus(); };
+    const close = () => {
+        if (popupContent) { void window.electronAPI?.closeSettingsWindow?.(); return; }
+        setOpen(false); chipRef.current?.focus();
+    };
+
+    if (compact) {
+        const togglePopup = (button: HTMLButtonElement) => {
+            const panel = panelRef?.current;
+            if (!panel) return;
+            const anchor = button.getBoundingClientRect();
+            window.electronAPI?.toggleSettingsWindow?.({
+                panel: 'courses',
+                x: window.screenX + anchor.left,
+                y: window.screenY + panel.getBoundingClientRect().bottom + 8,
+            }).catch(() => {});
+        };
+        return (
+            <button
+                type="button"
+                data-course-toggle="true"
+                data-stealth-ignore="true"
+                aria-label={`Courses, ${activeCount} selected`}
+                aria-expanded={popupOpen}
+                aria-haspopup="dialog"
+                data-state={popupOpen ? 'open' : undefined}
+                onClick={(event) => togglePopup(event.currentTarget)}
+                onKeyDown={(event) => {
+                    if (event.key !== 'ArrowDown' || popupOpen) return;
+                    event.preventDefault();
+                    togglePopup(event.currentTarget);
+                }}
+                className="relative no-drag w-7 h-7 shrink-0 rounded-[9px] flex items-center justify-center interaction-base interaction-press overlay-bare-icon focus-visible:ring-2 focus-visible:ring-accent-focus"
+            >
+                <BookOpen size={14} aria-hidden="true" />
+                {activeCount > 0 && <span aria-hidden="true" className="absolute right-1 top-1 h-1 w-1 rounded-full bg-accent-primary" />}
+            </button>
+        );
+    }
+
+    const courseContent = (
+        <>
+            <div className="flex items-center justify-between gap-2 px-2 pt-1 pb-0.5">
+                <span className="text-[11px] font-medium overlay-text-muted">Chat courses</span>
+                <button type="button" aria-label="Close courses" onClick={close} className="no-drag flex h-6 w-6 items-center justify-center rounded-lg overlay-bare-icon focus-visible:ring-2 focus-visible:ring-accent-focus">
+                    <X size={12} aria-hidden="true" />
+                </button>
+            </div>
+            <p className="px-2 pb-1.5 text-[11px] overlay-text-muted">Use selected courses as ground-truth context.</p>
+            {loading && <p role="status" className="px-2 py-2 text-xs overlay-text-muted">Refreshing courses…</p>}
+            {notice && (
+                <div className="px-2 py-2 text-xs">
+                    <p role="alert">{notice}</p>
+                    <button type="button" data-course-retry="true" onClick={() => { setWriteError(null); void refresh(); }} className="no-drag mt-1 rounded-md px-2 py-1 overlay-control-surface focus-visible:ring-2 focus-visible:ring-accent-focus">Try again</button>
+                </div>
+            )}
+            {!loading && !notice && courses.length === 0 && (
+                <p role="status" className="px-2 py-2 text-xs overlay-text-muted">No courses yet. Import a course in Courses Studio in the launcher.</p>
+            )}
+            {courses.map((course) => {
+                const checked = isCourseGroundingEnabled(course, pins);
+                const busy = pending.includes(course.id);
+                return (
+                    <button
+                        key={course.id}
+                        type="button"
+                        role="switch"
+                        aria-label={labelFor(course)}
+                        aria-checked={checked}
+                        aria-busy={busy}
+                        disabled={busy || loading}
+                        onClick={() => { void toggleCourse(course); }}
+                        className={`no-drag h-[30px] shrink-0 w-full px-2 flex items-center gap-2 rounded-[10px] select-none text-left focus-visible:ring-2 focus-visible:ring-accent-focus disabled:opacity-45 transition-colors ${isDarkBg ? 'hover:bg-white/[0.07]' : 'hover:bg-black/[0.05]'} glass-popup-row`}
+                    >
+                        <BookOpen size={14} aria-hidden="true" className={`shrink-0 ${checked ? '' : isDarkBg ? 'text-white/55' : 'text-slate-500'}`} />
+                        <span className="flex-1 min-w-0 truncate text-[12px] font-medium">{labelFor(course)}</span>
+                        <span aria-hidden="true" data-on={String(checked)} className={`t-toggle t-toggle-sm shrink-0 ${checked ? 'bg-accent-primary shadow-[0_2px_10px_var(--accent-shadow-20)]' : isDarkBg ? 'bg-white/10 glass-toggle-track' : 'bg-black/[0.22] glass-toggle-track'}`}>
+                            <span className="t-toggle-thumb" />
+                        </span>
+                    </button>
+                );
+            })}
+        </>
+    );
+
+    if (popupContent) return courseContent;
 
     return (
         <div ref={rootRef} className="relative inline-flex no-drag text-left" data-stealth-ignore="true">
@@ -236,46 +343,7 @@ const CoursePinBar: React.FC<CoursePinBarProps> = ({
                         exit={{ opacity: 0, pointerEvents: 'none' }}
                         transition={{ duration: reduceMotion ? 0 : 0.16 }}
                     >
-                        <div className="flex items-center justify-between gap-2 px-2 pt-1 pb-0.5">
-                            <span className="text-[11px] font-medium overlay-text-muted">Chat courses</span>
-                            <button type="button" aria-label="Close courses" onClick={close} className="no-drag flex h-6 w-6 items-center justify-center rounded-lg overlay-bare-icon focus-visible:ring-2 focus-visible:ring-accent-focus">
-                                <X size={12} aria-hidden="true" />
-                            </button>
-                        </div>
-                        <p className="px-2 pb-1.5 text-[11px] overlay-text-muted">Use selected courses as ground-truth context.</p>
-                        {loading && <p role="status" className="px-2 py-2 text-xs overlay-text-muted">Refreshing courses…</p>}
-                        {notice && (
-                            <div className="px-2 py-2 text-xs">
-                                <p role="alert">{notice}</p>
-                                <button type="button" data-course-retry="true" onClick={() => { setWriteError(null); void refresh(); }} className="no-drag mt-1 rounded-md px-2 py-1 overlay-control-surface focus-visible:ring-2 focus-visible:ring-accent-focus">Try again</button>
-                            </div>
-                        )}
-                        {!loading && !notice && courses.length === 0 && (
-                            <p role="status" className="px-2 py-2 text-xs overlay-text-muted">No courses yet. Import a course in Courses Studio in the launcher.</p>
-                        )}
-                        {courses.map((course) => {
-                            const checked = isCourseGroundingEnabled(course, pins);
-                            const busy = pending.includes(course.id);
-                            return (
-                                <button
-                                    key={course.id}
-                                    type="button"
-                                    role="switch"
-                                    aria-label={labelFor(course)}
-                                    aria-checked={checked}
-                                    aria-busy={busy}
-                                    disabled={busy || loading}
-                                    onClick={() => { void toggleCourse(course); }}
-                                    className={`no-drag h-[30px] w-full px-2 flex items-center gap-2 rounded-[10px] select-none text-left focus-visible:ring-2 focus-visible:ring-accent-focus disabled:opacity-45 transition-colors ${isDarkBg ? 'hover:bg-white/[0.07]' : 'hover:bg-black/[0.05]'} glass-popup-row`}
-                                >
-                                    <BookOpen size={14} aria-hidden="true" className={`shrink-0 ${checked ? '' : isDarkBg ? 'text-white/55' : 'text-slate-500'}`} />
-                                    <span className="flex-1 min-w-0 truncate text-[12px] font-medium">{labelFor(course)}</span>
-                                    <span aria-hidden="true" data-on={String(checked)} className={`t-toggle t-toggle-sm shrink-0 ${checked ? 'bg-accent-primary shadow-[0_2px_10px_var(--accent-shadow-20)]' : isDarkBg ? 'bg-white/10 glass-toggle-track' : 'bg-black/[0.22] glass-toggle-track'}`}>
-                                        <span className="t-toggle-thumb" />
-                                    </span>
-                                </button>
-                            );
-                        })}
+                        {courseContent}
                     </motion.div>
                 )}
             </AnimatePresence>

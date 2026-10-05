@@ -1,6 +1,8 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import fs from 'node:fs';
+import Module from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { performance } from 'node:perf_hooks';
 
@@ -8,7 +10,14 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const modesPath = path.resolve(__dirname, '../../../dist-electron/electron/services/ModesManager.js');
 const promptsPath = path.resolve(__dirname, '../../../dist-electron/electron/llm/prompts.js');
 
-const modesMod = await import(pathToFileURL(modesPath).href);
+// Substitute the bundle's own database boundary, not just read methods: source
+// contract migration must write back to the same fixtures it reads. _compile is
+// in-memory only; the built bundle and repository source remain unchanged.
+const modesBundle = new Module(modesPath);
+modesBundle.filename = modesPath;
+modesBundle.paths = Module._nodeModulePaths(path.dirname(modesPath));
+modesBundle._compile(fs.readFileSync(modesPath, 'utf8') + '\nmodule.exports.fixtureDatabase = DatabaseManager;', modesPath);
+const modesMod = modesBundle.exports;
 const promptsMod = await import(pathToFileURL(promptsPath).href);
 
 const { ModesManager, MODE_TEMPLATES, TEMPLATE_NOTE_SECTIONS } = modesMod;
@@ -77,6 +86,7 @@ function makeDb({ modes = [], files = [] } = {}) {
       if (updates.name !== undefined) mode.name = updates.name;
       if (updates.templateType !== undefined) mode.template_type = updates.templateType;
       if (updates.customContext !== undefined) mode.custom_context = updates.customContext;
+      if (updates.sourceContractJson !== undefined) mode.source_contract_json = updates.sourceContractJson;
     },
     deleteMode(id) {
       this.modes = this.modes.filter(mode => mode.id !== id);
@@ -100,6 +110,7 @@ function makeDb({ modes = [], files = [] } = {}) {
 
 function installDb(dbState) {
   db = dbState;
+  modesMod.fixtureDatabase.getInstance = () => db;
   const manager = ModesManager.getInstance();
   manager.getActiveMode = () => {
     const row = db.getActiveMode();

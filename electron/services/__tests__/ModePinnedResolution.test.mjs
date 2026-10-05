@@ -7,7 +7,8 @@
 //   - a pinned id wins over the (possibly switched) live active mode,
 //   - a deleted pinned id falls back to the active mode,
 //   - no pin → live active mode (every existing caller, behavior unchanged),
-//   - the prompt-suffix / pinned-instructions builders forward the pinned id.
+//   - the prompt-suffix / pinned-instructions builders forward the pinned id,
+//   - hybrid lexical fallback retains the request's captured mode across awaits.
 //
 // resolveMode references only this.getModes()/this.getActiveMode(), so we test it
 // on a hand-built `this` via prototype-apply (the class ctor needs Electron's DB).
@@ -23,6 +24,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const modPath = path.resolve(__dirname, '../../../dist-electron/electron/services/ModesManager.js');
 const { ModesManager } = await import(pathToFileURL(modPath).href);
+const { ModeContextRetriever } = await import(pathToFileURL(path.join(path.dirname(modPath), 'ModeContextRetriever.js')).href);
+const { buildWhatToAnswerRequestSnapshot } = await import(pathToFileURL(path.resolve(path.dirname(modPath), '../llm/whatToAnswerRequestSnapshot.js')).href);
 
 const TI = { id: 'mode_ti', templateType: 'technical-interview', name: 'TI', customContext: '', isActive: true, createdAt: '' };
 const SALES = { id: 'mode_sales', templateType: 'general', name: 'Sales', customContext: 'Pitch hard.', isActive: false, createdAt: '' };
@@ -79,12 +82,74 @@ describe('the prompt builders forward the pinned id to resolveMode (source guard
     const suffix = src.slice(src.indexOf('getActiveModeSystemPromptSuffix(pinnedModeId'));
     assert.match(suffix.slice(0, 200), /this\.resolveMode\(pinnedModeId\)/);
   });
+});
 
-  test('the hybrid lexical fallback forwards the same pinned id', () => {
-    // Inside buildRetrievedActiveModeContextBlockHybrid, the lexical fallback must
-    // pass pinnedModeId through so the fallback path pins the same mode.
-    // The fallback forwards pinnedModeId; a trailing retrievalOptions arg
-    // (round-6) may follow it.
-    assert.match(src, /buildRetrievedActiveModeContextBlock\(\s*query, transcript, tokenBudget, answerType, excludeCustomContext, pinnedModeId(, retrievalOptions)?\s*\)/);
-  });
+describe('hybrid lexical fallback keeps the request mode across awaits', () => {
+  for (const pinned of [true, false]) {
+    for (const forceDocumentGrounding of [false, true]) {
+      for (const outcome of ['empty', 'throw']) {
+        test(`${pinned ? 'snapshot pin' : 'captured active mode'} / ${forceDocumentGrounding ? 'document-grounded' : 'standard'} / ${outcome}`, { timeout: 5000 }, async t => {
+          let activeMode = TI;
+          const files = [TI, SALES].map(mode => ({
+            id: `ref_${mode.id}`, modeId: mode.id, fileName: `${mode.id}.md`, createdAt: '',
+            content: `Quasar handoff protocol: ${mode.id === TI.id ? 'TI_ONLY_EVIDENCE' : 'SALES_ONLY_EVIDENCE'}. Validate the quasar handoff before release.`,
+          }));
+          const ctx = Object.assign(Object.create(ModesManager.prototype), {
+            getActiveMode: () => activeMode,
+            getModes: () => [TI, SALES],
+            getActiveModeInfo: () => ({ id: activeMode.id, templateType: activeMode.templateType, name: activeMode.name }),
+            getReferenceFiles: id => files.filter(file => file.modeId === id),
+            modeContextRetriever: new ModeContextRetriever(),
+          });
+          const snapshot = buildWhatToAnswerRequestSnapshot({
+            modeReader: ctx, requestId: 'pinned-fallback-test', generationId: 1,
+          });
+          assert.ok(Object.isFrozen(snapshot));
+          assert.equal(snapshot.modeUniqueId, TI.id);
+          assert.equal(snapshot.modeId, TI.templateType);
+
+          let release;
+          let entered;
+          const pending = new Promise(resolve => { release = resolve; });
+          const started = new Promise(resolve => { entered = resolve; });
+          t.after(() => release());
+          const hybrid = t.mock.method(ctx.modeContextRetriever, 'retrieveHybrid', async () => {
+            entered();
+            await pending;
+            if (outcome === 'throw') throw new Error('fixture hybrid outage');
+            return { formattedContext: '', chunks: [], usedFallback: true, usedHybrid: false };
+          });
+          const lexical = t.mock.method(ctx.modeContextRetriever, 'retrieve');
+          const fallback = t.mock.method(ctx, 'buildRetrievedActiveModeContextBlock');
+          const retrievalOptions = { forceDocumentGrounding, followUpReferentHint: 'Quasar handoff' };
+          const result = ctx.buildRetrievedActiveModeContextBlockHybrid(
+            'quasar handoff protocol', 'Discuss the quasar handoff.', 1024,
+            'coding_question_answer', true, pinned ? snapshot.modeUniqueId : undefined, false, retrievalOptions,
+          );
+          await started;
+          assert.equal(hybrid.mock.callCount(), 1);
+          assert.equal(hybrid.mock.calls[0].arguments[0].id, TI.id);
+          assert.deepEqual(hybrid.mock.calls[0].arguments[1].map(file => file.modeId), [TI.id]);
+          assert.equal(fallback.mock.callCount(), 0, 'fallback must not run before the await completes');
+          assert.equal(ctx.getActiveMode().id, TI.id);
+          activeMode = SALES;
+          release();
+
+          const context = await result;
+          assert.equal(ctx.getActiveMode().id, SALES.id, 'the live mode really switched');
+          assert.equal(snapshot.modeUniqueId, TI.id, 'the request snapshot did not switch');
+          assert.equal(fallback.mock.callCount(), 1);
+          assert.deepEqual(fallback.mock.calls[0].arguments, [
+            'quasar handoff protocol', 'Discuss the quasar handoff.', 1024,
+            'coding_question_answer', true, TI.id, retrievalOptions,
+          ], 'fallback preserves the captured mode and every retrieval argument');
+          assert.equal(lexical.mock.callCount(), 1);
+          assert.equal(lexical.mock.calls[0].arguments[0].id, TI.id);
+          assert.deepEqual(lexical.mock.calls[0].arguments[1].map(file => file.modeId), [TI.id]);
+          assert.match(context, /TI_ONLY_EVIDENCE/, 'real lexical retrieval keeps request-mode evidence');
+          assert.doesNotMatch(context, /SALES_ONLY_EVIDENCE|Pitch hard\./, 'switched-mode evidence must not bleed');
+        });
+      }
+    }
+  }
 });

@@ -12,6 +12,8 @@ import {
     OVERLAY_OPACITY_DEFAULT,
 } from '../lib/overlayAppearance';
 import { useToggleInit } from './settings/useToggleInit';
+import CoursePinBar from './courses/CoursePinBar';
+import ModePicker from './modes/ModePicker';
 
 /**
  * The quick-settings popup's switch (`sm` variant: a 30x13.64 track — the
@@ -70,6 +72,39 @@ const PopupToggle: React.FC<{
 };
 
 const SettingsPopup = () => {
+    const [panel, setPanel] = useState<'settings' | 'courses' | 'modes'>('settings');
+    const [heightBudget, setHeightBudget] = useState(330);
+    useEffect(() => {
+        let alive = true;
+        let revision = 0;
+        let budgetRevision = 0;
+        const unsubscribeBudget = window.electronAPI?.onSettingsPopupHeightBudget?.((height) => {
+            ++budgetRevision;
+            setHeightBudget(height);
+        });
+        const unsubscribe = window.electronAPI?.onSettingsWindowShown?.((selectedPanel) => {
+            ++revision;
+            setPanel(selectedPanel);
+        });
+        window.electronAPI?.getSettingsPopupState?.().then((state) => {
+            if (!alive) return;
+            if (revision === 0) setPanel(state.panel);
+            if (budgetRevision === 0) setHeightBudget(state.heightBudget);
+        }).catch(() => {});
+        const onKeyDown = (event: KeyboardEvent) => {
+            if (event.key !== 'Escape') return;
+            event.preventDefault();
+            event.stopPropagation();
+            void window.electronAPI?.closeSettingsWindow?.();
+        };
+        document.addEventListener('keydown', onKeyDown, true);
+        return () => {
+            alive = false;
+            unsubscribe?.();
+            unsubscribeBudget?.();
+            document.removeEventListener('keydown', onKeyDown, true);
+        };
+    }, []);
     const { shortcuts } = useShortcuts();
     const isLightTheme = useResolvedTheme() === 'light';
     const [isUndetectable, setIsUndetectable] = useState(false);
@@ -423,10 +458,20 @@ const SettingsPopup = () => {
         <div className="w-fit h-fit bg-transparent flex flex-col">
             <div
                 ref={contentRef}
-                className={`w-[180px] backdrop-blur-md border rounded-[14px] overflow-hidden p-1 flex flex-col origin-top-left overlay-shell-surface overlay-popover-surface ${popupPanelClass}`}
+                role="dialog"
+                aria-label={panel === 'courses' ? 'Courses' : panel === 'modes' ? 'Modes' : 'Quick settings'}
+                data-popup-panel={panel}
+                className={`w-[180px] backdrop-blur-md border rounded-[14px] overflow-hidden p-1 flex flex-col origin-top-left overlay-shell-surface overlay-popover-surface ${popupPanelClass} ${labelColorClass}`}
                 style={{ ...appearance.shellStyle }}
             >
                 <div className="relative z-[1] flex flex-col">
+                    {panel !== 'settings' ? (
+                        <div className="overflow-y-auto overscroll-contain" style={{ maxHeight: Math.max(0, Math.min(320, heightBudget - 10)) }}>
+                            {panel === 'courses'
+                                ? <CoursePinBar popupContent interfaceTheme={interfaceTheme} />
+                                : <ModePicker interfaceTheme={interfaceTheme} />}
+                        </div>
+                    ) : <>
                     {renderToggleRow({
                         key: 'undetectable',
                         icon: <CustomGhost className={iconClass} />,
@@ -523,6 +568,7 @@ const SettingsPopup = () => {
                         label: 'Screenshot',
                         keys: shortcuts.takeScreenshot || [getModifierSymbol('cmd'), 'H'],
                     })}
+                    </>}
                 </div>
             </div>
         </div>

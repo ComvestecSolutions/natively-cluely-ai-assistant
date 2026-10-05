@@ -18,7 +18,7 @@ test('one Courses control is owned by the chat shell toolbar, beside model and s
     const controls = walk(ast, (node) => ts.isJsxSelfClosingElement(node) && node.tagName.getText(ast) === 'CoursePinBar');
     assert.equal(controls.length, 1);
     const control = controls[0];
-    assert.match(control.getText(ast), /panelRef=\{shellRef\}/);
+    assert.match(control.getText(ast), /panelRef=\{contentRef\}/);
     assert.match(control.getText(ast), /surfaceStyle=\{appearance.shellStyle\}/);
     assert.match(control.getText(ast), /controlStyle=\{appearance.controlStyle\}/);
     let parent = control.parent;
@@ -39,11 +39,13 @@ test('one Courses control is owned by the chat shell toolbar, beside model and s
     assert.ok(control.pos > chat.indexOf('<DynamicActionBar'), 'no standalone courses row above actions/transcript');
 });
 
-test('uses quick-settings material and compact switches, without importing a window lifecycle', () => {
+test('compact control delegates to the shared popup; launcher retains inline material and switches', () => {
     for (const token of ['overlay-shell-surface overlay-popover-surface', 't-toggle t-toggle-sm', 't-toggle-thumb', 'glass-popup-row', 'glass-toggle-track', 'h-[30px]', 'rounded-[14px]']) {
         assert.ok(component.includes(token), token);
     }
-    assert.doesNotMatch(component, /SettingsPopup|BrowserWindow|createPortal|toggleSettingsWindow|updateContentDimensions|setFocusable|setIgnoreMouseEvents/);
+    assert.match(component, /toggleSettingsWindow/);
+        assert.match(component, /panel: 'courses'/);
+        assert.doesNotMatch(component, /BrowserWindow|createPortal|updateContentDimensions|setFocusable|setIgnoreMouseEvents/);
     assert.doesNotMatch(component, /\btitle\s*=/, 'no native tooltip surfaces on protected overlays');
 });
 

@@ -1,7 +1,7 @@
 import { Mode, ModeReferenceFile } from './ModesManager';
 import { wordsOf } from './modes/lexicalTokens';
 import { normalizeLineEndings } from './modes/semanticChunker';
-import { ModeHybridRetriever, ModeRetrievedContext as HybridContext } from './modes/ModeHybridRetriever';
+import { ModeHybridRetriever, ModeRetrievedContext as HybridContext, invalidateModeReferenceIndexingPipeline } from './modes/ModeHybridRetriever';
 import { VectorStore } from '../rag/VectorStore';
 import { EmbeddingPipeline } from '../rag/EmbeddingPipeline';
 import { DatabaseManager } from '../db/DatabaseManager';
@@ -1713,8 +1713,13 @@ export class ModeContextRetriever {
      * Falls back to lexical-only if embedding provider is unavailable.
      */
     setSharedEmbeddingPipeline(pipeline: EmbeddingPipeline): void {
+        // esbuild inlines this class into independent upload/answer bundles.
+        // Share the application's pipeline, not a private uninitialized copy.
+        const shared = globalThis as unknown as { __nativelyModeEmbeddingPipelineV1__?: EmbeddingPipeline };
+        const previous = shared.__nativelyModeEmbeddingPipelineV1__;
+        if (previous && previous !== pipeline) invalidateModeReferenceIndexingPipeline(previous);
+        shared.__nativelyModeEmbeddingPipelineV1__ = pipeline;
         this._sharedEmbeddingPipeline = pipeline;
-        // Drop any retriever created before RAGManager injected the initialized pipeline.
         this._hybridRetriever = null;
     }
 
@@ -1756,6 +1761,12 @@ export class ModeContextRetriever {
      * path instead, and try again (cheaply — no allocation) on the next call.
      */
     private ensureHybridRetriever(): ModeHybridRetriever | null {
+        const pipeline = (globalThis as unknown as { __nativelyModeEmbeddingPipelineV1__?: EmbeddingPipeline })
+            .__nativelyModeEmbeddingPipelineV1__;
+        if (pipeline && pipeline !== this._sharedEmbeddingPipeline) {
+            this._sharedEmbeddingPipeline = pipeline;
+            this._hybridRetriever = null;
+        }
         if (this._hybridRetriever) return this._hybridRetriever;
         if (!this._sharedEmbeddingPipeline) {
             console.warn('[ModeContextRetriever] No shared EmbeddingPipeline injected yet — reference files will index as lexical_only until RAGManager finishes initializing.');
@@ -1814,7 +1825,20 @@ export class ModeContextRetriever {
 
     /** Drop a deleted file's persisted chunks + index state. */
     removeReferenceFileIndex(fileId: string): void {
-        this.ensureHybridRetriever()?.removeFileIndex(fileId);
+        const retriever = this.ensureHybridRetriever();
+        if (retriever) {
+            retriever.removeFileIndex(fileId);
+            return;
+        }
+        // Deletion is independent of embedding readiness. An earlier launch (or
+        // another bundle) may have persisted vectors even with no pipeline here.
+        const db = DatabaseManager.getInstance().getDb();
+        if (!db) return;
+        for (const table of ['mode_reference_chunks', 'mode_reference_index_state']) {
+            if (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)) {
+                db.prepare(`DELETE FROM ${table} WHERE file_id = ?`).run(fileId);
+            }
+        }
     }
 
     async retrieveHybrid(mode: Mode, files: ModeReferenceFile[], options: RetrieveOptions): Promise<HybridContext> {

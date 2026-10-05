@@ -49,7 +49,7 @@ process.env.NATIVELY_TEST_USERDATA = USERDATA;
 const base = path.resolve(process.cwd(), 'dist-electron/electron/context-intelligence');
 const { buildV3Prompt } = await import(pathToFileURL(path.join(base, 'orchestration/engine-bridge.js')).href);
 const { CONTEXT_INTELLIGENCE_V3_ENV_KEY } = await import(pathToFileURL(path.join(base, 'contracts/flag.js')).href);
-const { setStoredAnswerPolicy } = await import(pathToFileURL(path.join(base, 'policies/answer-policy-store.js')).href);
+const { setStoredAnswerPolicy, getStoredAnswerPolicy } = await import(pathToFileURL(path.join(base, 'policies/answer-policy-store.js')).href);
 
 const MODES = ['general', 'sales', 'recruiting', 'team-meet', 'looking-for-work',
   'technical-interview', 'lecture', 'seminar'];
@@ -97,18 +97,34 @@ const ANTI_FABRICATION = [
   /do not invent/i,
 ];
 
-const ask = (question, modeId, opts = {}) => buildV3Prompt({
-  surface: opts.surface ?? 'manual-chat', question, modeTemplateType: modeId, modeUniqueId: modeId,
-  attachedSourceCount: opts.attachedSourceCount ?? 0,
-  profileSourceCount: opts.profileSourceCount ?? 0,
-  attachedFileNames: (opts.attachedSourceCount ?? 0) ? ['handbook.pdf'] : [],
-  // An empty sweep over material that DOES exist — the "not covered by the
-  // attached file" case, which is unreachable while nothing is attached.
-  retrieval: { async retrieve() { return { evidence: [], attempts: [] }; } },
-  scope: { sessionId: `ap-${modeId}-${question.length}-${question.charCodeAt(0)}-${opts.surface ?? ''}${opts.attachedSourceCount ?? 0}${opts.profileSourceCount ?? 0}` },
-});
+// Immutable per-mode/policy snapshots exercise the real persisted-policy reader
+// without repeatedly replacing a file Windows may still be scanning. Policy
+// store mutation/atomicity has its own tests; this suite tests answer semantics.
+const policySnapshots = new Map();
+let selectedPolicy = null;
+const ask = (question, modeId, opts = {}) => {
+  const key = JSON.stringify([modeId, selectedPolicy]);
+  let dir = policySnapshots.get(key);
+  if (!dir) {
+    dir = fs.mkdtempSync(path.join(USERDATA, 'policy-'));
+    if (selectedPolicy !== null) setStoredAnswerPolicy(modeId, selectedPolicy, dir);
+    policySnapshots.set(key, dir);
+  }
+  process.env.NATIVELY_TEST_USERDATA = dir;
+  assert.equal(getStoredAnswerPolicy(modeId, dir), selectedPolicy);
+  return buildV3Prompt({
+    surface: opts.surface ?? 'manual-chat', question, modeTemplateType: modeId, modeUniqueId: modeId,
+    attachedSourceCount: opts.attachedSourceCount ?? 0,
+    profileSourceCount: opts.profileSourceCount ?? 0,
+    attachedFileNames: (opts.attachedSourceCount ?? 0) ? ['handbook.pdf'] : [],
+    // An empty sweep over material that DOES exist — the "not covered by the
+    // attached file" case, which is unreachable while nothing is attached.
+    retrieval: { async retrieve() { return { evidence: [], attempts: [] }; } },
+    scope: { sessionId: `ap-${modeId}-${question.length}-${question.charCodeAt(0)}-${opts.surface ?? ''}${opts.attachedSourceCount ?? 0}${opts.profileSourceCount ?? 0}` },
+  });
+};
 
-const setAll = (policy) => { for (const m of MODES) setStoredAnswerPolicy(m, policy, USERDATA); };
+const setAll = (policy) => { selectedPolicy = policy; };
 
 before(() => { process.env[CONTEXT_INTELLIGENCE_V3_ENV_KEY] = '1'; });
 after(() => { delete process.env[CONTEXT_INTELLIGENCE_V3_ENV_KEY]; });

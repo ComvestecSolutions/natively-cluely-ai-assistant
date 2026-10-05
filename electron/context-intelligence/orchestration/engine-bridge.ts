@@ -71,6 +71,8 @@ export function speechWindowContains(speech: string, answer: string): boolean {
 
 export interface BridgeInput {
   surface: AnswerSurface;
+  /** The caller's generation ownership; stale retrieval must not advance conversation state. */
+  isSuperseded?: () => boolean;
   /** The answer is read rather than said (the launcher's chat) — see
    *  ComposeInput.readingSurface. */
   readingSurface?: boolean;
@@ -275,7 +277,7 @@ export interface BridgeResult {
  */
 export async function buildV3Prompt(input: BridgeInput): Promise<BridgeResult | null> {
   try {
-    if (!isContextIntelligenceV3Enabled()) return null;
+    if (!isContextIntelligenceV3Enabled() || input.isSuperseded?.()) return null;
     const question = String(input.question || '').trim();
     if (!question) return null;
 
@@ -512,7 +514,8 @@ export async function buildV3Prompt(input: BridgeInput): Promise<BridgeResult | 
       } catch { /* continuity must never break a turn */ }
     }
 
-    const result = await orchestrate(req, input.retrieval);
+    const result = await orchestrate(req, input.retrieval, input.isSuperseded);
+    if (input.isSuperseded?.()) return null;
 
     // ── Outbound provider-data-scope filter ─────────────────────────────────
     // Settings > AI Providers > Privacy. Applied HERE — after retrieval, before

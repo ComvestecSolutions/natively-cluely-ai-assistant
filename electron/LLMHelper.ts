@@ -1192,6 +1192,7 @@ export class LLMHelper {
     // matched none of them — so a V3-composed payload was inferred to carry no
     // scope at all and no toggle was enforced on the shipped default path.
     scopes.push(...dataScopesForEvidenceMarkup(context));
+    if (/<evidence\b[^>]*\bprovenance="MODE_REFERENCE_FILE"/i.test(context)) scopes.push('reference_files');
     return [...new Set(scopes)];
   }
 
@@ -1205,6 +1206,7 @@ export class LLMHelper {
     // evidence in the MESSAGE (context is undefined), so this is the branch
     // that actually fires on the default path.
     scopes.push(...dataScopesForEvidenceMarkup(message));
+    if (/<evidence\b[^>]*\bprovenance="MODE_REFERENCE_FILE"/i.test(message)) scopes.push('reference_files');
     // V3 renders prior-turn continuity as a labelled prose section rather than
     // as evidence; it is CONVERSATION_STATE data, i.e. transcript scope.
     if (/^# Conversation so far$/m.test(message)) scopes.push('transcript');
@@ -1301,9 +1303,13 @@ export class LLMHelper {
       const removedScopes = new Set<ProviderDataScope>();
       scrubbed = scrubbed.replace(/<evidence\b[^>]*>[\s\S]*?<\/evidence>\s*/gi, (block) => {
         const match = /\bsource_type="([A-Za-z_]+)"/.exec(block);
-        if (match && deniedSourceTypes.has(match[1])) {
+        const modeReferenceDenied = deniedScopes.includes('reference_files')
+          && /\bprovenance="MODE_REFERENCE_FILE"/i.test(block.slice(0, block.indexOf('>')));
+        const typeDenied = Boolean(match && deniedSourceTypes.has(match[1]));
+        if (modeReferenceDenied || typeDenied) {
           removed += 1;
-          const scope = dataScopeForSourceType(match[1]);
+          if (modeReferenceDenied) removedScopes.add('reference_files');
+          const scope = match && typeDenied ? dataScopeForSourceType(match[1]) : undefined;
           if (scope) removedScopes.add(scope);
           return '';
         }
@@ -1559,7 +1565,7 @@ export class LLMHelper {
     if (hasOnDeviceScreenText(text) && !this.outboundLabelIsOnDevice(provider)) {
       throw new VisionPolicyError(provider, ON_DEVICE_SCREEN_REFUSED_MESSAGE);
     }
-    assertProviderDataScopes(provider, this.scopesForPayload(text, imagePaths, extraScopes), this.getProviderScopePolicy());
+    assertProviderDataScopes(provider, this.scopesForPayload(text, imagePaths, [...extraScopes, ...this.inferEmbeddedMessageScopes(text)]), this.getProviderScopePolicy());
   }
 
   /** Is this outbound label a provider on this device? Only a custom or cURL endpoint can be; every named provider is hosted. */
@@ -9448,17 +9454,44 @@ let isMultimodal = !!(imagePaths?.length);
   public streamRAGAnswer(
     ...args: Parameters<LLMHelper['_streamChatInner']>
   ): { stream: AsyncGenerator<string, void, unknown>; outcome: StreamOutcome } {
+    return this.captureRAGAnswerTransport().streamRAGAnswer(...args);
+  }
+
+  /** Bind endpoint classification and dispatch before asynchronous grounding.
+   * Privacy settings remain live and are rechecked at the outbound boundary. */
+  public captureRAGAnswerTransport(): Readonly<Pick<LLMHelper, 'streamRAGAnswer' | 'selectionStaysOnDevice'>> {
     const view: LLMHelper = Object.create(this);
     view.currentModelId = this.currentModelId;
     view.useOllama = this.useOllama;
     view.ollamaModel = this.ollamaModel;
+    view.ollamaUrl = this.ollamaUrl;
+    // Selection is immutable, but a privacy prohibition remains live and may
+    // only narrow this turn, including a subsequent dispatch or retry.
+    let localOnlyRequired = this.isLocalOnlyMode;
+    Object.defineProperty(view, 'isLocalOnlyMode', {
+      get: () => (localOnlyRequired ||= this.isLocalOnlyMode),
+    });
+    const deniedScopes = new Set<ProviderDataScope>();
+    view.getProviderScopePolicy = () => {
+      const policy = this.getProviderScopePolicy();
+      for (const scope of Object.keys(policy ?? {}) as ProviderDataScope[]) {
+        if (policy?.[scope] === false) deniedScopes.add(scope);
+      }
+      return deniedScopes.size
+        ? { ...policy, ...Object.fromEntries([...deniedScopes].map(scope => [scope, false])) }
+        : policy;
+    };
+    view.getProviderScopePolicy();
     view.customProvider = this.customProvider ? Object.freeze({ ...this.customProvider }) : null;
     view.activeCurlProvider = this.activeCurlProvider ? Object.freeze({ ...this.activeCurlProvider }) : null;
     view.groqFastTextMode = false;
     view._fastTurn = undefined;
     view._fastTurns = new WeakMap();
     view._ragSelectedProviderOnly = true;
-    return view.streamChatWithOutcome(...args);
+    return Object.freeze({
+      selectionStaysOnDevice: () => view.selectionStaysOnDevice(),
+      streamRAGAnswer: (...args: Parameters<LLMHelper['_streamChatInner']>) => view.streamChatWithOutcome(...args),
+    });
   }
 
   /**
@@ -9505,6 +9538,11 @@ let isMultimodal = !!(imagePaths?.length);
     const { StreamingDashReducer } = await import('./llm/postProcessor');
     const { StreamingReasoningFilter } = await import('./llm/reasoningTagFilter');
     const { StreamingCalcFilter, verifyCalcScratch } = await import('./llm/calcScratch');
+    const { StreamingQuestionEchoFilter } = await import('./llm/questionEchoFilter');
+    // Match only this V3 request's exact prolog, before or after hidden working.
+    // No global tag stripping: literal/code examples and other answers pass through.
+    const rawQuestionEcho = new StreamingQuestionEchoFilter(args[0], args[9]?.v3Owned, args[3]);
+    const visibleQuestionEcho = new StreamingQuestionEchoFilter(args[0], args[9]?.v3Owned, args[3]);
     // Per-stream reasoning-tag filter. Runs BEFORE the dash reducer so a think
     // block can never enter the reducer's fenced-code state machine (a ``` inside
     // the model's reasoning would otherwise leave it convinced the rest of the
@@ -9518,9 +9556,10 @@ let isMultimodal = !!(imagePaths?.length);
     // reducer, at this one point every provider passes through, so no surface
     // shows or stores it. Leading-only; any other answer passes untouched.
     const calcFilter = new StreamingCalcFilter();
-    const visibleOf = (text: string): string => (text ? calcFilter.feed(text) : '');
+    const visibleOf = (text: string): string => (text ? visibleQuestionEcho.feed(calcFilter.feed(text)) : '');
     const flushFilters = (): string => {
-      const tail = calcFilter.feed(reasoningFilter.finish()) + calcFilter.finish();
+      const rawTail = reasoningFilter.feed(rawQuestionEcho.finish()) + reasoningFilter.finish();
+      const tail = visibleQuestionEcho.feed(calcFilter.feed(rawTail) + calcFilter.finish()) + visibleQuestionEcho.finish();
       if (calcFilter.scratch !== null) {
         outcome.calcScratch = calcFilter.scratch;
         try {
@@ -9583,7 +9622,7 @@ let isMultimodal = !!(imagePaths?.length);
       }
       // May be empty (the filter is holding a partial tag) — never yield an
       // empty chunk, or trackCommit's non-empty predicate sees needless churn.
-      const visible = visibleOf(reasoningFilter.feed(chunk));
+      const visible = visibleOf(reasoningFilter.feed(rawQuestionEcho.feed(chunk)));
       if (visible) yield dashReducer.reduce(visible);
       // Count what the USER actually receives against the runaway cap. Charging
       // suppressed reasoning to the ceiling would end long answers early on a
@@ -10493,9 +10532,12 @@ let isMultimodal = !!(imagePaths?.length);
       ...this.inferContextScopes(context),
       ...this.inferEmbeddedMessageScopes(message),
     ];
-    const deniedOutboundScopes = this.getDeniedOutboundScopes(message, imagePaths, contextScopes);
+    // Only the frozen selected-only route earns this exemption: it cannot
+    // hand private evidence to a cloud spare if a local endpoint fails.
+    const deniedOutboundScopes = this._ragSelectedProviderOnly && this.selectionStaysOnDevice()
+      ? [] : this.getDeniedOutboundScopes(message, imagePaths, contextScopes);
     if (deniedOutboundScopes.length > 0) {
-      const ollamaAvailable = this.useOllama && await this.ensureOllamaModelSelected(deniedOutboundScopes.includes('screenshots') || Boolean(imagePaths?.length));
+      const ollamaAvailable = !this._ragSelectedProviderOnly && this.useOllama && await this.ensureOllamaModelSelected(deniedOutboundScopes.includes('screenshots') || Boolean(imagePaths?.length));
       for (const scope of deniedOutboundScopes) {
         this.logScopeFallback(scope, ollamaAvailable ? 'routing' : 'omitting');
       }
@@ -13350,7 +13392,7 @@ let isMultimodal = !!(imagePaths?.length);
       throw new DirectAssistError('INVALID_REQUEST', `The custom provider endpoint was refused: ${blockedHost}`);
     }
 
-    yield* this.streamCustomAttempt(url, headers, customRequestBody(data, true), curlConfig.method || 'POST', true, abortSignal, imagePaths, { outputStreamed: false }, provider.responsePath);
+    yield* this.streamCustomAttempt(url, headers, customRequestBody(data, true), curlConfig.method || 'POST', true, abortSignal, imagePaths, { outputStreamed: false }, provider.responsePath, userMessage);
   }
 
   // --- CUSTOM PROVIDER STREAMING ---
@@ -13496,7 +13538,7 @@ let isMultimodal = !!(imagePaths?.length);
       if (abortSignal?.aborted) return;
       const attemptState: CustomAttemptState = { outputStreamed: false };
       try {
-        yield* this.streamCustomAttempt(url, headers, body, requestConfig.method || 'POST', strictErrors, abortSignal, imagePaths, attemptState, selectedCustomProvider.responsePath);
+        yield* this.streamCustomAttempt(url, headers, body, requestConfig.method || 'POST', strictErrors, abortSignal, imagePaths, attemptState, selectedCustomProvider.responsePath, combinedMessage);
         // Normal completion — or a silent end on caller cancel; the stream is over either way.
         return;
       } catch (e: any) {
@@ -13522,7 +13564,16 @@ let isMultimodal = !!(imagePaths?.length);
     imagePaths: string[] | undefined,
     attemptState: CustomAttemptState,
     responsePath?: string,
+    outboundText?: string,
   ): AsyncGenerator<string, void, unknown> {
+    // Recheck after asynchronous preparation/readiness, on EVERY attempt. A
+    // newly forbidden cloud dispatch fails closed rather than choosing a spare.
+    if (this._ragSelectedProviderOnly && !this.selectionStaysOnDevice()) {
+      if (this.isLocalOnlyMode) {
+        throw new DirectAssistError('PROVIDER_ERROR', 'Cloud providers are disabled in local-only mode.');
+      }
+      this.assertOutboundScopes(this.activeCurlProvider ? 'custom_curl' : 'custom_provider', outboundText ?? '', imagePaths);
+    }
     const startedAt = Date.now();
     try {
       yield* streamCustomTransport({

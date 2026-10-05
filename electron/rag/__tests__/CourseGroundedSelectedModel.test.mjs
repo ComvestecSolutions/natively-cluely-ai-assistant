@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
 import ts from 'typescript';
+import { launcherComposer, mockSelectedTransport } from './launcherContextHarness.mjs';
 
 const read = (path) => fs.readFileSync(new URL(path, import.meta.url), 'utf8');
 const transpile = (source) => ts.transpileModule(source, {
@@ -111,8 +112,10 @@ test('all IPC chat paths compute course grounding locally, independently of V3',
   assert.match(legacy, /if \(courseBlock\) composed\.user/);
   assert.match(legacy, /const ctxForCall = courseBlock/);
   const selectedFallback = legacy.slice(legacy.indexOf('if (options?.selectedModelOnly)'), legacy.indexOf('// ── CONTEXT INTELLIGENCE V3'));
-  assert.match(selectedFallback, /llmHelper\.streamRAGAnswer\(/);
-  assert.match(selectedFallback, /\[context, courseBlock, skillPromptBlock\]/);
+  assert.match(selectedFallback, /launcherSnapshot!\.transport\.streamRAGAnswer\(/);
+  assert.match(selectedFallback, /composeLauncherAskContext\(/);
+  assert.match(selectedFallback, /courseGrounding: launcherCourseGrounding/);
+  assert.ok(legacy.indexOf('captureLauncherAskContext') < legacy.indexOf('await getChatCourseGrounding'));
   assert.match(selectedFallback, /return null;/);
   assert.doesNotMatch(selectedFallback, /streamChatWithGemini|claimFastTurn|planAnswer/);
   for (const channel of ['rag:query-meeting', 'rag:query-live', 'rag:query-global']) {
@@ -144,6 +147,7 @@ for (const truncated of [false, true]) test(`global fallback executes the select
   const calls = [];
   const events = [];
   const helper = {
+    captureRAGAnswerTransport() { return mockSelectedTransport(this); },
     getCodexSelectionAuthError: () => null,
     streamRAGAnswer(...args) {
       calls.push(args);
@@ -154,6 +158,7 @@ for (const truncated of [false, true]) test(`global fallback executes the select
     },
     streamChat() { throw new Error('must not enter the Background Model route'); },
   };
+  const composer = launcherComposer('win32');
   const context = {
     appState: { processingHelper: { getLLMHelper: () => helper } },
     getChatCourseGrounding: async (question, pins) => {
@@ -169,7 +174,8 @@ for (const truncated of [false, true]) test(`global fallback executes the select
     AbortController, console,
     require: (id) => {
       if (id === './rag/RAGManager') return evaluate(ragSource, { '../llm/providerStreamPolicy': policies });
-      assert.equal(id, './services/ForegroundGate', 'no V3/retrieval/cloud setup before selected fallback');
+      if (id === './rag/launcherAskContext') return composer;
+      assert.equal(id, './services/ForegroundGate', 'launcher context may assemble but must not enter background routing');
       return { ForegroundGate: {} };
     },
   };
@@ -178,9 +184,10 @@ for (const truncated of [false, true]) test(`global fallback executes the select
   await module.exports({ sender: { id: 17, send: (...args) => events.push(args) } },
     'Fallback question', undefined, undefined, { courseIds: ['disabled-pin'], selectedModelOnly: true, requestId: 'fallback-turn' });
   assert.equal(calls.length, 1);
-  assert.equal(calls[0][0], 'Fallback question');
+  assert.ok(calls[0][0].includes('Fallback question'));
   assert.equal(calls[0][1], undefined);
-  assert.ok(calls[0][2].includes('PINNED_GROUND_TRUTH'));
+  assert.ok(calls[0][0].includes('PINNED_GROUND_TRUTH'));
+  assert.equal(calls[0][2], undefined);
   assert.deepEqual([...calls[0][6]], ['reference_files']);
   const tokenEvent = events.find(e => e[0] === 'gemini-stream-token');
   assert.ok(tokenEvent);
@@ -210,26 +217,29 @@ for (const platform of ['darwin', 'win32']) test(`${platform}: global IPC publis
     ts.forEachChild(node, visit);
   }
   visit(ast); assert.ok(handlerSource, 'execute the actual global IPC handler');
-  const { RAGManager } = evaluate(ragSource, { './prompts': prompts, '../courses/chatGrounding': grounding, '../llm/providerStreamPolicy': policies }, platform);
+  const composer = launcherComposer(platform);
+  const { RAGManager } = evaluate(ragSource, { './prompts': prompts, '../courses/chatGrounding': grounding, '../llm/providerStreamPolicy': policies, './launcherAskContext': composer }, platform);
   const rag = Object.create(RAGManager.prototype); const calls = []; const events = [];
   rag.isReady = () => true;
   rag.retriever = { retrieveGlobal: async () => ({ chunks: [{}], formattedContext: 'MEETING EVIDENCE' }) };
-  rag.setLLMHelper({ streamRAGAnswer(...args) {
+  const helper = { captureRAGAnswerTransport() { return mockSelectedTransport(this); }, streamRAGAnswer(...args) {
     calls.push(args);
     return { outcome: { truncated: false }, stream: policies.withProviderStreamPolicy((async function* () { yield 'Selected local answer'; })(), {
       firstUsefulDeadlineMs: 300000, interTokenStallMs: 60000, signal: args[7], lastActivityAt: 123,
     }) };
-  } });
+  } };
+  rag.setLLMHelper(helper);
   const activeRAGQueries = new Map(); const module = { exports: {} };
   vm.runInNewContext(transpile(`module.exports = ${handlerSource};`), {
-    module, AbortController, appState: { getRAGManager: () => rag }, activeRAGQueries,
+    module, AbortController, appState: { getRAGManager: () => rag, processingHelper: { getLLMHelper: () => helper } }, activeRAGQueries,
+    require: id => { assert.equal(id, './rag/launcherAskContext'); return composer; },
     crypto: { randomUUID: () => 'isolated-test' }, abortPriorRAGQueriesOfClass: () => {},
     getChatCourseGrounding: async (query, pins) => {
       assert.equal(query, 'Pinned question'); assert.deepEqual([...pins], ['course-pin']); return 'PINNED EVIDENCE';
     },
   });
   assert.equal((await module.exports({ sender: { send: (...args) => events.push(args) } }, { query: 'Pinned question', courseIds: ['course-pin'], requestId: 'global-turn' })).success, true);
-  assert.equal(calls.length, 1); assert.ok(calls[0][2].includes('PINNED EVIDENCE'));
+  assert.equal(calls.length, 1); assert.ok(calls[0][0].includes('PINNED EVIDENCE'));
   assert.deepEqual(events.map(e => e[0]), ['chat:stream-policy', 'rag:stream-chunk', 'rag:stream-complete']);
   assert.deepEqual(JSON.parse(JSON.stringify(events[0][1])), {
     source: 'rag', requestId: 'global-turn', firstUsefulDeadlineMs: 300000, interTokenStallMs: 60000,

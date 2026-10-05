@@ -133,8 +133,14 @@ describe('a heard question says whose "I" it is', () => {
     const q = 'How many engineers did I say are on our team?';
     const base = { requestId: 'r', requestSequence: 1, modeId: 'general', scope: { userId: 'local', sessionId: 's' }, sessionId: 's', questionConfidence: 0.9 };
     const wta = composePrompt({ decision: decide({ ...base, surface: 'what-to-answer', transcriptQuestion: q }), policy: MODE_POLICIES.general, evidence: [], heardQuestion: true });
-    assert.match(wta.user, /# Question\nHow many engineers did I say are on our team\?\n\(Asked aloud by the other person in the meeting: in it, "I", "me", "my", "we" and "our" mean that speaker/);
+    const questionAt = wta.user.indexOf(`# Question\n${q}`);
+    assert.ok(questionAt >= 0, 'the heard question remains verbatim');
+    const perspective = '(Asked aloud by the other person in the meeting: in it, "I", "me", "my", "we" and "our" mean that speaker; "you" and "your" mean the user you are answering for.)';
+    const perspectiveAt = wta.user.indexOf(perspective);
+    assert.ok(perspectiveAt > questionAt + q.length, 'speaker perspective follows this question, outside any framing');
+    assert.ok(!wta.user.slice(questionAt, perspectiveAt).includes('# Evidence'), 'perspective must belong to the question, not another section');
     const typed = composePrompt({ decision: decide({ ...base, surface: 'manual-chat', manualQuestion: q }), policy: MODE_POLICIES.general, evidence: [] });
+    assert.ok(typed.user.includes(`# Question\n${q}`), 'typed question remains verbatim too');
     assert.doesNotMatch(typed.user, /Asked aloud by the other person/);
   });
 });

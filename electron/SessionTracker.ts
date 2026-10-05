@@ -999,6 +999,7 @@ export class SessionTracker {
         this.transcriptEpochSummaries = [];
         this.sessionStartTime = Date.now();
         this.lastAssistantMessage = null;
+        this.lastAssistantMessageBySurface = {};
         this.assistantResponseHistory = [];
         this.lastInterimInterviewer = null;
         this.detectedCodingQuestion = null;

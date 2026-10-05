@@ -94,6 +94,7 @@ async function* heldAnswer(text) {
 let answerText = '';
 const intelligenceManager = stub({
   getContextEpoch: () => contextEpoch,
+  reset: () => { contextEpoch++; },
   getFormattedContext: () => '',
   getLastAssistantMessage: () => null,
   addTranscript: (segment) => writes.push(['addTranscript', segment?.text]),
@@ -139,9 +140,12 @@ async function waitForHeldStream() {
 }
 
 // SessionTracker.reset() (meeting stop) or clearSessionContext() (mode switch).
-async function finishAnswer({ contextChangedMidStream }) {
+async function finishAnswer({ contextChangedMidStream, explicitReset }) {
   await waitForHeldStream();
   if (contextChangedMidStream) contextEpoch++;
+  if (explicitReset) {
+    assert.deepEqual(await handlers.get('reset-intelligence')({}), { success: true });
+  }
   const release = releaseStream;
   releaseStream = null;
   release();
@@ -170,6 +174,13 @@ describe('phone-mirror chat vs a context change mid-answer', () => {
       ['addAssistantMessage', 'The pricing decision from meeting A.', 'phone_mirror'],
       ['logUsage', 'what did we decide on pricing?', 'The pricing decision from meeting A.'],
     ]);
+  });
+
+  test('explicit chat reset during the stream: no stale tokens, completion, or saves', async () => {
+    const shown = await askFromPhone({ explicitReset: true });
+    assert.equal(shown, '');
+    assert.ok(!windowSends.some(([ch]) => ch === 'gemini-stream-done'));
+    assert.deepEqual(savedAnswer(), []);
   });
 
   test('a reset or mode switch during the stream: still delivered, not saved', async () => {
@@ -216,6 +227,13 @@ describe('desktop chat (launcher) vs a context change mid-answer', () => {
         ['addAssistantMessage', ANSWER, 'manual_chat'],
         ['logUsage', QUESTION, ANSWER],
       ]);
+    });
+
+    test(`${pathName}: explicit chat reset suppresses an in-flight answer even when the provider ignores abort`, async () => {
+      const { shown, done } = await askFromLauncher({ v3, explicitReset: true });
+      assert.equal(shown, '', 'reset must prevent stale tokens from recreating a chat row');
+      assert.equal(done, false);
+      assert.deepEqual(savedAnswer(), []);
     });
 
     test(`${pathName}: a meeting stop or mode switch during the answer — still shown, not saved`, async () => {

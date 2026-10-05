@@ -403,6 +403,7 @@ import { getCodexCliModelDisplayName, gatewayModelLabel, litellmModelLabel } fro
 import { getModifierSymbol, isMac, isWindows } from '../utils/platformUtils';
 import { DynamicActionBar } from './dynamic-actions/DynamicActionBar';
 import CoursePinBar from './courses/CoursePinBar';
+import ModePicker from './modes/ModePicker';
 import { getCoursePinIds } from '../lib/coursePins';
 import GlassEffectLayer from './ui/GlassEffectLayer';
 import { OverlayBanner, OverlayBannerButton } from './ui/OverlayBanner';
@@ -2074,6 +2075,9 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // handleWhatToSay() can access it even in React 18 concurrent mode (where
   // a plain setTimeout(0) may fire before setAttachedContext flushes).
   const pendingCaptureRef = useRef<{ path: string; preview: string } | null>(null);
+  const chatResetEpochRef = useRef(0);
+  const chatResetPendingRef = useRef(false);
+  const resetChatStateRef = useRef<() => void>(() => {});
 
   // Latent Context State (Screenshots attached but not sent)
   const [attachedContext, setAttachedContext] = useState<Array<{ path: string; preview: string }>>(
@@ -5200,10 +5204,16 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // Listen for settings window visibility changes
   useEffect(() => {
     if (!window.electronAPI?.onSettingsVisibilityChange) return;
-    const unsubscribe = window.electronAPI.onSettingsVisibilityChange((isVisible) => {
-      setIsSettingsOpen(isVisible);
+    let alive = true;
+    let revision = 0;
+    const unsubscribe = window.electronAPI.onSettingsVisibilityChange((isVisible, panel) => {
+      ++revision;
+      setIsSettingsOpen(isVisible && panel === 'settings');
     });
-    return () => unsubscribe();
+    window.electronAPI.getSettingsPopupState?.().then((state) => {
+      if (alive && revision === 0) setIsSettingsOpen(state.isVisible && state.panel === 'settings');
+    }).catch(() => {});
+    return () => { alive = false; unsubscribe(); };
   }, []);
 
   // Sync Window Visibility with Expanded State
@@ -5325,6 +5335,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     if (!window.electronAPI?.onSessionReset) return;
     const unsubscribe = window.electronAPI.onSessionReset(() => {
       console.log('[NativelyInterface] Resetting session state...');
+      resetChatStateRef.current();
       window.electronAPI?.cancelChatStream?.();
       chatStreamIdRef.current = null;
       chatStreamSourceRef.current = null;
@@ -6698,7 +6709,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   }, []);
 
   const tryBeginOverlayAction = useCallback((actionKey: string): boolean => {
-    if (overlayActionInFlightRef.current.has(actionKey)) return false;
+    if (chatResetPendingRef.current || overlayActionInFlightRef.current.has(actionKey)) return false;
     const nowMs = Date.now();
     const last = lastOverlayActionRef.current;
     if (
@@ -7160,7 +7171,51 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   }, [flushToken, settleDirectAssistIncomplete]);
 
   const resetChatState = useCallback(() => {
+    chatResetEpochRef.current++;
     cancelActiveChatStream();
+    forceFinalizeStaleRagStream();
+    legacyIntelligenceTombstonedRef.current = true;
+    liveAnswerGenIdRef.current = Number.MAX_SAFE_INTEGER;
+    streamingMsgIdRef.current = null;
+    streamingIntentRef.current = null;
+    streamingTextRef.current = '';
+    streamingNodeRef.current = null;
+    pendingFinalizeRef.current = null;
+    if (pendingFinalizeTimeoutRef.current !== null) {
+      clearTimeout(pendingFinalizeTimeoutRef.current);
+      pendingFinalizeTimeoutRef.current = null;
+    }
+    for (const ref of [streamingRafRef, streamingCodeRafRef, ragChunkRafRef]) {
+      if (ref.current !== null) cancelAnimationFrame(ref.current);
+      ref.current = null;
+    }
+    ragArrivedTextRef.current = '';
+    ragDoneRef.current = false;
+    pendingCaptureRef.current = null;
+    pendingPageCaptureAtRef.current = null;
+    capturedEnvelopeRef.current = null;
+    capturedMetaRef.current = null;
+    (window as any).lastCapturedDOM = '';
+    phoneShotPathsRef.current.clear();
+    setPageContext(null);
+    setCaptureFallback(null);
+    setAttachedContext([]);
+    setInputValue('');
+    manualTranscriptRef.current = '';
+    voiceInputRef.current = '';
+    setManualTranscript('');
+    setVoiceInput('');
+    isRecordingRef.current = false;
+    answerStopInFlightRef.current = false;
+    setIsManualRecording(false);
+    if (rollingPartialDebounceRef.current !== null) {
+      clearTimeout(rollingPartialDebounceRef.current);
+      rollingPartialDebounceRef.current = null;
+    }
+    pendingRollingPartialRef.current = null;
+    setRollingTranscript('');
+    setConversationContext('');
+    diagramRepairsRef.current.clear();
     diagramRepairBlockedRef.current.clear();
     previousDiagramRef.current = null;
     setMessages([]);
@@ -7168,8 +7223,27 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     setAnswerPanelPinned(false);
     lastManualSubmitRef.current = null;
     manualSubmitInFlightRef.current = false;
+    overlayActionInFlightRef.current.clear();
+    lastOverlayActionRef.current = null;
     directAssistHistoryRef.current = [];
-  }, [cancelActiveChatStream]);
+  }, [cancelActiveChatStream, forceFinalizeStaleRagStream]);
+  resetChatStateRef.current = resetChatState;
+
+  const resetConversation = useCallback(async () => {
+    if (chatResetPendingRef.current) return;
+    // The backend broadcasts session-reset before acknowledging. Do not accept
+    // a new turn against outgoing context or let that broadcast erase it.
+    chatResetPendingRef.current = true;
+    resetChatState();
+    try {
+      const result = await window.electronAPI.resetIntelligence();
+      if (!result.success) console.error('[NativelyInterface] Chat reset failed:', result.error);
+    } catch (error) {
+      console.error('[NativelyInterface] Chat reset failed:', error);
+    } finally {
+      chatResetPendingRef.current = false;
+    }
+  }, [resetChatState]);
 
   const finalizeStreamingByIntent = useCallback(
     (intent: string, text: string) => {
@@ -7889,6 +7963,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   };
 
   const handleWhatToSay = async (promptInstruction?: string | React.MouseEvent) => {
+    const resetEpoch = chatResetEpochRef.current;
     // Timing: the moment this request was accepted (content-free; see diagramTimings).
     diagramRequestAtRef.current = performance.now();
     warmDiagramRendererOnIdle();
@@ -8026,6 +8101,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
           await new Promise((r) => setTimeout(r, 100));
         }
       }
+      if (chatResetEpochRef.current !== resetEpoch) return;
       const hasManualContext =
         typeof (window as any).lastCapturedDOM === 'string' &&
         (window as any).lastCapturedDOM.trim().length > 0;
@@ -8050,6 +8126,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       // sets window.lastCapturedDOM) BEFORE it emits the `done` ack that resolves
       // phoneMirrorRequestAutoContext(). So by here, an auto-captured DOM has
       // already landed — no extra settle delay needed.
+      if (chatResetEpochRef.current !== resetEpoch) return;
       const rawDomContext = (window as any).lastCapturedDOM;
       const domContext =
         typeof rawDomContext === 'string' && rawDomContext.trim().length > 0
@@ -8103,6 +8180,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         currentAttachments.length > 0 ? currentAttachments.map((s) => s.path) : undefined,
         options,
       );
+      if (chatResetEpochRef.current !== resetEpoch) return;
       setScreenContextStatus(result.screenContextStatus || 'not_available');
       setLatestUsedImageInput(Boolean(result.usedImageInput));
       setLatestVisionProviderUsed(result.visionProviderUsed);
@@ -8144,6 +8222,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         pinAnswerPanel();
       }
     } catch (err) {
+      if (chatResetEpochRef.current !== resetEpoch) return;
       setMessages((prev) => [
         ...prev,
         {
@@ -8154,14 +8233,16 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       ]);
       pinAnswerPanel();
     } finally {
-      endOverlayAction('what_to_say');
-      // A Direct stream outlives the start IPC acknowledgement; its correlated
-      // terminal event owns the processing state. Legacy WTA is request/response.
-      if (!directAssistEnabled) setIsProcessing(false);
+      if (chatResetEpochRef.current === resetEpoch) {
+        endOverlayAction('what_to_say');
+        // The Direct terminal event, not its start acknowledgement, owns processing state.
+        if (!directAssistEnabled) setIsProcessing(false);
+      }
     }
   };
 
   const handleFollowUp = async (intent: string = 'rephrase') => {
+    const resetEpoch = chatResetEpochRef.current;
     // Timing: the moment this request was accepted (content-free; see diagramTimings).
     diagramRequestAtRef.current = performance.now();
     warmDiagramRendererOnIdle();
@@ -8179,6 +8260,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     try {
       await window.electronAPI.generateFollowUp(intent);
     } catch (err) {
+      if (chatResetEpochRef.current !== resetEpoch) return;
       setMessages((prev) => [
         ...prev,
         {
@@ -8188,12 +8270,15 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         },
       ]);
     } finally {
-      endOverlayAction(actionKey);
-      setIsProcessing(false);
+      if (chatResetEpochRef.current === resetEpoch) {
+        endOverlayAction(actionKey);
+        setIsProcessing(false);
+      }
     }
   };
 
   const handleRecap = async () => {
+    const resetEpoch = chatResetEpochRef.current;
     // Timing: the moment this request was accepted (content-free; see diagramTimings).
     diagramRequestAtRef.current = performance.now();
     warmDiagramRendererOnIdle();
@@ -8210,6 +8295,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     try {
       await window.electronAPI.generateRecap();
     } catch (err) {
+      if (chatResetEpochRef.current !== resetEpoch) return;
       setMessages((prev) => [
         ...prev,
         {
@@ -8219,12 +8305,15 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         },
       ]);
     } finally {
-      endOverlayAction('recap');
-      setIsProcessing(false);
+      if (chatResetEpochRef.current === resetEpoch) {
+        endOverlayAction('recap');
+        setIsProcessing(false);
+      }
     }
   };
 
   const handleFollowUpQuestions = async () => {
+    const resetEpoch = chatResetEpochRef.current;
     if (!tryBeginOverlayAction('follow_up_questions')) return;
     setIsExpanded(true);
     setIsProcessing(true);
@@ -8238,6 +8327,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     try {
       await window.electronAPI.generateFollowUpQuestions();
     } catch (err) {
+      if (chatResetEpochRef.current !== resetEpoch) return;
       setMessages((prev) => [
         ...prev,
         {
@@ -8247,12 +8337,15 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         },
       ]);
     } finally {
-      endOverlayAction('follow_up_questions');
-      setIsProcessing(false);
+      if (chatResetEpochRef.current === resetEpoch) {
+        endOverlayAction('follow_up_questions');
+        setIsProcessing(false);
+      }
     }
   };
 
   const handleClarify = async () => {
+    const resetEpoch = chatResetEpochRef.current;
     if (!tryBeginOverlayAction('clarify')) return;
     setIsExpanded(true);
     setIsProcessing(true);
@@ -8266,6 +8359,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     try {
       await window.electronAPI.generateClarify();
     } catch (err) {
+      if (chatResetEpochRef.current !== resetEpoch) return;
       setMessages((prev) => [
         ...prev,
         {
@@ -8275,12 +8369,15 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         },
       ]);
     } finally {
-      endOverlayAction('clarify');
-      setIsProcessing(false);
+      if (chatResetEpochRef.current === resetEpoch) {
+        endOverlayAction('clarify');
+        setIsProcessing(false);
+      }
     }
   };
 
   const handleCodeHint = async () => {
+    const resetEpoch = chatResetEpochRef.current;
     // In-flight guard (every other overlay action has one). Without it a rapid
     // double-press of the code-hint hotkey spawned two concurrent IPC/LLM streams;
     // engine generation-id supersession aborted the older one, but both fired.
@@ -8328,6 +8425,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         currentAttachments.length > 0 ? currentAttachments.map((s) => s.path) : undefined,
       );
     } catch (err) {
+      if (chatResetEpochRef.current !== resetEpoch) return;
       setMessages((prev) => [
         ...prev,
         {
@@ -8337,12 +8435,15 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         },
       ]);
     } finally {
-      endOverlayAction('code_hint');
-      setIsProcessing(false);
+      if (chatResetEpochRef.current === resetEpoch) {
+        endOverlayAction('code_hint');
+        setIsProcessing(false);
+      }
     }
   };
 
   const handleBrainstorm = async () => {
+    const resetEpoch = chatResetEpochRef.current;
     // Timing: the moment this request was accepted (content-free; see diagramTimings).
     diagramRequestAtRef.current = performance.now();
     warmDiagramRendererOnIdle();
@@ -8389,6 +8490,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         currentAttachments.length > 0 ? currentAttachments.map((s) => s.path) : undefined,
       );
     } catch (err) {
+      if (chatResetEpochRef.current !== resetEpoch) return;
       setMessages((prev) => [
         ...prev,
         {
@@ -8398,8 +8500,10 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         },
       ]);
     } finally {
-      endOverlayAction('brainstorm');
-      setIsProcessing(false);
+      if (chatResetEpochRef.current === resetEpoch) {
+        endOverlayAction('brainstorm');
+        setIsProcessing(false);
+      }
     }
   };
   useEffect(() => {
@@ -8864,6 +8968,8 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   }, [currentModel, queueToken, flushToken, scrollToLatest]); // Ensure tracking captures correct model
 
   const handleAnswerNow = async () => {
+    if (chatResetPendingRef.current) return;
+    const resetEpoch = chatResetEpochRef.current;
     if (isManualRecording) {
       if (!tryBeginOverlayAction('answer_now')) return;
       try {
@@ -8898,12 +9004,14 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
           console.error('[NativelyInterface] Failed to finalize mic STT:', err);
         }
 
+        if (chatResetEpochRef.current !== resetEpoch) return;
         // Event-driven: resolves the moment a FINAL user chunk is merged, and
         // is bounded so an empty recording still returns promptly.
         await answerTailWaiterRef.current!.wait({
           hasCapturedFinal: voiceInputRef.current.trim().length > 0,
           hasPendingInterim: manualTranscriptRef.current.trim().length > 0 || providerReportsPending,
         });
+        if (chatResetEpochRef.current !== resetEpoch) return;
         isRecordingRef.current = false;
         answerStopInFlightRef.current = false;
         setIsManualRecording(false);
@@ -9038,6 +9146,7 @@ Instructions:
 3. Be concise.`;
           } else {
             const ragResult = await window.electronAPI.ragQueryLive?.(question, getCoursePinIds());
+            if (chatResetEpochRef.current !== resetEpoch) return;
             if (ragResult?.success) {
               return;
             }
@@ -9072,6 +9181,7 @@ Provide only the answer, nothing else.`;
             { skipSystemPrompt: true, courseIds: getCoursePinIds(), liveQuestion: true },
           );
         } catch (err) {
+          if (chatResetEpochRef.current !== resetEpoch) return;
           // R-17: a throw from invoke() never reaches the main process, so no
           // gemini-stream-error follows and nothing else releases the claim we
           // took above. Left set, it would pin the guard to 'desktop' and block
@@ -9099,8 +9209,10 @@ Provide only the answer, nothing else.`;
           });
         }
       } finally {
-        answerStopInFlightRef.current = false;
-        endOverlayAction('answer_now');
+        if (chatResetEpochRef.current === resetEpoch) {
+          answerStopInFlightRef.current = false;
+          endOverlayAction('answer_now');
+        }
       }
     } else {
       // Start recording - reset voice input state.
@@ -9131,6 +9243,8 @@ Provide only the answer, nothing else.`;
   }, [inputValue]);
 
   const handleManualSubmit = async () => {
+    if (chatResetPendingRef.current) return;
+    const resetEpoch = chatResetEpochRef.current;
     // Timing: the moment this request was accepted (content-free; see diagramTimings).
     diagramRequestAtRef.current = performance.now();
     warmDiagramRendererOnIdle();
@@ -9224,7 +9338,7 @@ Provide only the answer, nothing else.`;
           userMessageId,
         });
       } finally {
-        manualSubmitInFlightRef.current = false;
+        if (chatResetEpochRef.current === resetEpoch) manualSubmitInFlightRef.current = false;
       }
       return;
     }
@@ -9288,6 +9402,7 @@ Provide only the answer, nothing else.`;
         { courseIds: getCoursePinIds() },
       );
     } catch (err) {
+      if (chatResetEpochRef.current !== resetEpoch) return;
       // R-17: release the claim taken above — see the note at the other call site.
       chatStreamIdRef.current = null;
       chatStreamSourceRef.current = null;
@@ -9312,7 +9427,7 @@ Provide only the answer, nothing else.`;
         ];
       });
     } finally {
-      manualSubmitInFlightRef.current = false;
+      if (chatResetEpochRef.current === resetEpoch) manualSubmitInFlightRef.current = false;
     }
   };
 
@@ -9994,6 +10109,7 @@ Provide only the answer, nothing else.`;
 
   // We use a ref to hold the latest handlers to avoid re-binding the event listener on every render
   const handlersRef = useRef({
+    actionButtonMode,
     handleWhatToSay,
     handleFollowUp,
     handleFollowUpQuestions,
@@ -10006,6 +10122,7 @@ Provide only the answer, nothing else.`;
 
   // Update ref on every render so the event listener always access latest state/props
   handlersRef.current = {
+    actionButtonMode,
     handleWhatToSay,
     handleFollowUp,
     handleFollowUpQuestions,
@@ -10110,6 +10227,7 @@ Provide only the answer, nothing else.`;
 
     const handleKeyDown = (e: KeyboardEvent) => {
       const {
+        actionButtonMode,
         handleWhatToSay,
         handleFollowUp,
         handleFollowUpQuestions,
@@ -10207,24 +10325,17 @@ Provide only the answer, nothing else.`;
   const generalHandlersRef = useRef({
     toggleVisibility: () => window.electronAPI.toggleWindow(),
     processScreenshots: handleWhatToSay,
-    resetCancel: async () => {
-      if (isProcessing) {
-        cancelActiveChatStream();
-      } else {
-        await window.electronAPI.resetIntelligence();
-        resetChatState();
-        setAttachedContext([]);
-        setInputValue('');
-      }
-    },
+    resetCancel: resetConversation,
     toggleMousePassthrough: () => {
       const newState = !isMousePassthrough;
       setIsMousePassthrough(newState);
       window.electronAPI?.setOverlayMousePassthrough?.(newState);
     },
     takeScreenshot: async () => {
+      const resetEpoch = chatResetEpochRef.current;
       try {
         const data = await window.electronAPI.takeScreenshot();
+        if (chatResetEpochRef.current !== resetEpoch) return;
         if (data && data.path) {
           handleScreenshotAttach(data as { path: string; preview: string });
         }
@@ -10233,8 +10344,10 @@ Provide only the answer, nothing else.`;
       }
     },
     selectiveScreenshot: async () => {
+      const resetEpoch = chatResetEpochRef.current;
       try {
         const data = await window.electronAPI.takeSelectiveScreenshot();
+        if (chatResetEpochRef.current !== resetEpoch) return;
         if (data && !data.cancelled && data.path) {
           handleScreenshotAttach(data as { path: string; preview: string });
         }
@@ -10248,24 +10361,17 @@ Provide only the answer, nothing else.`;
   generalHandlersRef.current = {
     toggleVisibility: () => window.electronAPI.toggleWindow(),
     processScreenshots: handleWhatToSay,
-    resetCancel: async () => {
-      if (isProcessing) {
-        cancelActiveChatStream();
-      } else {
-        await window.electronAPI.resetIntelligence();
-        resetChatState();
-        setAttachedContext([]);
-        setInputValue('');
-      }
-    },
+    resetCancel: resetConversation,
     toggleMousePassthrough: () => {
       const newState = !isMousePassthrough;
       setIsMousePassthrough(newState);
       window.electronAPI?.setOverlayMousePassthrough?.(newState);
     },
     takeScreenshot: async () => {
+      const resetEpoch = chatResetEpochRef.current;
       try {
         const data = await window.electronAPI.takeScreenshot();
+        if (chatResetEpochRef.current !== resetEpoch) return;
         if (data && data.path) {
           handleScreenshotAttach(data as { path: string; preview: string });
         }
@@ -10274,8 +10380,10 @@ Provide only the answer, nothing else.`;
       }
     },
     selectiveScreenshot: async () => {
+      const resetEpoch = chatResetEpochRef.current;
       try {
         const data = await window.electronAPI.takeSelectiveScreenshot();
+        if (chatResetEpochRef.current !== resetEpoch) return;
         if (data && !data.cancelled && data.path) {
           handleScreenshotAttach(data as { path: string; preview: string });
         }
@@ -10333,6 +10441,7 @@ Provide only the answer, nothing else.`;
   useEffect(() => {
     if (!window.electronAPI.onCaptureAndProcess) return;
     const unsubscribe = window.electronAPI.onCaptureAndProcess((data) => {
+      const resetEpoch = chatResetEpochRef.current;
       setIsExpanded(true);
 
       // Store screenshot in a stable ref BEFORE updating React state.
@@ -10353,6 +10462,7 @@ Provide only the answer, nothing else.`;
       // The ref guarantees handleWhatToSay has the screenshot regardless of
       // whether the state update has flushed yet.
       requestAnimationFrame(() => {
+        if (chatResetEpochRef.current !== resetEpoch) return;
         try {
           handlersRef.current.handleWhatToSay();
         } finally {
@@ -10508,7 +10618,7 @@ Provide only the answer, nothing else.`;
       else if (action === 'followUp') handlers.handleFollowUpQuestions();
       else if (action === 'recap') handlers.handleRecap();
       else if (action === 'dynamicAction4') {
-        if (actionButtonMode === 'brainstorm') handlers.handleBrainstorm();
+        if (handlers.actionButtonMode === 'brainstorm') handlers.handleBrainstorm();
         else handlers.handleRecap();
       } else if (action === 'answer') handlers.handleAnswerNow();
       else if (action === 'clarify') handlers.handleClarify();
@@ -10817,7 +10927,7 @@ Provide only the answer, nothing else.`;
       // that isn't on the settings toggle itself closes it (guarded so the
       // toggle's own open/close logic doesn't race). Clicks OUTSIDE the
       // overlay entirely are handled by the main-process click-catcher.
-      if (!target?.closest?.('[data-settings-toggle="true"]')) {
+      if (!target?.closest?.('[data-settings-toggle="true"], [data-course-toggle="true"], [data-modes-toggle="true"]')) {
         window.electronAPI?.dismissOverlayPopovers?.({ settings: true, model: false }).catch(() => {});
       }
     };
@@ -10849,6 +10959,9 @@ Provide only the answer, nothing else.`;
       textInputRef.current?.blur();
     }
   }, []);
+
+  // Captured by suggestion callbacks: an acceptance may outlive its reset/remount.
+  const renderedChatResetEpoch = chatResetEpochRef.current;
 
   // ── Derived STT status for the rolling transcript indicator (interviewer channel) ──
   const interviewerSttIndicatorStatus = sttInterviewerStatus;
@@ -11439,7 +11552,9 @@ Provide only the answer, nothing else.`;
 
 
               <DynamicActionBar
+                key={renderedChatResetEpoch}
                 onAcceptAction={(action: DynamicActionPayload) => {
+                  if (chatResetEpochRef.current !== renderedChatResetEpoch) return;
                   void handleWhatToSay(action.promptInstruction);
                 }}
                 surfaceStyle={appearance.chipStyle}
@@ -12273,28 +12388,26 @@ Provide only the answer, nothing else.`;
 
                     <CoursePinBar
                       compact
-                      panelRef={shellRef}
+                      panelRef={contentRef}
                       interfaceTheme={interfaceTheme}
                       surfaceStyle={appearance.shellStyle}
                       controlStyle={appearance.controlStyle}
                     />
 
+                    <ModePicker compact panelRef={contentRef} interfaceTheme={interfaceTheme} />
+
                     <div className="relative">
                       <button
                         data-settings-toggle="true"
+                        aria-label="Quick settings"
+                        aria-expanded={isSettingsOpen}
+                        aria-haspopup="dialog"
                         onClick={(e) => {
-                          if (isSettingsOpen) {
-                            // If open, just close it (toggle will handle logic but we can be explicit or just toggle)
-                            // Actually toggle-settings-window handles hiding if visible, so logic is same.
-                            window.electronAPI.toggleSettingsWindow();
-                            return;
-                          }
-
                           if (!contentRef.current) return;
 
                           const contentRect = contentRef.current.getBoundingClientRect();
                           const buttonRect = e.currentTarget.getBoundingClientRect();
-                          const POPUP_WIDTH = 270; // Matches SettingsWindowHelper actual width
+
                           const GAP = 8; // Same gap as between TopPill and main body (gap-2 = 8px)
 
                           // X: Left-aligned relative to the Settings Button
@@ -12303,7 +12416,7 @@ Provide only the answer, nothing else.`;
                           // Y: Below the main content + gap
                           const y = window.screenY + contentRect.bottom + GAP;
 
-                          window.electronAPI.toggleSettingsWindow({ x, y });
+                          window.electronAPI.toggleSettingsWindow({ x, y, panel: 'settings' });
                         }}
                         data-state={isSettingsOpen ? 'open' : undefined}
                         className="w-7 h-7 rounded-[9px] flex items-center justify-center interaction-base interaction-press overlay-bare-icon"

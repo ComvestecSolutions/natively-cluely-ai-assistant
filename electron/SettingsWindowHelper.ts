@@ -15,6 +15,8 @@ const startUrl = isDev
     ? DEV_SERVER_URL
     : `file://${path.join(app.getAppPath(), "dist/index.html")}`
 
+export type SettingsPopupPanel = 'settings' | 'courses' | 'modes';
+
 type WindowActivationOptions = {
     activate?: boolean
 }
@@ -23,6 +25,13 @@ export class SettingsWindowHelper {
     private settingsWindow: BrowserWindow | null = null
     private windowHelper: WindowHelper | null = null;
     private opacityTimeout: NodeJS.Timeout | null = null;
+    private panel: SettingsPopupPanel = 'settings';
+    private requestedVisible = false;
+    private heightBudget = 330; // 320px list viewport plus the shell's padding/border.
+
+    public getPopupState(): { panel: SettingsPopupPanel; isVisible: boolean; heightBudget: number } {
+        return { panel: this.panel, isVisible: this.requestedVisible, heightBudget: this.heightBudget };
+    }
 
     public getSettingsWindow(): BrowserWindow | null {
         return this.settingsWindow
@@ -41,8 +50,21 @@ export class SettingsWindowHelper {
         // Only update if dimensions actually change (avoid infinite loops)
         if (currentBounds.width === width && currentBounds.height === height) return
 
-        win.setSize(width, height)
-        if (win.isVisible()) this.ensureVisibleOnScreen()
+        if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return;
+        const workArea = screen.getDisplayNearestPoint({ x: currentBounds.x, y: currentBounds.y }).workArea;
+        win.setSize(
+            Math.min(Math.ceil(width), workArea.width),
+            Math.min(Math.ceil(height), workArea.height, this.panel !== 'settings' ? this.heightBudget : Infinity),
+        );
+        if (win.isVisible()) {
+            const mainBounds = this.windowHelper?.getMainWindow()?.getBounds();
+            if (mainBounds) {
+                if (this.overlayAnchor) {
+                    this.repositionForOverlay(mainBounds, this.windowHelper?.getOverlayPanelLeftMargin?.() ?? 0);
+                } else this.reposition(mainBounds);
+            }
+            this.ensureVisibleOnScreen();
+        }
     }
 
     // Store offsets relative to main window
@@ -81,7 +103,8 @@ export class SettingsWindowHelper {
         this.windowHelper = wh;
     }
 
-    public toggleWindow(x?: number, y?: number): void {
+    public toggleWindow(x?: number, y?: number, panel: SettingsPopupPanel = 'settings'): void {
+        const switchingPanel = this.panel !== panel;
         const mainWindow = this.windowHelper?.getMainWindow() ?? null;
         if (mainWindow && !mainWindow.isDestroyed() && x !== undefined && y !== undefined) {
             const bounds = mainWindow.getBounds();
@@ -104,26 +127,32 @@ export class SettingsWindowHelper {
 
         if (this.settingsWindow && !this.settingsWindow.isDestroyed()) {
             // Fix: If window was just closed by blur (e.g. clicking the toggle button), don't re-open immediately
-            if (!this.settingsWindow.isVisible() && (Date.now() - this.lastBlurTime < 250)) {
+            if (!switchingPanel && !this.settingsWindow.isVisible() && (Date.now() - this.lastBlurTime < 250)) {
                 return;
             }
 
-            if (this.settingsWindow.isVisible()) {
-                this.closeWindow(); // Use closeWindow to handle focus restore
+            if (this.requestedVisible && !switchingPanel) {
+                this.closeWindow();
             } else {
-                this.showWindow(x, y)
+                this.panel = panel;
+                this.showWindow(x, y);
             }
         } else {
-            this.createWindow(x, y)
+            this.panel = panel;
+            this.createWindow(x, y);
         }
     }
 
     public showWindow(x?: number, y?: number, options: WindowActivationOptions = {}): void {
+        this.requestedVisible = true;
         if (!this.settingsWindow || this.settingsWindow.isDestroyed()) {
             this.createWindow(x, y)
             return
         }
 
+        // Preserve the existing policy: default opens use show()/focus(); an
+        // explicit inactive restore uses showInactive(). Windows attachNoActivate
+        // remains in force; this is not a guarantee about physical OS focus.
         const activate = options.activate ?? true;
 
         // Set parent to ensure it stays on top of the correct window
@@ -136,7 +165,8 @@ export class SettingsWindowHelper {
             this.settingsWindow.setPosition(Math.round(x), Math.round(y))
         }
 
-        // Ensure fully visible on screen
+        // Budget before clamping so usable room below chat never pushes lists upward.
+        this.applyListHeightBudget();
         this.ensureVisibleOnScreen();
 
         if (process.platform === 'win32' && this.contentProtection) {
@@ -166,7 +196,7 @@ export class SettingsWindowHelper {
         // fires on the overlay-anchored popover path (showInactive). Tell the
         // renderer it was just shown so it can re-pull main-process state.
         try {
-            this.settingsWindow.webContents.send('settings-window-shown');
+            this.settingsWindow.webContents.send('settings-window-shown', this.panel);
         } catch { /* renderer not ready — mount fetch covers first open */ }
     }
 
@@ -177,6 +207,8 @@ export class SettingsWindowHelper {
         const newY = mainBounds.y + mainBounds.height + this.offsetY;
 
         this.settingsWindow.setPosition(Math.round(newX), Math.round(newY));
+        this.applyListHeightBudget();
+        this.ensureVisibleOnScreen();
     }
 
     // Overlay-anchored variant: x tracks the PANEL's left edge (overlay.x +
@@ -189,9 +221,13 @@ export class SettingsWindowHelper {
             Math.round(overlayBounds.x + panelLeftMargin + this.overlayAnchor.offsetXFromPanel),
             Math.round(overlayBounds.y + overlayBounds.height + this.overlayAnchor.offsetY),
         );
+        this.applyListHeightBudget();
+        this.ensureVisibleOnScreen();
     }
 
     public closeWindow(): void {
+        this.requestedVisible = false;
+        if (this.opacityTimeout) { clearTimeout(this.opacityTimeout); this.opacityTimeout = null; }
         if (this.settingsWindow && !this.settingsWindow.isDestroyed()) {
             this.settingsWindow.hide()
             this.emitVisibilityChange(false);
@@ -209,13 +245,14 @@ export class SettingsWindowHelper {
         }
         if (mainWindow.isDestroyed()) return;
         try {
-            mainWindow.webContents.send('settings-visibility-changed', isVisible);
+            mainWindow.webContents.send('settings-visibility-changed', isVisible, this.panel);
         } catch {
             // Renderer is tearing down; ignore.
         }
     }
 
     private createWindow(x?: number, y?: number, showWhenReady: boolean = true): void {
+        this.requestedVisible = showWhenReady;
         const isMac = process.platform === 'darwin';
         const windowSettings: Electron.BrowserWindowConstructorOptions = {
             width: 180, // Match React component width (SettingsPopup.tsx)
@@ -279,6 +316,14 @@ export class SettingsWindowHelper {
             console.error('[SettingsWindowHelper] Failed to load URL:', e);
         });
 
+        // Re-deliver the selected panel after reload; mount also pulls getPopupState
+        // because did-finish-load can precede React's event subscriptions.
+        this.settingsWindow.webContents.on('did-finish-load', () => {
+            if (this.requestedVisible && this.settingsWindow && !this.settingsWindow.isDestroyed()) {
+                this.settingsWindow.webContents.send('settings-window-shown', this.panel);
+            }
+        });
+
         this.settingsWindow.once('ready-to-show', () => {
             // Apply NSPanel stealth attributes (becomesKeyOnlyIfNeeded +
             // _setPreventsActivation + sharingType=None + collectionBehavior)
@@ -299,7 +344,7 @@ export class SettingsWindowHelper {
                     console.error('[SettingsWindowHelper] applyStealthToWindow failed:', e);
                 }
             }
-            if (showWhenReady) {
+            if (this.requestedVisible) {
                 this.showWindow(this.settingsWindow?.getBounds().x || 0, this.settingsWindow?.getBounds().y || 0)
             }
         })
@@ -309,6 +354,12 @@ export class SettingsWindowHelper {
         // User asked for "independent window", maybe sticky?
         // Let's keep it simple: clicks outside close it if we want "popover" behavior.
         // For now, let it stay open until toggled or ESC.
+        this.settingsWindow.on('closed', () => {
+            this.requestedVisible = false;
+            this.emitVisibilityChange(false);
+            this.settingsWindow = null;
+        });
+
         this.settingsWindow.on('blur', () => {
             if (this.ignoreBlur) return;
             this.lastBlurTime = Date.now();
@@ -347,6 +398,26 @@ export class SettingsWindowHelper {
 
 
 
+    private applyListHeightBudget(): void {
+        if (this.panel === 'settings' || !this.settingsWindow || this.settingsWindow.isDestroyed()) return;
+        const { x, y, width, height } = this.settingsWindow.getBounds();
+        const overlayBounds = this.overlayAnchor ? this.windowHelper?.getOverlayWindow()?.getBounds() : null;
+        const anchorY = overlayBounds && this.overlayAnchor
+            ? overlayBounds.y + overlayBounds.height + this.overlayAnchor.offsetY
+            : y;
+        const bounds = screen.getDisplayNearestPoint({ x, y: anchorY }).workArea;
+        const below = Math.floor(bounds.y + bounds.height - anchorY - 8);
+        // Less than 80px cannot show the header and a list row comfortably.
+        // In that case clamp the whole popup at the screen edge instead; the
+        // same capacity still reaches the renderer so all content can scroll.
+        const capacity = Math.min(330, Math.max(1, bounds.height), below >= 80 ? below : Infinity);
+        if (capacity !== this.heightBudget) {
+            this.heightBudget = capacity;
+            this.settingsWindow.webContents.send('settings-popup-height-budget', capacity);
+        }
+        if (height > capacity) this.settingsWindow.setSize(width, capacity);
+    }
+
     private ensureVisibleOnScreen() {
         if (!this.settingsWindow) return;
         const { x, y, width, height } = this.settingsWindow.getBounds();
@@ -363,7 +434,7 @@ export class SettingsWindowHelper {
             newY = bounds.y + bounds.height - height;
         }
 
-        this.settingsWindow.setPosition(newX, newY);
+        this.settingsWindow.setPosition(Math.max(bounds.x, newX), Math.max(bounds.y, newY));
     }
     private contentProtection: boolean = false; // Track state
 

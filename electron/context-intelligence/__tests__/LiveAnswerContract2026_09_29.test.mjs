@@ -243,13 +243,15 @@ describe('steps and counted sets get the list line at recency', () => {
       'Why should we hire you?',
     ]) assert.equal(isEnumerableAsk(q), false, q);
   });
-  test('rendered on both surfaces, after the notices, before the user\'s own instructions', () => {
+  test('rendered on both surfaces after the USER notices, subordinate to SYSTEM standing instructions', () => {
     for (const d of [heard('Walk me through the steps to safely deploy a change to production.'), typed('Give me three reasons we should use TypeScript.')]) {
       const r = compose(d, 'general', { realtimeInstruction: 'Keep answers under 50 words.' });
       assert.ok(r.user.includes(ENUMERABLE_FORM_LINE), d.surface);
       const i = r.sections.indexOf('list_form');
       assert.ok(i > r.sections.indexOf('question'), r.sections.join(','));
-      assert.ok(i < r.sections.indexOf('user_instructions'), r.sections.join(','));
+      assert.match(r.system, /Keep answers under 50 words\./);
+      assert.doesNotMatch(r.user, /<user_instructions/);
+      assert.ok(r.sections.indexOf('user_instructions') < r.sections.indexOf('question'), r.sections.join(','));
     }
   });
   test('a statement or a preamble that counts things is not a list ask', () => {

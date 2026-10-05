@@ -198,7 +198,7 @@ export class KeybindManager {
      */
     public triggerActionById(actionId: string): void {
         const kb = this.keybinds.get(actionId);
-        if (!kb || !kb.isGlobal) return;
+        if (!kb || !kb.isGlobal || !kb.accelerator?.trim() || !this.shouldRegister(actionId)) return;
         this.onShortcutTriggeredCallbacks.forEach(cb => cb(actionId));
     }
 
@@ -431,7 +431,7 @@ export class KeybindManager {
                 }
                 try {
                     globalShortcut.register(acc, () => {
-                        this.onShortcutTriggeredCallbacks.forEach(cb => cb(kb.id));
+                        this.triggerActionById(kb.id);
                     });
                     if (globalShortcut.isRegistered(acc)) {
                         console.log(`[KeybindManager] Registered global shortcut: ${acc} -> ${kb.id}`);
@@ -501,7 +501,7 @@ export class KeybindManager {
             lost++;
             try {
                 globalShortcut.register(acc, () => {
-                    this.onShortcutTriggeredCallbacks.forEach(cb => cb(kb.id));
+                    this.triggerActionById(kb.id);
                 });
                 if (globalShortcut.isRegistered(acc)) {
                     recovered++;
@@ -559,8 +559,9 @@ export class KeybindManager {
                 {
                     label: 'View',
                     submenu: [
-                        { role: 'reload' },
-                        { role: 'forceReload' },
+                        // Role-default Cmd/Ctrl+R would reload before the chat's reset handler.
+                        { role: 'reload', accelerator: '' },
+                        { role: 'forceReload', accelerator: '' },
                         { role: 'toggleDevTools' },
                         { type: 'separator' },
                         { role: 'resetZoom' },
@@ -631,8 +632,8 @@ export class KeybindManager {
                         click: () => this.windowHelper?.moveWindowRight()
                     },
                     { type: 'separator' },
-                    { role: 'reload' },
-                    { role: 'forceReload' },
+                    { role: 'reload', accelerator: '' },
+                    { role: 'forceReload', accelerator: '' },
                     { role: 'toggleDevTools' },
                     { type: 'separator' },
                     { role: 'resetZoom' },

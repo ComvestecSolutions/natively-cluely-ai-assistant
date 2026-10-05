@@ -13,6 +13,11 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import type { ProfileDocLike, ProfileCardLike } from '../../context-intelligence/retrieval/profile-retrieval-port';
+import type { SourceType, EvidenceItem } from '../../context-intelligence/contracts/types';
+import type { RetrievalPort } from '../../context-intelligence/orchestration/orchestrator';
+import { LIVE_TRANSCRIPT_SOURCE_ID } from '../../context-intelligence/retrieval/live-transcript-port';
+import type { ModeSourceContract } from '../modeSourceContract';
+import { resolveTurnSourceDecision, type TurnSourceDecision } from '../../llm/turnSourceDecision';
 
 /**
  * Raw text for a profile doc (deep-test D1). Prefer the persisted raw_text
@@ -70,21 +75,106 @@ const EMPTY: CollectedProfileSources = {
   resolved: [],
 };
 
+/** Intersect the template ceiling with canonical TURN consent, not switch eligibility.
+ * Without a decision, only the default turn is considered; callers handling an
+ * explicit switch must pass their preflight and recheck actual availability. */
+export function permittedV3ProfileSources(
+  profileSources: readonly SourceType[],
+  contract: ModeSourceContract | null | undefined,
+  decision?: TurnSourceDecision,
+): SourceType[] {
+  if (!contract || ['reference_files_only', 'reference_files_plus_transcript', 'transcript_only'].includes(contract.sourceAuthority)) return [];
+  const turn = decision ?? resolveTurnSourceDecision({
+    sourceContract: contract,
+    availability: {
+      hasReferenceFiles: false,
+      hasProfileFacts: profileSources.includes('RESUME') || profileSources.includes('PROFILE_FACT'),
+      hasJobDescription: profileSources.includes('JOB_DESCRIPTION'),
+      hasLiveTranscript: false, hasMeetingRag: false,
+    },
+  });
+  if (turn.outcome === 'explicit_denied' || turn.outcome === 'source_unavailable') return [];
+  return profileSources.filter((source) => {
+    if (source === 'JOB_DESCRIPTION') return turn.allowedEvidenceKinds.includes('profile_jd');
+    if (source === 'RESUME' || source === 'PROFILE_FACT') return turn.allowedEvidenceKinds.includes('profile_resume') || turn.allowedEvidenceKinds.includes('projects');
+    return false;
+  });
+}
+
+/** Mixed defaults leave reference/meeting selection to the caller, as the
+ * canonical resolver specifies. Explicit requests never inherit that fallback. */
+export function permittedV3TurnPools(decision: TurnSourceDecision) {
+  const open = decision.outcome !== 'explicit_denied' && decision.outcome !== 'source_unavailable';
+  const mixedDefault = decision.outcome === 'default'
+    && (decision.sourceAuthority === 'general_mixed' || decision.sourceAuthority === 'ask_if_ambiguous');
+  const has = (kind: TurnSourceDecision['allowedEvidenceKinds'][number]) => open && decision.allowedEvidenceKinds.includes(kind);
+  return {
+    references: open && (has('reference_files') || mixedDefault),
+    profileResume: has('profile_resume') || has('projects'),
+    profileJd: has('profile_jd'),
+    liveTranscript: open && (has('live_transcript') || mixedDefault),
+    meetingRag: open && (has('meeting_rag') || mixedDefault),
+  };
+}
+
+/** Gate by pool origin, not just SourceType: an attached résumé is a mode file,
+ * not permission to read Profile settings. Filter BEFORE port merge/capping. */
+export function gateV3TurnRetrievalPort(
+  port: RetrievalPort,
+  pool: 'mode' | 'profile' | 'meeting' | 'screen',
+  decision: TurnSourceDecision,
+): RetrievalPort {
+  const allowed = permittedV3TurnPools(decision);
+  const enabled = pool === 'mode' ? allowed.references
+    : pool === 'profile' ? allowed.profileResume || allowed.profileJd
+    : pool === 'meeting' ? allowed.liveTranscript || allowed.meetingRag
+    : decision.outcome !== 'explicit_denied' && decision.outcome !== 'source_unavailable';
+  const admits = (e: EvidenceItem) => pool === 'profile'
+    ? (e.sourceType === 'JOB_DESCRIPTION' ? allowed.profileJd : (e.sourceType === 'RESUME' || e.sourceType === 'PROFILE_FACT') && allowed.profileResume)
+    : pool === 'meeting' ? e.sourceType === 'MEETING_TRANSCRIPT' && (e.sourceId === LIVE_TRANSCRIPT_SOURCE_ID ? allowed.liveTranscript : allowed.meetingRag)
+    : pool === 'screen' ? e.sourceType === 'SCREEN_CONTEXT' : true;
+  return {
+    probeAnchors: question => enabled && port.probeAnchors?.(question) === true,
+    probeAnchorSources: question => enabled ? (port.probeAnchorSources?.(question) ?? []) : [],
+    async retrieve(args) {
+      if (!enabled) return { evidence: [], attempts: [] };
+      const result = await port.retrieve(args);
+      return { ...result, evidence: result.evidence.filter(admits) };
+    },
+  };
+}
+
+// Retrieval identity includes the exact raw material being indexed. The shared
+// ActiveProfileContext.documentHash remains structured-only for telemetry.
+function profileRetrievalVersion(structured: unknown, rawText: string | null): string {
+  return crypto.createHash('sha256').update(JSON.stringify([structured, rawText])).digest('hex').slice(0, 16);
+}
+
 /**
  * Collect the ACTIVE profile documents (+ their OKF verified cards, when packs
  * exist) as plain values. Read per turn — no caching here — so a profile
- * re-upload is visible on the very next answer; versionId is the content hash
- * of the structured extraction, which is what invalidates stale evidence.
+ * re-upload is visible on the very next answer; versionId hashes both the
+ * structured extraction and resolved raw text to invalidate stale evidence.
  *
  * Never throws: profile hydration is additive, and a defect here must degrade
  * to "mode attachments only", never break a live answer.
  */
-export function collectV3ProfileSources(orchestrator: unknown): CollectedProfileSources {
+export function collectV3ProfileSources(
+  orchestrator: unknown,
+  permittedSources: readonly SourceType[] = ['RESUME', 'JOB_DESCRIPTION', 'PROFILE_FACT'],
+): CollectedProfileSources {
   try {
     if (!orchestrator) return EMPTY;
     const { buildActiveProfileContext } = require('../../llm/ActiveProfileContext') as
       typeof import('../../llm/ActiveProfileContext');
-    const ctx = buildActiveProfileContext(orchestrator as never);
+    const includeResume = permittedSources.includes('RESUME');
+    const includeJD = permittedSources.includes('JOB_DESCRIPTION');
+    if (!includeResume && !includeJD) return EMPTY;
+    const source = orchestrator as import('../../llm/ActiveProfileContext').ActiveProfileContextOrchestratorLike;
+    const ctx = buildActiveProfileContext({
+      ...(includeResume ? { activeResume: source.activeResume } : {}),
+      ...(includeJD ? { activeJD: source.activeJD } : {}),
+    });
 
     // OKF verified cards (optional — packs exist only when the OKF flag was on
     // at ingest time). Keyed by kind via pack fileName? No — by source type.
@@ -103,8 +193,8 @@ export function collectV3ProfileSources(orchestrator: unknown): CollectedProfile
           // Provenance travels so the port can refuse model-composed AOT cards.
           generatedFrom: typeof c.generatedFrom === 'string' ? c.generatedFrom : undefined,
         }));
-      resumeCards = toCards(builder.getProfilePack('resume'));
-      jdCards = toCards(builder.getProfilePack('jd'));
+      if (includeResume) resumeCards = toCards(builder.getProfilePack('resume'));
+      if (includeJD) jdCards = toCards(builder.getProfilePack('jd'));
     } catch { /* cards are additive; sections alone still answer */ }
 
     const docs: ProfileDocLike[] = [];
@@ -112,27 +202,29 @@ export function collectV3ProfileSources(orchestrator: unknown): CollectedProfile
 
     if (ctx.activeResume?.structured) {
       const id = canonicalProfileSourceId('resume');
+      const rawText = rawTextForDoc(ctx.activeResume.rawText, ctx.activeResume.sourceUri);
       docs.push({
         kind: 'resume',
         sourceId: id,
-        versionId: ctx.activeResume.documentHash,
+        versionId: profileRetrievalVersion(ctx.activeResume.structured, rawText),
         fileName: 'Candidate Resume (Profile Intelligence)',
         structured: ctx.activeResume.structured as Record<string, unknown>,
         cards: resumeCards,
-        rawText: rawTextForDoc(ctx.activeResume.rawText, ctx.activeResume.sourceUri),
+        rawText,
       });
       resolved.push({ role: 'profile_resume', id });
     }
     if (ctx.activeJD?.structured) {
       const id = canonicalProfileSourceId('jd');
+      const rawText = rawTextForDoc(ctx.activeJD.rawText, ctx.activeJD.sourceUri);
       docs.push({
         kind: 'jd',
         sourceId: id,
-        versionId: ctx.activeJD.documentHash,
+        versionId: profileRetrievalVersion(ctx.activeJD.structured, rawText),
         fileName: 'Target Job Description (Profile Intelligence)',
         structured: ctx.activeJD.structured as Record<string, unknown>,
         cards: jdCards,
-        rawText: rawTextForDoc(ctx.activeJD.rawText, ctx.activeJD.sourceUri),
+        rawText,
       });
       resolved.push({ role: 'profile_job_description', id });
     }

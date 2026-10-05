@@ -1063,8 +1063,7 @@ export class ModesManager {
         // Reject it (and any future reserved mode) here at the single write choke
         // point so it can never become active/pinned.
         if (id === PROFILE_OKF_RESERVED_MODE_ID) {
-            console.warn('[ModesManager] setActiveMode: refusing to activate the reserved profile OKF mode');
-            return;
+            throw new Error('Cannot activate the reserved profile OKF mode');
         }
         DatabaseManager.getInstance().setActiveMode(id);
         this.invalidateActiveModeCache();
@@ -1775,15 +1774,16 @@ export class ModesManager {
                 if (hybridResult && !hybridResult.usedFallback && hybridResult.formattedContext) {
                     return hybridResult.formattedContext;
                 }
-                // Hybrid unavailable — fall back to lexical + identity block.
+                // Keep the captured file owner if the active mode changed while
+                // hybrid retrieval was awaiting a provider.
                 return this.buildRetrievedActiveModeContextBlock(
-                    query, transcript, tokenBudget, answerType, excludeCustomContext, pinnedModeId, retrievalOptions,
+                    query, transcript, tokenBudget, answerType, excludeCustomContext, mode.id, retrievalOptions,
                 );
             } catch (err) {
                 // Don't let a hybrid outage block a document-grounded answer.
                 console.warn('[ModesManager] hybrid forceDocumentGrounding failed, falling back to lexical:', (err as { message?: string })?.message);
                 return this.buildRetrievedActiveModeContextBlock(
-                    query, transcript, tokenBudget, answerType, excludeCustomContext, pinnedModeId, retrievalOptions,
+                    query, transcript, tokenBudget, answerType, excludeCustomContext, mode.id, retrievalOptions,
                 );
             }
         }
@@ -1829,7 +1829,7 @@ export class ModesManager {
             console.warn('[ModesManager] hybrid retrieval failed, falling back to lexical:', (err as Error)?.message);
         }
 
-        const lexical = this.buildRetrievedActiveModeContextBlock(query, transcript, tokenBudget, answerType, excludeCustomContext, pinnedModeId, retrievalOptions);
+        const lexical = this.buildRetrievedActiveModeContextBlock(query, transcript, tokenBudget, answerType, excludeCustomContext, mode.id, retrievalOptions);
         try {
             const { telemetryService } = require('./telemetry/TelemetryService');
             telemetryService.track({

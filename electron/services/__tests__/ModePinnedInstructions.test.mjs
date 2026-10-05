@@ -5,35 +5,62 @@
 //   1. getActiveModePinnedInstructions returns the customContext deterministically.
 //   2. Sensitivity scoping still applies (salary/pricing chunks dropped for
 //      non-negotiation answer types; included for negotiation).
-//   3. 1,200-char cap.
+//   3. Editor-aligned 8,000-char cap with an explicit truncation marker.
 //   4. Custom (user-built) modes surface their NAME.
 //   5. PromptAssembler always includes the pinned block (injection-escaped),
 //      and skips it when the legacy modeContext path already carries it.
 //   6. Retrieval with excludeCustomContext=true returns reference-file snippets
 //      only (no duplicate custom-context source).
 //
-// Uses the same stub-the-singleton pattern as ModesManager.test.mjs (no SQLite).
+// Mocks only the bundle's database boundary, as in ModesManager.test.mjs;
+// mode resolution, contract migration and pinned-instruction semantics stay real.
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import Module from 'node:module';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distRoot = path.resolve(__dirname, '../../../dist-electron/electron');
 
-const { ModesManager } = await import(pathToFileURL(path.join(distRoot, 'services/ModesManager.js')).href);
+// Expose the inlined persistence boundary in memory, never rewriting the bundle.
+const modesPath = path.join(distRoot, 'services/ModesManager.js');
+const modesBundle = new Module(modesPath);
+modesBundle.filename = modesPath;
+modesBundle.paths = Module._nodeModulePaths(path.dirname(modesPath));
+modesBundle._compile(fs.readFileSync(modesPath, 'utf8') + '\nmodule.exports.fixtureDatabase = DatabaseManager;', modesPath);
+const { ModesManager, fixtureDatabase } = modesBundle.exports;
 const { PromptAssembler } = await import(pathToFileURL(path.join(distRoot, 'services/context/PromptAssembler.js')).href);
 const { ModeContextRetriever } = await import(pathToFileURL(path.join(distRoot, 'services/ModeContextRetriever.js')).href);
 
-/** Point the singleton's getActiveMode at a fixed mode row (same pattern as
- *  ModesManager.test.mjs installDb) and invalidate the W1 info cache. */
 function installActiveMode(mode) {
-    const manager = ModesManager.getInstance();
-    manager.getActiveMode = () => mode;
-    // The PI v3 cache memoizes getActiveModeInfo — reset between tests.
-    manager._activeModeInfoCacheValid = false;
-    manager._activeModeInfoCache = null;
+    const row = mode ? {
+        id: mode.id, name: mode.name, template_type: mode.templateType,
+        custom_context: mode.customContext, is_active: 0, created_at: mode.createdAt,
+        source_contract_json: null,
+    } : null;
+    const requireRow = id => {
+        if (!row || row.id !== id) throw new Error(`Mode not found: ${id}`);
+        return row;
+    };
+    const database = {
+        getModes: () => row ? [row] : [],
+        getActiveMode: () => row?.is_active === 1 ? row : null,
+        getReferenceFiles: () => [],
+        updateMode(id, updates) {
+            requireRow(id).source_contract_json = updates.sourceContractJson;
+        },
+        setActiveMode(id) {
+            if (id !== null) requireRow(id);
+            if (row) row.is_active = row.id === id ? 1 : 0;
+        },
+    };
+    fixtureDatabase.getInstance = () => database;
+    // A fresh manager avoids unrelated singleton startup/built-in seeding.
+    const manager = new ModesManager();
+    manager.setActiveMode(mode?.id ?? null);
     return manager;
 }
 
@@ -43,6 +70,23 @@ const makeMode = ({ name = 'Sales Push', templateType = 'sales', customContext =
 });
 
 describe('W2: getActiveModePinnedInstructions', () => {
+    test('legacy fixture contracts persist once and missing mode writes still fail', t => {
+        const mode = makeMode({ customContext: 'Prefer concise answers.' });
+        const mgr = installActiveMode(mode);
+        const writes = t.mock.method(fixtureDatabase.getInstance(), 'updateMode');
+        assert.equal(mgr.getActiveMode().sourceContract, null);
+        const first = mgr.getActiveModePinnedInstructions('sales_answer');
+        const persisted = mgr.getActiveMode().sourceContract;
+        assert.equal(persisted.origin, 'migrated_from_prompt');
+        assert.equal(writes.mock.callCount(), 1);
+        assert.equal(mgr.getActiveModePinnedInstructions('sales_answer'), first);
+        assert.deepEqual(mgr.getActiveMode().sourceContract, persisted);
+        assert.equal(writes.mock.callCount(), 1, 'persisted contracts are not re-migrated');
+        assert.throws(() => mgr.setActiveMode('missing'), /Mode not found: missing/);
+        assert.throws(() => mgr.updateMode('missing', { sourceContract: persisted }), /Mode not found: missing/);
+        assert.equal(mgr.getActiveMode().id, mode.id, 'failed activation preserves the fixture mode');
+    });
+
     test('returns the customContext deterministically (no retrieval scoring)', () => {
         const mgr = installActiveMode(makeMode({
             customContext: 'Always position our premium tier first. Mention the Q3 case study.',

@@ -44,18 +44,20 @@ describe('a diagram turn in the V3 composition', () => {
     assert.ok(!before.sections.includes('diagram_turn'));
   });
 
-  test('the note sits after the length default and before the user instructions', () => {
+  test('the action note stays after the USER length default; standing instructions are SYSTEM', () => {
     const c = compose('Design a notification service with retries.', {
       defaultLengthDirective: APP_LENGTH,
       realtimeInstruction: 'Be direct.',
       diagramTurn: { note: NOTE },
     });
     assert.ok(c.sections.includes('diagram_turn'));
-    assert.deepEqual(c.sections.slice(-3), ['default_length', 'diagram_turn', 'user_instructions']);
+    assert.deepEqual(c.sections.slice(-2), ['default_length', 'diagram_turn']);
     assert.ok(c.user.indexOf('40 to 60 words') < c.user.indexOf(NOTE));
-    assert.ok(c.user.indexOf(NOTE) < c.user.indexOf('<user_instructions'));
+    assert.match(c.system, /<user_instructions/);
+    assert.ok(c.system.includes('Be direct.'));
+    assert.doesNotMatch(c.user, /<user_instructions/);
     assert.match(c.user, /<presentation_instruction note="Diagram for this turn\. Affects layout ONLY\.">/);
-    assert.ok(c.user.trimEnd().endsWith('</user_instructions>'), 'the user keeps the last word');
+    assert.ok(c.system.trimEnd().endsWith('</user_instructions>'), 'standing instructions hold SYSTEM recency');
   });
 
   test('the note is app text and never enters the system prompt', () => {

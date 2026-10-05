@@ -5,6 +5,7 @@
 import Database from 'better-sqlite3';
 import { LLMHelper } from '../LLMHelper';
 import { courseGroundingAsReference } from '../courses/chatGrounding';
+import { composeLauncherAskContext, type LauncherAskContext } from './launcherAskContext';
 import { providerStreamPolicy, type ProviderStreamPolicy } from '../llm/providerStreamPolicy';
 import { preprocessTranscript, RawSegment } from './TranscriptPreprocessor';
 import { chunkTranscript } from './SemanticChunker';
@@ -401,14 +402,18 @@ export class RAGManager {
         abortSignal?: AbortSignal,
         courseGrounding?: string | null,
         onProviderPolicy?: (policy: ProviderStreamPolicy) => void,
+        launcherContext?: LauncherAskContext,
     ): AsyncGenerator<string, void, unknown> {
         if (!this.llmHelper) {
             throw new Error('LLM helper not initialized');
         }
 
         if (abortSignal?.aborted) return;
-        // Retrieve from all meetings
-        const context = await this.retriever.retrieveGlobal(query);
+        // A persisted mode contract owns meeting admission, not the presence
+        // of a global RAG index. Literal meeting search is a separate IPC path.
+        const context = !launcherContext || launcherContext.allowMeetingContext
+            ? await this.retriever.retrieveGlobal(query)
+            : { chunks: [], formattedContext: '', intent: 'open_question' as const };
         if (abortSignal?.aborted) return;
 
         // ALWAYS ANSWER (2026-09-07, owner's direction): an empty global search
@@ -426,11 +431,18 @@ export class RAGManager {
 
         // Use the selected model, not the legacy Gemini tier list or Background
         // Model. The helper retains chat's scope gates, filters and outcome.
+        const composed = launcherContext ? await composeLauncherAskContext({
+            snapshot: launcherContext, question: query, courseGrounding,
+            meetingContext: context.chunks.length ? context.formattedContext : undefined,
+            signal: abortSignal,
+        }) : undefined;
+        if (abortSignal?.aborted) return;
         const controller = new AbortController();
-        const { stream, outcome: streamOutcome } = this.llmHelper.streamRAGAnswer(
-            query, undefined, evidence, prompt, true, true,
-            courseGrounding ? ['transcript', 'reference_files'] : ['transcript'],
-            controller.signal, undefined, { v3Owned: true },
+        const transport = launcherContext?.transport ?? this.llmHelper;
+        const { stream, outcome: streamOutcome } = transport.streamRAGAnswer(
+            composed?.user ?? query, undefined, composed ? undefined : evidence, composed?.system ?? prompt, true, true,
+            composed?.dataScopes ?? (courseGrounding ? ['transcript', 'reference_files'] : ['transcript']),
+            controller.signal, undefined, { v3Owned: true, ...(launcherContext ? { pinnedModeId: launcherContext.mode?.id } : {}) },
         );
 
         for await (const chunk of raceGeneratorWithDeadline(stream, RAG_STREAM_STALL_MS, controller, abortSignal, onProviderPolicy)) {

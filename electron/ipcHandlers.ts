@@ -1935,17 +1935,28 @@ export function initializeIpcHandlers(appState: AppState): void {
           }
         }
 
-        courseBlock = courseGroundingAsReference(await getChatCourseGrounding(skillStrippedMessage ?? message, pinnedCourseIds));
+        const launcherComposer = options?.selectedModelOnly
+          ? require('./rag/launcherAskContext') as typeof import('./rag/launcherAskContext') : undefined;
+        const launcherSnapshot = launcherComposer?.captureLauncherAskContext({
+          question: skillStrippedMessage ?? message, llmHelper, senderId: event.sender.id,
+        });
+        const launcherCourseGrounding = await getChatCourseGrounding(skillStrippedMessage ?? message, pinnedCourseIds);
+        courseBlock = courseGroundingAsReference(launcherCourseGrounding);
         if (myController.signal.aborted) return null;
 
         // Global Ask-anything fallback has the same selected-model contract as
         // RAG. Do not let a Background Model or active-mode pipeline steal it.
         if (options?.selectedModelOnly) {
-          const groundingContext = [context, courseBlock, skillPromptBlock].filter(Boolean).join('\n\n') || undefined;
-          const { stream, outcome } = llmHelper.streamRAGAnswer(
-            skillStrippedMessage ?? message, imagePaths, groundingContext, CHAT_MODE_PROMPT,
-            true, true, courseBlock ? ['reference_files'] : [], myController.signal,
-            undefined, { v3Owned: true },
+          const composed = await launcherComposer!.composeLauncherAskContext({
+            snapshot: launcherSnapshot!, question: skillStrippedMessage ?? message,
+            courseGrounding: launcherCourseGrounding, meetingContext: context,
+            skillInstructions: skillPromptBlock, signal: myController.signal,
+          });
+          if (myController.signal.aborted) return null;
+          const { stream, outcome } = launcherSnapshot!.transport.streamRAGAnswer(
+            composed.user, imagePaths, undefined, composed.system,
+            true, true, composed.dataScopes, myController.signal,
+            undefined, { v3Owned: true, pinnedModeId: launcherSnapshot!.mode?.id },
           );
           const { raceGeneratorWithDeadline } = require('./rag/RAGManager') as typeof import('./rag/RAGManager');
           let finalText = '';
@@ -2022,7 +2033,8 @@ export function initializeIpcHandlers(appState: AppState): void {
               modeInfo ? rawMode : null, 'ipc/manual-chat', { quietWhenAbsent: true });
             const policy = resolveModePolicy(modeId);
 
-            const files = modeInfo?.id ? (mm.getReferenceFiles?.(modeInfo.id) ?? []) : [];
+            const candidateFiles = modeInfo?.id ? (mm.getReferenceFiles?.(modeInfo.id) ?? []) : [];
+            let files = candidateFiles;
             // Fail-closed retrieval port over this mode's files. The registry
             // construction lives in ONE factory (mode-retrieval-port.ts) shared
             // with the engine surfaces — a second inline copy of a
@@ -2035,8 +2047,8 @@ export function initializeIpcHandlers(appState: AppState): void {
             // "Untitled" custom mode planned [] for every job question because
             // the general policy's allowlist has no CANDIDATE_FILE/JOB_DESCRIPTION.
             // Empty for every built-in non-general mode.
-            const extraSourceTypes = attachmentSourceTypeExtensions(modeId, files);
-            const effectiveAllowedSourceTypes = [...policy.allowedSourceTypes, ...extraSourceTypes];
+            let extraSourceTypes = attachmentSourceTypeExtensions(modeId, files);
+            let effectiveAllowedSourceTypes = [...policy.allowedSourceTypes, ...extraSourceTypes];
 
             // Context-debug: identity list of the sources this turn could read
             // (id/role/name/status — never content). Built only when the debug
@@ -2055,22 +2067,7 @@ export function initializeIpcHandlers(appState: AppState): void {
                 }));
               }
             } catch { /* debug identity only */ }
-            const modePort = createModeRetrievalPort({
-              rerankSurface: 'manual',
-              // Typed turns outside a meeting may query the bundled embedder's vectors.
-              meetingActive: () => appState.getIsMeetingActive(),
-              modesManager: mm,
-              modeInfo,
-              files,
-              // Without this every file is typed REFERENCE_FILE, and a résumé in
-              // a mode that authorizes [RESUME, PROFILE_FACT] is retrieved and
-              // then discarded by claim authority — the user sees "not covered"
-              // for facts in their own résumé. Must match what decide() plans,
-              // so the extension list is shared with the bridge below.
-              allowedSourceTypes: effectiveAllowedSourceTypes,
-              tokenBudget: policy.contextBudget.evidenceTokens,
-              userId: V3_USER_ID,
-            });
+            // Construct the file port only after canonical turn admission below.
 
             // Meeting evidence (issue #552): the JIT semantic port scoped to the
             // LIVE index id plus the BM25 port over raw speech, from the same
@@ -2089,37 +2086,66 @@ export function initializeIpcHandlers(appState: AppState): void {
             const { resolveMeetingEvidence } = require('./context-intelligence/retrieval/meeting-evidence') as
               typeof import('./context-intelligence/retrieval/meeting-evidence');
             const v3ConversationKey = v3ConversationSessionId(appState, senderId);
-            const v3MeetingEvidence = resolveMeetingEvidence({
-              rag: appState.getRAGManager?.() ?? null,
-              segments: appState.getIntelligenceManager?.()?.getCurrentMeetingTranscript?.() ?? [],
-              allowedSourceTypes: policy.allowedSourceTypes,
-              userId: V3_USER_ID,
-              sessionId: v3ConversationKey,
-              tokenBudget: policy.contextBudget.evidenceTokens,
-            });
+            const v3MeetingEvidence = (() => {
+              try {
+                return resolveMeetingEvidence({
+                  rag: appState.getRAGManager?.() ?? null,
+                  segments: appState.getIntelligenceManager?.()?.getCurrentMeetingTranscript?.() ?? [],
+                  allowedSourceTypes: policy.allowedSourceTypes,
+                  userId: V3_USER_ID,
+                  sessionId: v3ConversationKey,
+                  tokenBudget: policy.contextBudget.evidenceTokens,
+                });
+              } catch (error) {
+                console.warn('[V3] meeting evidence failed — retaining mode/profile evidence:', (error as Error)?.message ?? error);
+                return { ports: [], scopeMeetingId: null, inLiveMeeting: false };
+              }
+            })();
+            const { collectV3ProfileSources, permittedV3ProfileSources, permittedV3TurnPools, gateV3TurnRetrievalPort } = require('./services/knowledge/v3ProfileSources');
+            const v3SourceContract = modeInfo?.sourceContract ?? (modeInfo?.id ? mm.getOrMigrateSourceContract?.(modeInfo.id) : null);
+            const { resolveTurnSourceDecision } = require('./llm/turnSourceDecision');
+            const { resolveExplicitSourceRequests } = require('./intelligence/context-os/explicitSourceSwitch');
+            const v3ExplicitRequests = resolveExplicitSourceRequests(String((skillStrippedMessage ?? message) || ''));
+            const v3SourceAvailability = {
+              hasReferenceFiles: candidateFiles.length > 0,
+              hasLiveTranscript: v3MeetingEvidence.inLiveMeeting,
+              hasMeetingRag: Boolean(v3MeetingEvidence.scopeMeetingId),
+            };
+            const v3SourcePreflight = resolveTurnSourceDecision({ sourceContract: v3SourceContract, explicitRequests: v3ExplicitRequests, availability: {
+              ...v3SourceAvailability,
+              hasProfileFacts: policy.profileSources.includes('RESUME') || policy.profileSources.includes('PROFILE_FACT'),
+              hasJobDescription: policy.profileSources.includes('JOB_DESCRIPTION'),
+            } });
+            let v3ProfileAvailability = { hasProfileFacts: false, hasJobDescription: false };
 
             // Profile Intelligence hydration (2026-07-31 source-routing fix).
             // The user's active résumé/target JD, uploaded ONCE in Profile
             // settings, are the PRIMARY pool for profile-aware modes — mode
             // attachments are optional supplements, and requiring duplicates
             // was the live defect. Gated on the mode's EXPLICIT
-            // policy.profileSources opt-in (empty for recruiting/sales/etc so
-            // the user's own documents can never leak into those turns), and
+            // policy.profileSources opt-in AND persisted source permissions
+            // (empty for recruiting/sales/etc so the user's profile cannot leak), and
             // additive: any failure here degrades to mode attachments only.
             let v3ProfilePort: unknown = null;
             let v3ProfileCounts = { profileResume: 0, profileJd: 0, profileFact: 0 };
             let v3ProfileResolved: Array<{ role: string; id: string }> = [];
             try {
-              if (policy.profileSources?.length) {
-                const { collectV3ProfileSources } = require('./services/knowledge/v3ProfileSources');
-                const collected = collectV3ProfileSources(llmHelper.getKnowledgeOrchestrator?.() ?? null);
-                if (collected.docs.length) {
+              const candidates = permittedV3ProfileSources(policy.profileSources, v3SourceContract, v3SourcePreflight);
+              if (candidates.length) {
+                const collected = collectV3ProfileSources(llmHelper.getKnowledgeOrchestrator?.() ?? null, candidates);
+                v3ProfileAvailability = {
+                  hasProfileFacts: collected.counts.profileResume + collected.counts.profileFact > 0,
+                  hasJobDescription: collected.counts.profileJd > 0,
+                };
+                const admitted = resolveTurnSourceDecision({ sourceContract: v3SourceContract, explicitRequests: v3ExplicitRequests, availability: { ...v3SourceAvailability, ...v3ProfileAvailability } });
+                const profileSources = permittedV3ProfileSources(candidates, v3SourceContract, admitted);
+                if (profileSources.length && collected.docs.length) {
                   const { createProfileRetrievalPort } = require('./context-intelligence/retrieval/profile-retrieval-port');
                   const v3ProfileRawRetriever = require('./services/knowledge/v3ProfileSources').buildProfileRawRetriever(mm, collected.docs, { tokenBudget: policy.contextBudget.evidenceTokens, rerankSurface: 'manual', meetingActive: () => appState.getIsMeetingActive() });
                   v3ProfilePort = createProfileRetrievalPort({
                     docs: collected.docs,
                     allowedSourceTypes: policy.allowedSourceTypes,
-                    profileSources: policy.profileSources,
+                    profileSources,
                     userId: V3_USER_ID,
                     ...(v3ProfileRawRetriever ? { rawRetriever: v3ProfileRawRetriever } : {}),
                   });
@@ -2134,6 +2160,25 @@ export function initializeIpcHandlers(appState: AppState): void {
               // from "no profile" and reintroduces the upload-again defect (§22.1).
               console.warn('[V3] profile hydration failed — continuing with mode attachments only:', (profErr as Error)?.message ?? profErr);
             }
+
+            const v3TurnDecision = resolveTurnSourceDecision({ sourceContract: v3SourceContract, explicitRequests: v3ExplicitRequests, availability: { ...v3SourceAvailability, ...v3ProfileAvailability } });
+            const v3TurnPools = permittedV3TurnPools(v3TurnDecision);
+            files = v3TurnPools.references ? candidateFiles : [];
+            extraSourceTypes = attachmentSourceTypeExtensions(modeId, files);
+            effectiveAllowedSourceTypes = [...policy.allowedSourceTypes, ...extraSourceTypes];
+            v3DebugSources = v3DebugSources?.filter(s => files.some((f: { id?: unknown }) => String(f.id) === s.id));
+            if (!v3TurnPools.profileResume && !v3TurnPools.profileJd) {
+              v3ProfilePort = null;
+              v3ProfileCounts = { profileResume: 0, profileJd: 0, profileFact: 0 };
+              v3ProfileResolved = [];
+            }
+            v3MeetingEvidence.inLiveMeeting = v3MeetingEvidence.inLiveMeeting && (v3TurnPools.liveTranscript || v3TurnPools.meetingRag);
+            if (!v3TurnPools.meetingRag) v3MeetingEvidence.scopeMeetingId = null;
+            const modePort = gateV3TurnRetrievalPort(createModeRetrievalPort({
+              modesManager: mm, modeInfo, files, allowedSourceTypes: effectiveAllowedSourceTypes,
+              tokenBudget: policy.contextBudget.evidenceTokens, userId: V3_USER_ID,
+              rerankSurface: 'manual', meetingActive: () => appState.getIsMeetingActive(),
+            }), 'mode', v3TurnDecision);
 
             // The skill prefix is stripped for V3 too — otherwise the model reads
             // a literal "/humanize " at the head of the question (PR #429 Bug 003).
@@ -2251,9 +2296,9 @@ export function initializeIpcHandlers(appState: AppState): void {
 
             const v3Ports = [
               modePort,
-              ...(v3ScreenPort ? [v3ScreenPort] : []),
-              ...(v3ProfilePort ? [v3ProfilePort] : []),
-              ...v3MeetingEvidence.ports,
+              ...(v3ScreenPort ? [gateV3TurnRetrievalPort(v3ScreenPort, 'screen', v3TurnDecision)] : []),
+              ...(v3ProfilePort ? [gateV3TurnRetrievalPort(v3ProfilePort as never, 'profile', v3TurnDecision)] : []),
+              ...v3MeetingEvidence.ports.map(p => gateV3TurnRetrievalPort(p, 'meeting', v3TurnDecision)),
             ];
             const port = v3Ports.length > 1 ? combineRetrievalPorts(v3Ports as never[]) : modePort;
 
@@ -2313,7 +2358,7 @@ export function initializeIpcHandlers(appState: AppState): void {
               // transcript at all — the BM25 port admits nothing for a meeting-wide
               // ask, and typed chat had no speech window). Overlay (live) surface
               // only; the launcher's reading surface is not inside a meeting.
-              conversationSummary: answerSurface === 'live' ? (() => {
+              conversationSummary: answerSurface === 'live' && v3TurnPools.liveTranscript ? (() => {
                 try {
                   const { speechWindowForPrompt } = require('./llm/conversationHistoryPolicy') as typeof import('./llm/conversationHistoryPolicy');
                   const formatted = String(appState.getIntelligenceManager?.()?.getFormattedContext?.(180) ?? '');
@@ -5103,6 +5148,10 @@ export function initializeIpcHandlers(appState: AppState): void {
               try { myController?.abort(); } catch { /* noop */ }
             },
             onToken: (token: string) => {
+              if (_chatStreamsBySender.get(senderId)?.streamId !== myStreamId) {
+                manualSuperseded = true;
+                return;
+              }
               noteManualFirstToken();
               // F-302: "useful" must mean USER-USEFUL CONTENT, not "a token
               // object arrived". raceStreamWithDeadline forwards every yielded
@@ -7245,9 +7294,16 @@ export function initializeIpcHandlers(appState: AppState): void {
   });
 
   // Settings Window
-  safeHandle('toggle-settings-window', (event, { x, y } = {}) => {
-    appState.settingsWindowHelper.toggleWindow(x, y);
+  safeHandle('toggle-settings-window', (event, request = {}) => {
+    if (!request || typeof request !== 'object' || Array.isArray(request)) throw new Error('Invalid popup request');
+    const { x, y, panel = 'settings' } = request;
+    if (panel !== 'settings' && panel !== 'courses' && panel !== 'modes') throw new Error('Invalid popup panel');
+    if ((x !== undefined || y !== undefined) && (!Number.isFinite(x) || !Number.isFinite(y))) {
+      throw new Error('Invalid popup coordinates');
+    }
+    appState.settingsWindowHelper.toggleWindow(x, y, panel);
   });
+  safeHandle('get-settings-popup-state', () => appState.settingsWindowHelper.getPopupState());
 
   // Open the launcher's SettingsOverlay on a specific tab (callable from any window)
   safeHandle('settings:open-tab', (_, tab: string) => {
@@ -8106,6 +8162,12 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
 
     const courseGrounding = await getChatCourseGrounding(resolvedSkill.currentRequest, request.courseIds);
+    if (controller.signal.aborted || activeDirectAssistByRequest.get(requestKey) !== active) {
+      event.sender.removeListener?.('destroyed', onSenderDestroyed);
+      if (activeDirectAssistBySurface.get(surfaceKey) === active) activeDirectAssistBySurface.delete(surfaceKey);
+      if (activeDirectAssistByRequest.get(requestKey) === active) activeDirectAssistByRequest.delete(requestKey);
+      return { accepted: false, requestId: request.requestId };
+    }
     if (courseGrounding) referenceFiles.unshift({ fileName: 'Course ground truth', content: courseGrounding });
 
     const directRequest: DirectAssistRequestInput = Object.freeze({
@@ -8147,7 +8209,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
       try {
         for await (const streamEvent of service.stream(directRequest, controller.signal)) {
-          if (terminalSent) break;
+          if (terminalSent || controller.signal.aborted || activeDirectAssistByRequest.get(requestKey) !== active) break;
           if (streamEvent.requestId !== request.requestId) {
             throw new Error('request_correlation_failed');
           }
@@ -16401,8 +16463,24 @@ export function initializeIpcHandlers(appState: AppState): void {
   // Reset intelligence state
   safeHandle('reset-intelligence', async () => {
     try {
+      // Invalidation, not merely abort: providers can finish after cancellation.
+      const { abortAndInvalidateChatStreams } = require('./services/chatStreamRegistry') as typeof import('./services/chatStreamRegistry');
+      abortAndInvalidateChatStreams(_chatStreamsBySender);
+      _phoneChatLatestId++;
+      for (const active of activeDirectAssistByRequest.values()) active.controller.abort();
+      activeDirectAssistByRequest.clear();
+      activeDirectAssistBySurface.clear();
+      abortPriorRAGQueriesOfClass((key) => key.startsWith('live-'));
+      _manualConversationMemory.clearAllSessions();
+      _manualCodingState.clearAllSessions();
+      _manualDiversityGuard.reset();
       const intelligenceManager = appState.getIntelligenceManager();
       intelligenceManager.reset();
+      appState.clearQueues();
+      await appState.resetConversationTransientState();
+      BrowserWindow.getAllWindows().forEach(win => {
+        if (!win.isDestroyed()) win.webContents.send('session-reset');
+      });
       return { success: true };
     } catch (error: any) {
       return { success: false, error: error.message };
@@ -17093,6 +17171,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
     try {
       const courseGrounding = await getChatCourseGrounding(query, courseIds);
+      if (abortController.signal.aborted) return { success: true };
       const stream = ragManager.queryMeeting(liveMeetingId, query, abortController.signal, courseGrounding);
 
       // Accumulated so the turn can be RECORDED (issue #552). A RAG-answered
@@ -17155,13 +17234,17 @@ export function initializeIpcHandlers(appState: AppState): void {
     activeRAGQueries.set(queryKey, abortController);
 
     try {
+      const { captureLauncherAskContext } = require('./rag/launcherAskContext') as typeof import('./rag/launcherAskContext');
+      const launcherSnapshot = captureLauncherAskContext({
+        question: query, llmHelper: appState.processingHelper.getLLMHelper(), senderId: event.sender.id,
+      });
       const courseGrounding = await getChatCourseGrounding(query, courseIds);
       const stream = ragManager.queryGlobal(query, abortController.signal, courseGrounding, policy => {
         event.sender.send('chat:stream-policy', {
           source: 'rag', requestId,
           firstUsefulDeadlineMs: policy.firstUsefulDeadlineMs, interTokenStallMs: policy.interTokenStallMs,
         });
-      });
+      }, launcherSnapshot);
 
       for await (const chunk of stream) {
         if (abortController.signal.aborted) break;
@@ -18638,8 +18721,11 @@ export function initializeIpcHandlers(appState: AppState): void {
         }
       }
       const { ModesManager } = require('./services/ModesManager');
-      // Abort AND INVALIDATE every in-flight chat stream BEFORE the mode
-      // flips. A turn planned under mode A must not keep streaming into a UI
+      // Commit before changing session state. These steps are synchronous, so
+      // no answer can interleave; a failed write leaves the old session intact.
+      ModesManager.getInstance().setActiveMode(id);
+      // Abort AND INVALIDATE every in-flight chat stream before yielding.
+      // A turn planned under mode A must not keep streaming into a UI
       // whose badge now says mode B — with no per-message mode marker in the
       // renderer, that answer is indistinguishable from a B answer carrying
       // A's evidence and policy. Same bug family as BUG-MODE-BLEEDING below,
@@ -18660,7 +18746,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         const { abortAndInvalidateChatStreams } = require('./services/chatStreamRegistry') as typeof import('./services/chatStreamRegistry');
         abortAndInvalidateChatStreams(_chatStreamsBySender);
       }
-      // BUG-MODE-BLEEDING fix: clear mode-specific session context BEFORE switching modes
+      // BUG-MODE-BLEEDING fix: clear mode-specific session context in the successful switch
       // so Interview mode resume/JD context doesn't bleed into the new mode's responses.
       try {
         const appStateIntMgr = appState.getIntelligenceManager();
@@ -18689,7 +18775,6 @@ export function initializeIpcHandlers(appState: AppState): void {
       // depth, not because a live path currently reaches it unguarded.
       try { _manualCodingState.clearAllSessions(); } catch { /* non-fatal */ }
 
-      ModesManager.getInstance().setActiveMode(id);
       // Supersede in-flight LIVE answers too (the abort loop above only covers
       // manual chat streams): a WTA generation planned under the old mode must
       // not finalize into a UI now showing the new one.
@@ -20119,6 +20204,10 @@ export function initializeIpcHandlers(appState: AppState): void {
             return false;
           },
           onToken: (token: string) => {
+            if (_phoneChatLatestId !== myPhoneId) {
+              phoneSuperseded = true;
+              return;
+            }
             notePhoneFirstToken();
             try { phoneMirror.publishToken(String(myStreamId), token); } catch (_) {}
             // streamId lets the desktop renderer drop tokens from a superseded

@@ -2221,7 +2221,7 @@ export class DatabaseManager {
     }
 
     public createMode(mode: { id: string; name: string; templateType: string; customContext: string; sourceContractJson?: string }): void {
-        if (!this.db) return;
+        if (!this.db) throw new Error('Database not initialized');
         try {
             this.db.prepare(`
                 INSERT INTO modes (id, name, template_type, custom_context, is_active, source_contract_json)
@@ -2229,6 +2229,7 @@ export class DatabaseManager {
             `).run(mode.id, mode.name, mode.templateType, mode.customContext, mode.sourceContractJson ?? null);
         } catch (e) {
             console.error('[DatabaseManager] createMode failed:', e);
+            throw e;
         }
     }
 
@@ -2243,22 +2244,29 @@ export class DatabaseManager {
     }
 
     public updateMode(id: string, updates: { name?: string; templateType?: string; customContext?: string; sourceContractJson?: string | null }): void {
-        if (!this.db) return;
+        if (!this.db) throw new Error('Database not initialized');
         try {
-            if (updates.name !== undefined) {
-                this.db.prepare('UPDATE modes SET name = ? WHERE id = ?').run(updates.name, id);
-            }
-            if (updates.templateType !== undefined) {
-                this.db.prepare('UPDATE modes SET template_type = ? WHERE id = ?').run(updates.templateType, id);
-            }
-            if (updates.customContext !== undefined) {
-                this.db.prepare('UPDATE modes SET custom_context = ? WHERE id = ?').run(updates.customContext, id);
-            }
-            if (updates.sourceContractJson !== undefined) {
-                this.db.prepare('UPDATE modes SET source_contract_json = ? WHERE id = ?').run(updates.sourceContractJson, id);
-            }
+            const txn = this.db.transaction(() => {
+                if (!this.db!.prepare('SELECT id FROM modes WHERE id = ?').get(id)) {
+                    throw new Error(`Mode not found: ${id}`);
+                }
+                if (updates.name !== undefined) {
+                    this.db!.prepare('UPDATE modes SET name = ? WHERE id = ?').run(updates.name, id);
+                }
+                if (updates.templateType !== undefined) {
+                    this.db!.prepare('UPDATE modes SET template_type = ? WHERE id = ?').run(updates.templateType, id);
+                }
+                if (updates.customContext !== undefined) {
+                    this.db!.prepare('UPDATE modes SET custom_context = ? WHERE id = ?').run(updates.customContext, id);
+                }
+                if (updates.sourceContractJson !== undefined) {
+                    this.db!.prepare('UPDATE modes SET source_contract_json = ? WHERE id = ?').run(updates.sourceContractJson, id);
+                }
+            });
+            txn();
         } catch (e) {
             console.error('[DatabaseManager] updateMode failed:', e);
+            throw e;
         }
     }
 
@@ -2272,20 +2280,22 @@ export class DatabaseManager {
     }
 
     public setActiveMode(id: string | null): void {
-        if (!this.db) return;
+        if (!this.db) throw new Error('Database not initialized');
+        if (id !== null && (typeof id !== 'string' || !id)) throw new Error('Invalid mode id');
         try {
             const txn = this.db.transaction(() => {
                 this.db!.prepare('UPDATE modes SET is_active = 0').run();
-                if (id) {
+                if (id !== null) {
                     const result = this.db!.prepare('UPDATE modes SET is_active = 1 WHERE id = ?').run(id);
                     if (result.changes === 0) {
-                        console.warn(`[DatabaseManager] setActiveMode: no mode found with id "${id}" — active mode cleared`);
+                        throw new Error(`Mode not found: ${id}`);
                     }
                 }
             });
             txn();
         } catch (e) {
             console.error('[DatabaseManager] setActiveMode failed:', e);
+            throw e;
         }
     }
 
