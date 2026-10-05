@@ -37,17 +37,13 @@ export interface CourseEmbedder {
 }
 
 // Index (or re-index) one course's lessons for retrieval.
-// Idempotent per chunk via sha1(text): unchanged chunks are skipped entirely — we trust that a
-// matching content_hash implies its vector already exists, so no per-chunk vector probe is done.
+// Idempotent per chunk via sha1(text), while repairing missing FTS or vector rows.
 export async function indexCourseForRetrieval(opts: {
   db: SqliteDatabaseLike;
   courseId: string;
   embedder?: CourseEmbedder;
 }): Promise<{ indexed: number; skipped: number; error?: string }> {
-  const { db, courseId } = opts;
-  // Keep it simple: a real index run needs embeddings. (Caller may still pass one later.)
-  if (!opts.embedder) throw new Error('embedder required');
-  const embedder = opts.embedder;
+  const { db, courseId, embedder } = opts;
 
   const lessons: DbRow[] = db.prepare(
     'SELECT id, title, url, order_no, local_md_path FROM course_lessons WHERE course_id = ?',
@@ -66,6 +62,32 @@ export async function indexCourseForRetrieval(opts: {
   const insFts = db.prepare(
     'INSERT INTO course_chunks_fts (rowid, course_id, lesson_id, heading_path, text) VALUES (?, ?, ?, ?, ?)',
   );
+  const getFts = db.prepare('SELECT rowid FROM course_chunks_fts WHERE rowid = ?');
+
+  // Only probe actual dimension-named tables; vec0 also creates shadow tables in sqlite_master.
+  let vectorLookups: Map<string, DbStatement> | undefined;
+  const getVectorLookups = (): Map<string, DbStatement> => {
+    if (!vectorLookups) {
+      vectorLookups = new Map();
+      const tables = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name GLOB 'vec_course_chunks_[0-9]*'",
+      ).all();
+      for (const { name } of tables) {
+        if (typeof name === 'string' && /^vec_course_chunks_[1-9]\d*$/.test(name)) {
+          vectorLookups.set(name, db.prepare(`SELECT chunk_id FROM ${name} WHERE chunk_id = ?`));
+        }
+      }
+    }
+    return vectorLookups;
+  };
+  const hasVector = (rowId: bigint): boolean =>
+    [...getVectorLookups().values()].some((stmt) => stmt.get(rowId) != null);
+  const invalidateVectors = (rowId: bigint): void => {
+    // A reused chunk id must never point to an embedding of its previous text.
+    for (const table of getVectorLookups().keys()) {
+      db.prepare(`DELETE FROM ${table} WHERE chunk_id = ?`).run(rowId);
+    }
+  };
 
   // One vec0 table per dimension, created lazily. `dim` comes from embedding.length, never SQL input.
   const vecTables = new Map<number, DbStatement>();
@@ -79,6 +101,7 @@ export async function indexCourseForRetrieval(opts: {
       );
       stmt = db.prepare(`INSERT OR REPLACE INTO ${table}(chunk_id, embedding) VALUES (?, ?)`);
       vecTables.set(dim, stmt);
+      vectorLookups?.set(table, db.prepare(`SELECT chunk_id FROM ${table} WHERE chunk_id = ?`));
     }
     return stmt;
   };
@@ -111,24 +134,40 @@ export async function indexCourseForRetrieval(opts: {
       const hash = sha1(ch.text);
       const existing = getChunk.get(lessonKey, ord) as DbRow | undefined;
 
-      // Unchanged content → trust that its vector + FTS row already exist. Skip the rest.
-      if (existing && String(existing.content_hash ?? null) === hash) {
-        skipped++;
-        continue;
-      }
-
-      let rowId: number;
-      if (!existing || existing.id == null) {
+      const sameHash = existing?.id != null && String(existing.content_hash ?? null) === hash;
+      let rowId: bigint;
+      if (sameHash) {
+        rowId = BigInt(existing.id as number | string | bigint);
+        const ftsPresent = getFts.get(rowId) != null;
+        const vectorPresent = embedder ? hasVector(rowId) : false;
+        if (ftsPresent && (!embedder || vectorPresent)) {
+          skipped++;
+          continue;
+        }
+        if (!ftsPresent) insFts.run(rowId, courseId, lessonKey, ch.headingPath ?? null, ch.text);
+        if (!embedder || vectorPresent) {
+          indexed++;
+          continue;
+        }
+      } else if (!existing || existing.id == null) {
         const res = insChunk.run(courseId, lessonKey, ord, ch.headingPath ?? null, ch.text, hash);
-        rowId = Number(res.lastInsertRowid);
+        rowId = BigInt(res.lastInsertRowid);
       } else {
+        rowId = BigInt(existing.id as number | string | bigint);
+        invalidateVectors(rowId);
         updChunk.run(ch.text, ch.headingPath ?? null, hash, existing.id);
-        rowId = Number(existing.id);
       }
 
       // Keep the standalone FTS table in lockstep (rowid == course_chunks.id).
-      delFts.run(rowId);
-      insFts.run(rowId, courseId, lessonKey, ch.headingPath ?? null, ch.text);
+      if (!sameHash) {
+        delFts.run(rowId);
+        insFts.run(rowId, courseId, lessonKey, ch.headingPath ?? null, ch.text);
+      }
+
+      if (!embedder) {
+        indexed++;
+        continue;
+      }
 
       const e = await embedder.getEmbeddingWithFallback(ch.text);
       if (!Array.isArray(e.embedding)) throw new Error('embedder returned no embedding vector');

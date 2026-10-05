@@ -15,6 +15,8 @@ const { COURSES_SCHEMA_SQL, CourseStore } = await loadModule('courseStore.js');
 const { chunkLessonMarkdown } = await loadModule('chunking.js');
 const { buildCourseGroundedBlock, createCourseVectorSearch, courseGroundingAsReference } = await loadModule('chatGrounding.js');
 const { estimateTokens } = await loadModule('../llm/modelCapabilities.js');
+const { searchCourses } = await loadModule('retrieval.js');
+const { DirectAssistService } = await loadModule('../direct-assist/DirectAssistService.js');
 
 // Pinned byte-for-byte: must equal GROUNDING_HEADER in chatGrounding.ts.
 const HEADER =
@@ -230,4 +232,135 @@ test('G11 the escaped privacy wrapper, not just raw markdown, stays within the s
   assert.ok(block.endsWith('…'));
   assert.ok(estimateTokens(courseGroundingAsReference(block)) <= 4800);
   assert.ok(block.includes('Source URL:'));
+});
+
+const MAKER_QUESTION = "A maker's agent needs one small procedure for IT requests. The same team owns it; no other agent reuses it. What should the maker do first?";
+const RIGHT_STEP = 'Keep the procedure in the maker agent and review the agent description and instructions first.';
+const WRONG_STEP = 'Publish the procedure as a separate agent and connect it to the maker agent.';
+
+async function makerCourseFixture(message, courseQuery = message) {
+  const { db, store } = freshStore();
+  const [rightUrl] = seedCourse(db, 'maker', 'Maker agent design', [
+    { title: 'Single-owner procedure', text: `# Single-owner procedure\n\nWhen one team owns a small IT request procedure and no other agent reuses it, ${RIGHT_STEP}` },
+    { title: 'Reusable agent', text: `# Reusable procedure\n\nWhen many agents across teams reuse a procedure with separate ownership, ${WRONG_STEP}` },
+  ]);
+  const [disabledUrl] = seedCourse(db, 'disabled', 'Unselected course', [
+    { title: 'Other approach', text: `# Wrong scope\n\nFor a small procedure in one team, ${WRONG_STEP}` },
+  ]);
+  store.setCourseEnabled('disabled', false);
+  const rows = await searchCourses({ db, query: courseQuery, courseIds: ['maker'], limit: 6 });
+  const block = await buildCourseGroundedBlock({ message: courseQuery, storeLike: store, db, pinnedCourseIds: ['maker'], pipeline: null });
+  let dispatched;
+  const service = new DirectAssistService({
+    async *streamDirectAssist(request) { dispatched = request; yield 'mock answer'; },
+  });
+  const events = [];
+  for await (const event of service.stream({
+    requestId: 'maker-course-test', source: 'typed', selection: { provider: 'gemini', model: 'gemini-3.7-flash' },
+    currentRequest: message, imagePaths: ['synthetic-screenshot.png'],
+    pinnedModeInstructions: 'Select one answer for the multiple-choice question.',
+    referenceFiles: [{ fileName: 'Course ground truth', content: block }],
+  })) events.push(event);
+  assert.ok(events.some((event) => event.type === 'done'), 'mock provider must receive the request');
+  return { db, rows, block, dispatched, rightUrl, disabledUrl };
+}
+
+test('MCQ: an imported single-owner lesson reaches actual retrieval and the provider prompt', async () => {
+  const result = await makerCourseFixture(MAKER_QUESTION);
+  try {
+    assert.ok(result.rows[0]?.text.includes(RIGHT_STEP), 'single-owner first step must rank ahead of the reusable-agent distractor');
+    assert.ok(result.block.includes(RIGHT_STEP), 'course-grounding block must carry the first step');
+    assert.ok(result.dispatched.userPrompt.includes(RIGHT_STEP), 'the mocked provider must receive the first step');
+    assert.ok(result.dispatched.userPrompt.includes(result.rightUrl), 'the first step must have a source');
+    assert.ok(result.dispatched.systemPrompt.includes('Select one answer for the multiple-choice question.'));
+    assert.ok(!result.dispatched.userPrompt.includes(result.disabledUrl), 'disabled courses must not leak');
+  } finally {
+    result.db.close();
+  }
+});
+
+test('MCQ: reusable cross-team procedure ranks the separate-agent rule instead', async () => {
+  const result = await makerCourseFixture('When many agents across teams reuse a procedure with separate ownership, what should the maker do first?');
+  try {
+    assert.ok(result.rows[0]?.text.includes(WRONG_STEP), 'the other course rule applies when agents actually reuse it');
+    assert.ok(result.dispatched.userPrompt.includes(WRONG_STEP));
+  } finally {
+    result.db.close();
+  }
+});
+
+// Exercise the actual IPC refresh branch with real local SQL retrieval; loading the
+// entire Electron IPC module would register unrelated handlers and native services.
+const ipc = fs.readFileSync(path.resolve(__dirname, '../../../electron/ipcHandlers.ts'), 'utf8');
+const refreshStart = ipc.indexOf('if (v3ScreenDescription && imagePaths?.length) {', ipc.indexOf('let v3ScreenDescription ='));
+const refreshEnd = ipc.indexOf('const v3ScreenPort =', refreshStart);
+assert.ok(refreshStart >= 0 && refreshEnd > refreshStart, 'V3 course refresh branch must exist');
+const runV3CourseRefresh = new Function(
+  'originalBlock', 'v3Question', 'v3ScreenDescription', 'imagePaths', 'pinnedCourseIds',
+  'getChatCourseGrounding', 'courseGroundingAsReference', 'myController',
+  `return (async () => { let courseBlock = originalBlock; ${ipc.slice(refreshStart, refreshEnd)} return courseBlock; })();`,
+);
+
+test('MCQ: V3 screen description replaces metadata-only course context with a lesson hit', async () => {
+  const request = 'Analyze the attached screenshot.';
+  const { db, store } = freshStore();
+  const [rightUrl] = seedCourse(db, 'maker', 'Maker agent design', [
+    { title: 'Single-owner procedure', text: `# Single-owner procedure\n\nWhen one team owns a small IT request procedure and no other agent reuses it, ${RIGHT_STEP}` },
+  ]);
+  seedCourse(db, 'unrelated', 'Unrelated course', [{ title: 'Habitat', text: QUOKKA_MD }]);
+  try {
+    const original = courseGroundingAsReference(await buildCourseGroundedBlock({ message: request, storeLike: store, db }));
+    assert.ok(original.includes('No matching lesson excerpt'));
+    const queries = [];
+    const refreshed = await runV3CourseRefresh(original, request, MAKER_QUESTION, ['synthetic-screenshot.png'], ['maker'],
+      async (query, pinnedCourseIds) => {
+        queries.push(query);
+        return buildCourseGroundedBlock({ message: query, storeLike: store, db, pinnedCourseIds });
+      }, courseGroundingAsReference, { signal: { aborted: false } });
+    assert.deepEqual(queries, [`${request}\n${MAKER_QUESTION}`]);
+    assert.ok(refreshed.includes(RIGHT_STEP), 'screenshot hit must replace the original block');
+    assert.ok(refreshed.includes('No matching lesson excerpt'), 'a second unmatched course must not block a valid hit');
+    assert.ok(refreshed.includes(rightUrl));
+    assert.notEqual(refreshed, original);
+  } finally {
+    db.close();
+  }
+});
+
+test('MCQ: V3 screen miss preserves the original answer-bearing lesson', async () => {
+  const { db, store } = freshStore();
+  seedCourse(db, 'maker', 'Maker agent design', [
+    { title: 'Single-owner procedure', text: `# Single-owner procedure\n\nWhen one team owns a small IT request procedure and no other agent reuses it, ${RIGHT_STEP}` },
+  ]);
+  try {
+    const request = 'single';
+    const original = courseGroundingAsReference(await buildCourseGroundedBlock({ message: request, storeLike: store, db }));
+    assert.ok(original.includes(RIGHT_STEP), 'typed question must first retrieve an answer');
+    const description = 'ocean glacier marigold sapphire nebula lantern compass mosaic horizon river';
+    const getChatCourseGrounding = (query, pinnedCourseIds) =>
+      buildCourseGroundedBlock({ message: query, storeLike: store, db, pinnedCourseIds });
+    const screenOnly = await getChatCourseGrounding(`${request}\n${description}`, ['maker']);
+    assert.ok(screenOnly.includes('No matching lesson excerpt'), 'screen search should return metadata only');
+    assert.ok(!screenOnly.includes(RIGHT_STEP));
+    const args = [original, request, description, ['synthetic-screenshot.png'], ['maker']];
+    assert.equal(await runV3CourseRefresh(...args, getChatCourseGrounding, courseGroundingAsReference, { signal: { aborted: false } }), original);
+    assert.equal(await runV3CourseRefresh(...args, async () => null, courseGroundingAsReference, { signal: { aborted: false } }), original,
+      'an unavailable second lookup must also preserve the first answer');
+    assert.equal(await runV3CourseRefresh(...args, getChatCourseGrounding, courseGroundingAsReference, { signal: { aborted: true } }), null,
+      'an aborted turn must not dispatch stale grounding');
+  } finally {
+    db.close();
+  }
+});
+
+test('MCQ: screenshot-only prompt is not OCR text for course retrieval', async () => {
+  const result = await makerCourseFixture('Analyze the attached screenshot.');
+  try {
+    assert.equal(result.rows.length, 0);
+    assert.ok(!result.dispatched.userPrompt.includes(RIGHT_STEP));
+    assert.ok(result.dispatched.userPrompt.includes('No matching lesson excerpt'));
+    assert.ok(!result.dispatched.userPrompt.includes(result.disabledUrl));
+  } finally {
+    result.db.close();
+  }
 });

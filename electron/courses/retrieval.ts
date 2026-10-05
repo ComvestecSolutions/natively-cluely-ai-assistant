@@ -83,6 +83,37 @@ function queryTerms(query: string): string[] {
     .filter(Boolean);
 }
 
+// An entire MCQ rarely appears verbatim in a single lesson chunk. Use its
+// distinctive words only when the precise AND search found nothing; generic
+// question words must not turn an unrelated lesson into apparent evidence.
+const RELAXED_QUERY_STOPWORDS = new Set([
+  'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'do', 'does', 'for', 'from',
+  'how', 'in', 'is', 'it', 'its', 'of', 'on', 'or', 'should', 'that', 'the',
+  'their', 'this', 'to', 'was', 'what', 'when', 'where', 'which', 'who', 'why',
+  'with', 'would', 'you', 'your',
+]);
+
+function relaxedQueryTerms(query: string): string[] {
+  return [...new Set(queryTerms(query.toLowerCase()).filter(
+    (term) => term.length >= 3 && !RELAXED_QUERY_STOPWORDS.has(term),
+  ))].slice(0, 24);
+}
+
+function relaxedFtsSearch(db: SqliteDatabase, query: string, courseIds: string[] | undefined, fetchLimit: number): RankedHit[] {
+  const terms = relaxedQueryTerms(query);
+  if (terms.length < 3) return [];
+  const hits = runFtsSearch(db, terms.map((term) => `"${term.replace(/"/g, '""')}"`).join(' OR '), courseIds, fetchLimit);
+  const minimumOverlap = Math.min(3, Math.ceil(terms.length / 3));
+  return hits
+    .map((hit, rank) => {
+      const words = new Set(queryTerms(hit.text.toLowerCase()));
+      return { hit, rank, overlap: terms.filter((term) => words.has(term)).length };
+    })
+    .filter((entry) => entry.overlap >= minimumOverlap)
+    .sort((a, b) => b.overlap - a.overlap || a.rank - b.rank)
+    .map((entry) => entry.hit);
+}
+
 /**
  * Strip FTS5 metacharacters and turn surviving terms into a safe MATCH expression:
  * each term double-quoted on its own; FTS5 ANDs adjacent quoted phrases.
@@ -306,6 +337,9 @@ export async function searchCourses(opts: SearchCoursesOptions): Promise<CourseE
     if (terms.length > 0) {
       try {
         ftsHits = runFtsSearch(opts.db, sanitizeFtsQuery(opts.query), courseIds, Math.min(64, limit * 4));
+        if (ftsHits.length === 0) {
+          ftsHits = relaxedFtsSearch(opts.db, opts.query, courseIds, Math.min(64, limit * 8));
+        }
       } catch {
         // FTS index missing or unusable: degrade to a substring scan.
         try {

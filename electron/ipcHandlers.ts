@@ -2278,6 +2278,22 @@ export function initializeIpcHandlers(appState: AppState): void {
                   screenErr?.message ?? screenErr);
               }
             }
+            // The first course lookup only saw the typed request. For an image-only
+            // question that is just "analyze this screenshot", the screen text did
+            // not exist yet; refresh local retrieval now that V3 has described it.
+            // Direct Assist has no pre-answer transcription and keeps its own
+            // single-dispatch latency contract unchanged.
+            if (v3ScreenDescription && imagePaths?.length) {
+              const groundedFromScreen = await getChatCourseGrounding(
+                `${v3Question}\n${v3ScreenDescription}`, pinnedCourseIds,
+              );
+              if (myController.signal.aborted) return null;
+              // Course metadata survives an empty search; only a lesson section
+              // (not a ### Course: heading) should displace the typed-query answer.
+              if (groundedFromScreen && /(?:^|\n)### (?!Course: )[^\n]+ \([^\n]+\)(?:\n|$)/.test(groundedFromScreen)) {
+                courseBlock = courseGroundingAsReference(groundedFromScreen);
+              }
+            }
             const v3ScreenPort = v3ScreenDescription
               ? require('./context-intelligence/retrieval/screen-retrieval-port')
                   .createScreenRetrievalPort({
@@ -15520,6 +15536,22 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 
+  // Persist every chunk and its FTS row before an optional embedding pass can fail.
+  const indexCourseOfflineFirst = async (db: Parameters<typeof indexCourseForRetrieval>[0]['db'], courseId: string) => {
+    const lexical = await indexCourseForRetrieval({ db, courseId });
+    if (lexical.error) return lexical;
+
+    const pipeline = appState.getRAGManager()?.getEmbeddingPipeline();
+    if (!pipeline?.isReady()) return lexical;
+
+    try {
+      const vectors = await indexCourseForRetrieval({ db, courseId, embedder: pipeline });
+      return vectors.error ? { ...lexical, error: `Vector indexing failed: ${vectors.error}` } : vectors;
+    } catch (e) {
+      return { ...lexical, error: `Vector indexing failed: ${e instanceof Error ? e.message : String(e)}` };
+    }
+  };
+
   safeHandle('courses:import', async (_event, input: any) => {
     const sendProgress = (stage: string, detail?: string) => {
       appState.getMainWindow()?.webContents.send('courses:progress', { stage, detail });
@@ -15577,13 +15609,11 @@ export function initializeIpcHandlers(appState: AppState): void {
           onProgress: (p) => sendProgress(p.phase === 'done' ? 'crawled' : p.phase, p.current ? `${p.done}/${p.total} ${p.current}` : undefined),
         });
         const db = DatabaseManager.getInstance().getDb();
-        const pipeline = appState.getRAGManager()?.getEmbeddingPipeline();
-        if (db && pipeline) {
-          // Indexing is best-effort — the crawl already persisted lessons.
-          sendProgress('indexing');
-          await indexCourseForRetrieval({ db, courseId: courseIdValue, embedder: pipeline });
-        }
-        // Single terminal progress event: only after the crawl and indexing (or its skip) finish.
+        if (!db) throw new Error('database not ready');
+        sendProgress('indexing');
+        const result = await indexCourseOfflineFirst(db, courseIdValue);
+        if (result.error) throw new Error(result.error);
+        // Single terminal progress event: only after the crawl and indexing finish.
         sendProgress('done', course.id);
       })().catch((e) => { console.error('[courses] import post-process failed', e); sendProgress('failed', String(e)); });
       return { course };
@@ -15594,7 +15624,7 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 
-  // P1: rebuild the vector index for one course's lessons (premium; idempotent).
+  // P1: rebuild the course retrieval index (FTS locally, vectors when available).
   safeHandle('courses:reindex', async (_event, input: any) => {
     try {
       if (!isProOrTrialActive()) return { disabled: true };
@@ -15605,9 +15635,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       }
       const sqliteDb = DatabaseManager.getInstance().getDb();
       if (!sqliteDb) return { error: 'database not ready' };
-      const pipeline = appState.getRAGManager()?.getEmbeddingPipeline();
-      if (!pipeline) return { error: 'embedding pipeline not ready' };
-      return await indexCourseForRetrieval({ db: sqliteDb, courseId: input.id, embedder: pipeline });
+      return await indexCourseOfflineFirst(sqliteDb, input.id);
     } catch (e: any) {
       console.warn('[CoursesStudio] reindex failed:', e?.message);
       return { error: String(e?.message ?? 'reindex failed') };
