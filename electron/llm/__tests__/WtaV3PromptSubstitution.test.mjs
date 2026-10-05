@@ -81,6 +81,30 @@ test('without v3Prompt the legacy assembly is untouched', async () => {
     'no V3 text may leak into a legacy turn');
 });
 
+test('legacy What-to-Answer sends scoped standing mode instructions once in SYSTEM, not USER', async () => {
+  const { WhatToAnswerLLM } = require(distWhatToAnswerPath);
+  const calls = [];
+  const pinned = 'In the interview, answer in first person with a concrete example.';
+  const answerer = new WhatToAnswerLLM(makeLLMHelper(calls), {
+    ...modesManager,
+    getActiveModePinnedInstructions: () => pinned,
+  });
+  const before = process.env.NATIVELY_PROMPT_SYSTEM_V2;
+  try {
+    for (const enabled of ['0', '1']) {
+      process.env.NATIVELY_PROMPT_SYSTEM_V2 = enabled;
+      await drive(answerer, snapshot());
+      const [userMessage, , , systemPrompt] = calls.at(-1);
+      assert.equal(systemPrompt.split(pinned).length - 1, 1, `v2=${enabled}`);
+      assert.doesNotMatch(userMessage, /In the interview, answer in first person/);
+    }
+  } finally {
+    if (before === undefined) delete process.env.NATIVELY_PROMPT_SYSTEM_V2;
+    else process.env.NATIVELY_PROMPT_SYSTEM_V2 = before;
+  }
+  assert.equal(calls.length, 2);
+});
+
 test('the substitution is all-or-nothing — a prompt without both halves is ignored', async () => {
   // A half-present prompt would pair a V3 system prompt with a legacy user
   // message (or vice versa): two different decisions about what the model may

@@ -32,7 +32,7 @@ function makeHelper(captured) {
     getPromptTier() { return 'cloud'; }, getCapabilities() { return { contextWindow: 128000, supportsVision: true }; },
     fitContextForCurrentModel(x) { return x; }, rememberAnswerCall() {},
     async *streamChat(...a) {
-      captured.push(`${String(a[3] ?? '')}\n${String(a[0] ?? '')}`);
+      captured.push({ system: String(a[3] ?? ''), user: String(a[0] ?? '') });
       yield 'Here it is:\n```python\ndef rotate():\n    return 1\n```\n';
     },
   };
@@ -50,7 +50,8 @@ async function press(segments) {
   const captured = [];
   const engine = new IntelligenceEngine(makeHelper(captured), session);
   await engine.runWhatShouldISay(undefined, 0.9, undefined, { skipCooldown: true });
-  return captured.join('\n');
+  assert.equal(captured.length, 1, 'one provider call per press');
+  return captured[0];
 }
 
 // Problem stated >180s before the press, so it is outside the hot window.
@@ -65,7 +66,8 @@ const earlier = [
 describe('WTA keeps the active coding problem for a coding continuation (#539)', () => {
   for (const ask of ['show the solution in python', 'show in python', 'show me how you would implement in python']) {
     test(`"${ask}" reaches the model with the evicted problem`, async () => {
-      const prompt = await press([...earlier, [3, 'interviewer', ask]]);
+      const { system, user } = await press([...earlier, [3, 'interviewer', ask]]);
+      const prompt = `${system}\n${user}`;
       assert.ok(prompt, 'the provider was called');
       assert.match(prompt, /rotate the active encryption key/, 'problem statement missing from the prompt');
       assert.match(prompt, /follow-up to the coding problem/, 'the ask was not resolved against the problem');
@@ -73,24 +75,71 @@ describe('WTA keeps the active coding problem for a coding continuation (#539)',
   }
 
   test('a behavioural question after the coding problem does NOT inherit it', async () => {
-    const prompt = await press([...earlier, [3, 'interviewer', 'Tell me about your experience with python']]);
-    assert.ok(prompt, 'the provider was called');
-    assert.doesNotMatch(prompt, /follow-up to the coding problem/);
-    // 2026-09-24: in a live meeting a personal question also reads the
-    // transcript (details the user said aloud), and this fixture's whole
-    // meeting is one retrievable window — so the old problem may appear as
-    // quoted MEETING_TRANSCRIPT evidence. It must appear NOWHERE else: not as
-    // the question, not as the active coding problem.
-    const outsideTranscriptEvidence = prompt.replace(
-      /<evidence[^>]*source_type="MEETING_TRANSCRIPT"[^>]*>[\s\S]*?<\/evidence>/g, '');
-    assert.doesNotMatch(outsideTranscriptEvidence, /rotate the active encryption key/);
+    const assertBehavioralRouting = ({ system, user }, v3Enabled) => {
+      // V3 carries the question in <current_question>; V3-off with v2 enabled
+      // carries it in the last <current_turn>. Older conversation is not the ask.
+      const current = v3Enabled
+        ? /<current_question[^>]*>\s*# Question\n([^\n]+)\s*<\/current_question>/.exec(user)
+        : [...user.matchAll(/<current_turn>\n([^\n]+)\n<\/current_turn>/g)].at(-1);
+      assert.ok(current, 'the current question reaches the provider');
+      assert.doesNotMatch(current[1], /follow-up to the coding problem/i, 'current question must not be a coding follow-up');
+      assert.equal(current[1].trim(), 'Tell me about your experience with python');
+      assert.doesNotMatch(current[1], /rotate the active encryption key/i);
+
+      // Inspect only instructions governing THIS ask, not historical transcript
+      // or the prior assistant reply. A v2-off system has no <active_action> tag.
+      let activeInstructions;
+      if (v3Enabled) {
+        activeInstructions = `${system}\n${user.slice(0, current.index)}`;
+        assert.match(activeInstructions, /# Source authority\n- Personal claims require/);
+        assert.match(activeInstructions, /# Grounding\nAnswer normally\./);
+      } else {
+        const task = /<task>\n([\s\S]*?)\n<\/task>/.exec(user);
+        assert.ok(task, 'V3-off active task reaches the provider');
+        activeInstructions = `${system}\n${task[1]}`;
+        assert.match(task[1], /answerType:\s*skill_experience_answer/);
+        assert.match(task[1], /profileContextPolicy:\s*required/);
+      }
+      assert.doesNotMatch(activeInstructions, /follow-up to the coding problem|# Follow-up\b|answerType:\s*(?:coding|dsa_question_answer)/i);
+      assert.doesNotMatch(activeInstructions, /rotate the active encryption key/i);
+      return current;
+    };
+
+    const previousV3 = process.env.NATIVELY_CONTEXT_INTELLIGENCE_V3;
+    const previousV2 = process.env.NATIVELY_PROMPT_SYSTEM_V2;
+    try {
+      for (const [v3, v2] of [['1', '1'], ['1', '0'], ['0', '1']]) {
+        process.env.NATIVELY_CONTEXT_INTELLIGENCE_V3 = v3;
+        process.env.NATIVELY_PROMPT_SYSTEM_V2 = v2;
+        await press([...earlier, [3, 'interviewer', 'show the solution in python']]);
+        const outbound = await press([...earlier, [3, 'interviewer', 'Tell me about your experience with python']]);
+        if (v3 === '1') {
+          assert.match(outbound.user, /Question heard in the meeting: show the solution in python \(follow-up to the coding problem:/);
+        }
+        const current = assertBehavioralRouting(outbound, v3 === '1');
+
+        // Changing only the active question must fail, despite retained coding history.
+        const mutatedUser = outbound.user.replace(current[0], current[0].replace(
+          'Tell me about your experience with python',
+          `show in python (follow-up to the coding problem: "${PROBLEM}")`));
+        assert.notEqual(mutatedUser, outbound.user, 'the active question was mutated');
+        assert.throws(() => assertBehavioralRouting({ ...outbound, user: mutatedUser }, v3 === '1'),
+          /current question must not be a coding follow-up/);
+      }
+    } finally {
+      if (previousV3 === undefined) delete process.env.NATIVELY_CONTEXT_INTELLIGENCE_V3;
+      else process.env.NATIVELY_CONTEXT_INTELLIGENCE_V3 = previousV3;
+      if (previousV2 === undefined) delete process.env.NATIVELY_PROMPT_SYSTEM_V2;
+      else process.env.NATIVELY_PROMPT_SYSTEM_V2 = previousV2;
+    }
   });
 
   // The old turns can still reach the prompt through the durable meeting-transcript
   // block (unchanged by this fix); what must not happen is the question being
   // rewritten as a follow-up to the OLD problem.
   test('a new, self-contained coding question is NOT rewritten onto the old problem', async () => {
-    const prompt = await press([...earlier, [3, 'interviewer', 'Now write a function that reverses a linked list in place.']]);
+    const { system, user } = await press([...earlier, [3, 'interviewer', 'Now write a function that reverses a linked list in place.']]);
+    const prompt = `${system}\n${user}`;
     assert.ok(prompt, 'the provider was called');
     assert.doesNotMatch(prompt, /follow-up to the coding problem/);
     assert.match(prompt, /reverses a linked list/);

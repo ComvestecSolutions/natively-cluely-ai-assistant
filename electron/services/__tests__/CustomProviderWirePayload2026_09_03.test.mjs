@@ -111,7 +111,9 @@ function containerOf(base64) {
 /** Pull the image data URL out of the last request the server actually received. */
 function imageDataUrlFromLastRequest() {
   const body = JSON.parse(received.at(-1).body);
-  const part = body.messages[0].content.find(p => p.type === 'image_url');
+  assert.equal(body.messages[0]?.role, 'system', 'OpenAI requests place the app instructions before the image-bearing user turn');
+  const user = body.messages.find(message => message.role === 'user');
+  const part = user?.content.find(p => p.type === 'image_url');
   assert.ok(part, 'no image_url part reached the endpoint');
   const url = part.image_url.url;
   const sep = url.indexOf(';base64,');
@@ -186,7 +188,9 @@ describe('placeholder expansion', () => {
     await helperFor({ id: 'p', name: 'p', curlCommand: tpl })
       .executeCustomProvider(tpl, prompt, 'sys', prompt, '');
 
-    assert.equal(JSON.parse(received.at(-1).body).messages[0].content, prompt,
+    const messages = JSON.parse(received.at(-1).body).messages;
+    assert.equal(messages[0]?.role, 'system');
+    assert.equal(messages.find(message => message.role === 'user')?.content, prompt,
       'a question about sed rewrote itself when the value was used as a replacement string');
   });
 });

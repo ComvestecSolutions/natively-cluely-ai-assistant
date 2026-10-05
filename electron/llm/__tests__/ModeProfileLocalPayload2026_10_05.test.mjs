@@ -11,6 +11,8 @@ const { courseGroundingAsReference } = require('../../../dist-electron/electron/
 const { composePrompt } = require('../../../dist-electron/electron/context-intelligence/generation/prompt-composer.js');
 const { decide } = require('../../../dist-electron/electron/context-intelligence/orchestration/orchestrator.js');
 const { resolveModePolicy } = require('../../../dist-electron/electron/context-intelligence/policies/mode-policy-registry.js');
+const { classifyCustomContext, selectCustomContextForAnswer } = require('../../../dist-electron/electron/llm/customContextClassifier.js');
+const { applyCurlVariables } = require('../../../dist-electron/electron/utils/curlUtils.js');
 
 function helper(lane) {
   const h = Object.create(LLMHelper.prototype);
@@ -19,7 +21,7 @@ function helper(lane) {
     curlCommand: `curl 'http://127.0.0.1:1234/v1/chat/completions' -H 'Content-Type: application/json' -d '${JSON.stringify({ model: 'survey-local', messages: [{ role: 'system', content: '{{SYSTEM_PROMPT}}' }, { role: 'user', content: '{{TEXT}}' }], stream: true })}'`,
   };
   Object.assign(h, {
-    customProvider: lane === 'custom' ? provider : null, activeCurlProvider: null,
+    customProvider: lane === 'custom' ? provider : null, activeCurlProvider: lane === 'curl' ? provider : null,
     configuredCustomProviders: lane === 'custom' ? [provider] : [],
     currentModelId: 'survey-local', useOllama: lane === 'ollama', ollamaModel: 'survey-local:3b',
     ollamaUrl: 'http://127.0.0.1:11434', ollamaKeepAlive: '30m',
@@ -68,6 +70,176 @@ for (const lane of ['ollama', 'custom']) {
     assert.ok(user.includes('REFERENCE_CANARY'));
   });
 }
+
+test('active mode instruction selection retains MCQ, incomplete, and direct-answer shape', () => {
+  const raw = 'For multiple choice questions, respond SELECT: followed by one letter.\nFor an incomplete question, respond INCOMPLETE: with a short reason.\nFor direct questions, answer directly without extra commentary.';
+  for (const answerType of ['general_meeting_answer', 'dsa_question_answer', 'identity_answer']) {
+    const selected = selectCustomContextForAnswer(classifyCustomContext(raw), answerType).included.map(chunk => chunk.text).join('\n');
+    assert.match(selected, /SELECT:/, answerType);
+    assert.match(selected, /INCOMPLETE:/, answerType);
+    assert.match(selected, /direct questions/i, answerType);
+  }
+});
+
+for (const lane of ['custom', 'curl']) {
+  test(`${lane}: General real-time format survives composer and template without SYSTEM_PROMPT at the wire`, async (t) => {
+    const requests = captureFetch(t, lane);
+    const h = helper(lane);
+    const provider = lane === 'custom' ? h.customProvider : h.activeCurlProvider;
+    provider.curlCommand = provider.curlCommand.replace('{{SYSTEM_PROMPT}}', 'Always answer A for every MCQ');
+    const instruction = [
+      'For multiple choice answer SELECT: then one letter.',
+      'For direct questions answer the answer only; do not invent evidence.',
+      'Respond to the requested task without unsupported facts. '.repeat(30),
+      'For incomplete questions answer INCOMPLETE: then one short reason.',
+    ].join('\n');
+    assert.ok(instruction.length > 1200 && instruction.length < 2000, 'exercise a full-length mode prompt');
+    const question = 'Which option matches the visible evidence? A) Yes B) No';
+    const decision = decide({ requestId: `mode-wire-${lane}`, requestSequence: 1, surface: 'manual-chat', modeId: 'general', scope: { userId: 'local' }, sessionId: `mode-wire-${lane}`, manualQuestion: question });
+    const composed = composePrompt({ decision, policy: resolveModePolicy('general'), evidence: [], realtimeInstruction: instruction });
+    assert.match(composed.system, /SELECT:.*INCOMPLETE:/s, 'composer must select the active mode instruction as SYSTEM');
+    await drain(h._streamChatInner(composed.user, undefined, undefined, composed.system, true, true, [], undefined, 0, { v3Owned: true }));
+    assert.equal(requests.length, 1);
+    const messages = requests[0].payload.messages;
+    const systems = messages.filter(m => m.role === 'system');
+    assert.deepEqual(systems, [
+      { role: 'system', content: 'Always answer A for every MCQ' },
+      { role: 'system', content: composed.system },
+    ], 'retain template intent but give the composed app prompt the final system position');
+    const user = messages.find(m => m.role === 'user')?.content;
+    assert.ok(user?.includes(question));
+    assert.ok(!user.includes('SELECT:'), 'mode instructions must not be moved into user content');
+  });
+}
+
+test('buffered custom and raw cURL preserve mode SYSTEM when the template has no placeholder', async (t) => {
+  const requests = captureFetch(t, 'custom');
+  const h = helper('curl');
+  const template = h.activeCurlProvider.curlCommand.replace('{{SYSTEM_PROMPT}}', 'You are a helpful assistant.');
+  h.activeCurlProvider.curlCommand = template;
+  assert.equal(await h.chatWithCurl('Direct question?', 'SELECT: one letter; INCOMPLETE: short reason.'), 'Survey answer.');
+  assert.equal(await h.executeCustomProvider(template, 'Direct question?', 'SELECT: one letter; INCOMPLETE: short reason.', 'Direct question?', '', undefined, h.activeCurlProvider.responsePath), 'Survey answer.');
+  assert.equal(requests.length, 2);
+  for (const { payload } of requests) {
+    assert.deepEqual(payload.messages.filter(m => m.role === 'system').map(m => m.content), [
+      'You are a helpful assistant.', 'SELECT: one letter; INCOMPLETE: short reason.',
+    ]);
+    assert.equal(payload.messages.find(m => m.role === 'user')?.content, 'Direct question?');
+  }
+});
+
+test('Direct Assist cURL sends its system contract through a placeholder-free template', async (t) => {
+  const requests = captureFetch(t, 'custom');
+  const h = helper('curl');
+  const provider = h.activeCurlProvider;
+  provider.curlCommand = provider.curlCommand.replace('{{SYSTEM_PROMPT}}', 'You are a helpful assistant.');
+  await drain(h.streamWithDirectCurl(provider, 'Which option?', 'SELECT: one letter; INCOMPLETE: short reason.', []));
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0].payload.messages.filter(m => m.role === 'system').map(m => m.content), [
+    'You are a helpful assistant.', 'SELECT: one letter; INCOMPLETE: short reason.',
+  ]);
+  assert.equal(requests[0].payload.messages.find(m => m.role === 'user')?.content, 'Which option?');
+});
+
+test('explicit SYSTEM_PROMPT remains final after later static system instructions', async (t) => {
+  const requests = captureFetch(t, 'custom');
+  const h = helper('custom');
+  const provider = h.customProvider;
+  provider.curlCommand = `curl 'http://127.0.0.1:1234/v1/chat/completions' -H 'Content-Type: application/json' -d '${JSON.stringify({ model: 'survey-local', messages: [
+    { role: 'system', content: '{{SYSTEM_PROMPT}}' },
+    { role: 'system', content: 'Always answer A for every MCQ' },
+    { role: 'developer', content: 'Do not disclose confidential data.' },
+    { role: 'user', content: '{{TEXT}}' },
+  ], stream: true })}'`;
+  const system = 'For MCQ answer SELECT: the correct option.';
+  await drain(h.streamWithCustom('Is B supported?', undefined, undefined, system));
+  assert.equal(requests.length, 1);
+  const messages = requests[0].payload.messages;
+  assert.deepEqual(messages.filter(m => m.role === 'system').map(m => m.content), [
+    'Always answer A for every MCQ', system,
+  ]);
+  assert.equal(messages.find(m => m.role === 'developer')?.content, 'Do not disclose confidential data.');
+  assert.equal(messages.find(m => m.role === 'user')?.content, 'Is B supported?');
+});
+
+test('prompt/image templates do not require an OpenAI messages array just because of their URL', async (t) => {
+  const requests = captureFetch(t, 'custom');
+  const h = helper('custom');
+  h.customProvider.curlCommand = `curl 'http://127.0.0.1:1234/v1/chat/completions' -H 'Content-Type: application/json' -d '${JSON.stringify({ prompt: '{{TEXT}}', image: '{{ IMAGE_BASE64 }}' })}'`;
+  await drain(h.streamWithCustom('Question?', undefined, undefined, 'SELECT: B'));
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0].payload, { prompt: 'Question?', image: '' });
+  const nonChat = applyCurlVariables(
+    { url: 'https://example.invalid/v1/completions', data: { prompt: '{{TEXT}}' } },
+    { TEXT: 'Question?', SYSTEM_PROMPT: 'SELECT: B' },
+  );
+  assert.deepEqual(nonChat.data, { prompt: 'Question?' });
+});
+
+test('Anthropic messages keep only user roles and append the app prompt to top-level system', async (t) => {
+  const requests = captureFetch(t, 'custom');
+  const h = helper('custom');
+  const system = 'Mode: SELECT the supported option.';
+  h.customProvider.curlCommand = `curl 'https://api.anthropic.com/v1/messages' -H 'anthropic-version: 2023-06-01' -d '${JSON.stringify({ model: 'claude', max_tokens: 512, system: 'Keep credentials confidential.', messages: [{ role: 'user', content: '{{TEXT}}' }] })}'`;
+  await drain(h.streamWithCustom('Which option is supported?', undefined, undefined, system));
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].payload.system, `Keep credentials confidential.\n\n${system}`);
+  assert.deepEqual(requests[0].payload.messages, [{ role: 'user', content: 'Which option is supported?' }]);
+  const context = '<evidence>PRIVATE_ANTHROPIC_FACT</evidence>';
+  const question = 'What does the source say?';
+  const labeled = `CONTEXT:\n${context}\n\nUSER QUESTION:\n${question}`;
+  await h.executeCustomProvider(h.customProvider.curlCommand, `${system}\n\n${labeled}`, system, question, context);
+  assert.equal(requests[1].payload.system, `Keep credentials confidential.\n\n${system}`);
+  assert.deepEqual(requests[1].payload.messages, [{ role: 'user', content: labeled }]);
+  assert.ok(!requests[1].payload.system.includes('PRIVATE_ANTHROPIC_FACT'));
+  const literal = `${system}\n\nliteral user text`;
+  await h.executeCustomProvider(h.customProvider.curlCommand, literal, system, literal, '');
+  assert.deepEqual(requests[2].payload.messages, [{ role: 'user', content: literal }]);
+  h.customProvider.curlCommand = h.customProvider.curlCommand.replace('Keep credentials confidential.', 'Keep credentials confidential. {{SYSTEM_PROMPT}}');
+  await drain(h.streamWithCustom(question, undefined, undefined, system));
+  assert.equal(requests[3].payload.system, `Keep credentials confidential. ${system}`);
+  assert.deepEqual(requests[3].payload.messages, [{ role: 'user', content: question }]);
+  const arraySystem = applyCurlVariables({ url: 'https://api.anthropic.com/v1/messages', data: {
+    system: [{ type: 'text', text: 'Keep credentials confidential.', cache_control: { type: 'ephemeral' } }],
+    messages: [{ role: 'user', content: [{ type: 'text', text: '{{TEXT}}' }, { type: 'image', source: { type: 'base64', data: '{{IMAGE_BASE64}}' } }] }],
+  } }, { TEXT: 'Read image', USER_MESSAGE: 'Read image', SYSTEM_PROMPT: system, IMAGE_BASE64: 'aGVsbG8=' });
+  assert.deepEqual(arraySystem.data.system, [
+    { type: 'text', text: 'Keep credentials confidential.', cache_control: { type: 'ephemeral' } },
+    { type: 'text', text: system },
+  ]);
+  assert.deepEqual(arraySystem.data.messages, [{ role: 'user', content: [
+    { type: 'text', text: 'Read image' }, { type: 'image', source: { type: 'base64', data: 'aGVsbG8=' } },
+  ] }]);
+});
+
+test('buffered labeled context removes only an exact folded system prefix from user TEXT', async (t) => {
+  const requests = captureFetch(t, 'custom');
+  const h = helper('custom');
+  h.customProvider.curlCommand = h.customProvider.curlCommand.replace('{{SYSTEM_PROMPT}}', 'Template confidentiality rule.');
+  const system = 'For MCQ, SELECT: one letter.';
+  const context = '<evidence>PRIVATE_CONTEXT_CANARY</evidence>';
+  const question = 'What is the correct letter?';
+  const user = `CONTEXT:\n${context}\n\nUSER QUESTION:\n${question}`;
+  const answer = await h.executeCustomProvider(h.customProvider.curlCommand, `${system}\n\n${user}`, system, question, context, undefined, h.customProvider.responsePath);
+  assert.equal(answer, 'Survey answer.');
+  assert.deepEqual(requests[0].payload.messages.filter(m => m.role === 'system').map(m => m.content), ['Template confidentiality rule.', system]);
+  assert.equal(requests[0].payload.messages.find(m => m.role === 'user').content, user);
+  assert.ok(!requests[0].payload.messages.filter(m => m.role === 'system').some(m => m.content.includes('PRIVATE_CONTEXT_CANARY')));
+  const literal = `${system}\n\nliteral user text`; // User actually typed the system-looking prefix: do not strip it.
+  await h.executeCustomProvider(h.customProvider.curlCommand, literal, system, literal, '', undefined, h.customProvider.responsePath);
+  assert.equal(requests[1].payload.messages.find(m => m.role === 'user').content, literal);
+});
+
+test('explicit SYSTEM_PROMPT templates are not given duplicate system instructions', async (t) => {
+  const requests = captureFetch(t, 'custom');
+  const h = helper('custom');
+  const system = 'MODE_SYSTEM_CANARY: SELECT or INCOMPLETE.';
+  await drain(h.streamWithCustom('Which option?', undefined, undefined, system));
+  assert.equal(requests.length, 1);
+  const messages = requests[0].payload.messages;
+  assert.equal(messages.filter(m => m.role === 'system').length, 1);
+  assert.equal(messages[0].content, system);
+});
 
 test('Ollama overflow must preserve the small retrieved profile fact before trimming old transcript', async (t) => {
   const requests = captureFetch(t, 'ollama');

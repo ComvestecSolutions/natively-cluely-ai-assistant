@@ -49,6 +49,7 @@ import { TrustLevel, ContextBlock, EvidenceRef, containsPromptInjection, TRUST_L
 import { ContextPacket } from './ContextPacket';
 import { DOM_CONTEXT_MAX_CHARS } from '../../config/constants';
 import { telemetryService } from '../telemetry/TelemetryService';
+import { renderUserInstructionSystemLayer } from '../../llm/userInstructionContract';
 
 // ──────────────────────────────────────────────────────────
 // Prompt Injection Neutralization Constants
@@ -222,10 +223,11 @@ export class PromptAssembler {
          * (customContext), ALWAYS pinned when non-empty — unlike
          * retrievedModeContext it is not retrieval-scored, so a custom mode's
          * instructions reliably shape every answer. Already sensitivity-scoped
-         * by ModesManager.getActiveModePinnedInstructions(answerType). Gets the
-         * same injection escaping as the legacy modeContext path.
+         * by ModesManager.getActiveModePinnedInstructions(answerType). Rendered
+         * in SYSTEM as policy, never alongside reference facts in USER.
          */
         pinnedModeInstructions?: string;
+        pinnedModeIsCustom?: boolean;
         /**
          * Candidate's own profile facts (resume projects/experience/skills/...)
          * already XML-formatted by KnowledgeOrchestrator.assemblePromptContext.
@@ -243,7 +245,11 @@ export class PromptAssembler {
     }): ContextPacket {
         const packet: ContextPacket = {
             blocks: [],
-            systemPrompt: params.systemPrompt,
+            systemPrompt: params.pinnedModeInstructions?.trim()
+                ? `${params.systemPrompt}\n\n${renderUserInstructionSystemLayer(params.pinnedModeInstructions, {
+                    isCustomMode: params.pinnedModeIsCustom === true,
+                })}`
+                : params.systemPrompt,
             developerPrompt: params.developerPrompt,
             userMessage: '',
             metadata: {
@@ -310,27 +316,11 @@ export class PromptAssembler {
 
         // 6. MODE CONTEXT — custom instructions + reference files
         if (params.modeContext) {
-            this.addModeContextBlocks(packet, params.modeContext);
-        }
-        // 5a. PINNED MODE INSTRUCTIONS (PI v3, W2) — the mode's "Real-time
-        //     prompt", always included when present. MODE_POLICY trust (mode
-        //     configuration, not conversation evidence) with the same injection
-        //     escaping as the legacy whole-mode path. Skipped if the legacy
-        //     modeContext path already emitted custom instructions (no dupes).
-        if (params.pinnedModeInstructions?.trim() && !params.modeContext?.customContext?.trim()) {
-            const pinned = params.pinnedModeInstructions.trim();
-            if (containsPromptInjection(pinned)) {
-                console.warn('[PromptAssembler] Pinned mode instructions contain prompt injection pattern — escaping');
-            }
-            this.addBlock(packet, {
-                type: 'active_mode_custom_instructions',
-                trustLevel: TrustLevel.MODE_POLICY,
-                source: params.modeId ? `mode:${params.modeId}` : 'mode',
-                tokenBudget: 300,
-                content: `<active_mode_custom_instructions format="json">
-${JSON.stringify({ content: this.escapePromptInjection(pinned) })}
-</active_mode_custom_instructions>`,
-            });
+            // The same mode policy may arrive through both the legacy context
+            // and the pinned channel. Keep reference evidence, never repeat it.
+            this.addModeContextBlocks(packet, params.pinnedModeInstructions?.trim()
+                ? { ...params.modeContext, customContext: undefined }
+                : params.modeContext);
         }
         if (params.retrievedModeContext) {
             this.addBlock(packet, this.buildRetrievedModeContextBlock(params.retrievedModeContext));

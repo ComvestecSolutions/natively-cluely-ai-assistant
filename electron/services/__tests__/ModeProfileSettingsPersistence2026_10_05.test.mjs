@@ -113,7 +113,7 @@ for (const platform of ['darwin', 'win32']) {
   });
 }
 
-function profileHarness(platform, action, outcome) {
+function profileHarness(platform, action, outcome, backendReady = true) {
   const { ast } = parse(profileFile);
   let callback;
   function visit(node) {
@@ -129,23 +129,32 @@ function profileHarness(platform, action, outcome) {
   const originalData = { identity: { name: 'Existing profile' }, hasActiveJD: true, activeJD: { company: 'Existing company' } };
   const originalDossier = { company: 'Existing company' };
   const state = {
-    status: { hasProfile: true, profileMode: false }, data: originalData, dossier: originalDossier,
-    profileError: '', jdError: '', reads: 0, toggleArmed: false,
+    status: { hasProfile: true, profileMode: false, backendAvailable: backendReady,
+      backendUnavailable: backendReady ? null : 'knowledge_engine_unavailable' },
+    data: originalData, dossier: originalDossier,
+    profileError: '', jdError: '', reads: 0, writes: 0, confirmations: 0, toggleArmed: false,
   };
   const nextData = action === 'profileDelete'
     ? { hasActiveJD: true, activeJD: originalData.activeJD }
     : { identity: originalData.identity, hasActiveJD: false };
   const api = {
     [action]: async () => {
+      state.writes++;
       if (outcome === 'rejected') throw new Error('IPC disconnected');
       return outcome === 'missing' ? undefined : { success: outcome === 'success', error: 'write_refused' };
     },
     profileGetProfile: async () => { state.reads++; return nextData; },
   };
+  // The extracted onClick closure normally captures these from the mounted panel.
+  // Preserve its real availability and Persona Engine disabled rules in the VM.
+  const backendAvailable = state.status.backendAvailable === true;
+  const hasProfileAccess = true;
+  const isDisabled = !backendAvailable || !state.status.hasProfile || !hasProfileAccess;
   const click = evaluate(`(${callback})`, {
     window: { electronAPI: api }, process: { platform },
-    profileStatus: state.status, hasProfileAccess: true, profileUploading: false, jdUploading: false,
-    askConfirm: async () => true,
+    profileStatus: state.status, backendAvailable, isDisabled, hasProfileAccess,
+    profileUploading: false, jdUploading: false,
+    askConfirm: async () => { state.confirmations++; return true; },
     piToggleInit: { arm: () => { state.toggleArmed = true; } },
     setProfileStatus: (value) => { state.status = typeof value === 'function' ? value(state.status) : value; },
     setProfileData: (value) => { state.data = value; },
@@ -162,8 +171,10 @@ for (const platform of ['darwin', 'win32']) {
       test(`${platform}: ${action} ${outcome} preserves documents/state and displays failure`, async () => {
         const h = profileHarness(platform, action, outcome);
         await h.click();
+        assert.equal(h.state.writes, 1, 'operational backend must receive the attempted write');
         assert.equal(h.state.status.hasProfile, true);
         assert.equal(h.state.status.profileMode, false);
+        assert.equal(h.state.status.backendAvailable, true);
         assert.equal(h.state.data, h.originalData);
         assert.equal(h.state.dossier, h.originalDossier);
         assert.equal(h.state.reads, 0);
@@ -174,9 +185,24 @@ for (const platform of ['darwin', 'win32']) {
       });
     }
 
+    test(`${platform}: ${action} is blocked when the knowledge engine is unavailable`, async () => {
+      const h = profileHarness(platform, action, 'success', false);
+      await h.click();
+      assert.equal(h.state.writes, 0, 'unavailable backend must not receive a write');
+      assert.equal(h.state.confirmations, 0);
+      assert.equal(h.state.reads, 0);
+      assert.equal(h.state.status.hasProfile, true);
+      assert.equal(h.state.status.profileMode, false);
+      assert.equal(h.state.status.backendAvailable, false);
+      assert.equal(h.state.data, h.originalData);
+      assert.equal(h.state.dossier, h.originalDossier);
+      assert.equal(h.state.toggleArmed, false);
+    });
+
     test(`${platform}: ${action} success updates local state`, async () => {
       const h = profileHarness(platform, action, 'success');
       await h.click();
+      assert.equal(h.state.writes, 1, 'acknowledged success requires an IPC write');
       if (action === 'profileSetMode') {
         assert.equal(h.state.status.profileMode, true);
         assert.equal(h.state.toggleArmed, true);
@@ -186,6 +212,7 @@ for (const platform of ['darwin', 'win32']) {
         if (action === 'profileDelete') assert.equal(h.state.status.hasProfile, false);
         else assert.equal(h.state.dossier, null);
       }
+      assert.equal(h.state.status.backendAvailable, true);
       assert.equal(h.state.profileError, '');
       assert.equal(h.state.jdError, '');
     });

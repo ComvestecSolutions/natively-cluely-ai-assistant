@@ -7503,6 +7503,19 @@ export class IntelligenceEngine extends EventEmitter {
 
             const ctx = this.v3ModeRetrievalContext(undefined, resolved.resolvedQuestion);
             if (!ctx) return null;
+            // The question and mode are fixed before the bridge's asynchronous
+            // retrieval; the standing policy must belong to that same turn.
+            let realtimeInstruction: string | undefined;
+            try {
+                const { ModesManager } = require('./services/ModesManager');
+                const answerType = planAnswer({
+                    question: resolved.resolvedQuestion,
+                    source: pinned?.source === 'manual' ? 'manual_input' : 'what_to_answer',
+                    speakerPerspective: pinned?.source === 'manual' ? 'user' : 'interviewer',
+                    activeMode: this.getActiveModeInfo(),
+                }).answerType;
+                realtimeInstruction = ModesManager.getInstance().getActiveModePinnedInstructions?.(answerType, ctx.modeUniqueId ?? undefined) || undefined;
+            } catch { /* Mode policy is best-effort; V3 source governance remains authoritative. */ }
             const { buildV3Prompt } = require('./context-intelligence/orchestration/engine-bridge');
             const _v3 = await buildV3Prompt({
                 isSuperseded: () => this.currentGenerationId !== generationId,
@@ -7516,6 +7529,7 @@ export class IntelligenceEngine extends EventEmitter {
                 // their traces separable from real assist turns.
                 pathTag: tag,
                 question: resolved.resolvedQuestion,
+                realtimeInstruction,
                 modeTemplateType: ctx.raw,
                 modeUniqueId: ctx.modeUniqueId,
                 modeName: ctx.modeName,
@@ -8087,6 +8101,14 @@ export class IntelligenceEngine extends EventEmitter {
                         // both recorded legacyPath 'v3-manual-chat').
                         pathTag: 'engine',
                         question,
+                        // V3 owns the prompt; the AnswerLLM transport skips
+                        // legacy mode injection on this request.
+                        realtimeInstruction: (() => {
+                            try {
+                                const { ModesManager } = require('./services/ModesManager');
+                                return ModesManager.getInstance().getActiveModePinnedInstructions?.(answerPlan.answerType, activeModeInfo?.id) || undefined;
+                            } catch { return undefined; }
+                        })(),
                         modeTemplateType: _ctx.raw,
                         modeUniqueId: _ctx.modeUniqueId,
                         modeName: _ctx.modeName,

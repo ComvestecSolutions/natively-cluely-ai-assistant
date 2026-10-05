@@ -126,6 +126,9 @@ export interface DirectAssistRequestInput {
   readonly source: DirectAssistSource;
   readonly selection: DirectAssistSelection;
   readonly currentRequest: string;
+  /** Server-selected, answer-type-scoped mode instructions, pinned before async work. */
+  readonly pinnedModeInstructions?: string;
+  readonly pinnedModeIsCustom?: boolean;
   readonly skill?: DirectAssistSkill | null;
   readonly manualContext?: string;
   /** Legacy pre-rendered form. Prefer `referenceFiles`: a flat string cannot be
@@ -159,6 +162,8 @@ export interface DirectAssistRequest {
   readonly source: DirectAssistSource;
   readonly selection: DirectAssistSelection;
   readonly currentRequest: string;
+  readonly pinnedModeInstructions: string;
+  readonly pinnedModeIsCustom: boolean;
   readonly skill: DirectAssistSkill | null;
   readonly manualContext: string;
   readonly referenceContext: string;

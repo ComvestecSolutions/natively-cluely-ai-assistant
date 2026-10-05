@@ -73,8 +73,17 @@ test('Direct Assist dispatch snapshots one exact selection and never enters a le
   assert.equal((streamBlock.match(/service\.stream\(/g) ?? []).length, 1);
   assert.doesNotMatch(
     streamBlock,
-    /ragQueryLive|generateWhatToSay|generate-what-to-say|gemini-chat-stream|runWhatShouldISay|planAnswer|IntelligenceEngine/,
+    /ragQueryLive|generateWhatToSay|generate-what-to-say|gemini-chat-stream|runWhatShouldISay|IntelligenceEngine/,
   );
+});
+
+test('Direct Assist pins scoped mode policy before asynchronous course grounding and skips skill-owned requests', () => {
+  assert.match(streamBlock, /getActiveModeInfo\(\)/);
+  assert.match(streamBlock, /getActiveModePinnedInstructions\?\.\(.*answerType.*activeModeId/);
+  assert.match(streamBlock, /if \(activeModeId && !resolvedSkill\.skill\)/);
+  assert.match(streamBlock, /pinnedModeInstructions,/);
+  assert.ok(streamBlock.indexOf('pinnedModeInstructions =') < streamBlock.indexOf('await getChatCourseGrounding('));
+  assert.ok(streamBlock.indexOf('activeModeId =') < streamBlock.indexOf('await getChatCourseGrounding('));
 });
 
 test('renderer request IDs, sender IDs, and sources isolate supersession and cancellation', () => {
@@ -260,7 +269,8 @@ test('referenceContext and meetingTranscript are always server-populated, ignori
     /referenceFiles: request\.referenceFiles/,
     'reference files must be server-computed, not passed through from the renderer',
   );
-  assert.match(streamBlock, /ModesManager\.getInstance\(\)[\s\S]{0,400}\.getReferenceFiles\(/);
+  assert.match(streamBlock, /const modesManager = ModesManager\.getInstance\(\)/);
+  assert.match(streamBlock, /modesManager\.getReferenceFiles\(activeModeId\)/);
   // STRUCTURED, not pre-rendered: the per-file budget share happens downstream
   // against the real prompt limit, so one oversized attachment cannot starve
   // the rest (allocateDirectAssistReferenceFiles).

@@ -606,6 +606,10 @@ const GROUNDING_OVERRIDE_RE = new RegExp(String.raw`\b(?:ignore|disregard|bypass
 const ASSUMED_EXPERIENCE_RE = /\b(?:assume|pretend|act\s+as\s+if|act\s+like|imagine|suppose|say|claim|state|tell\s+(?:them|him|her|the\s+\w+))\b[^.\n]{0,30}\b(?:that\s+)?(?:I|we|my|our)\b(?!\s+am\s+(?:a\s+)?(?:beginner|five|child|kid|student|novice|layman)\b)/i;
 // "Make up metrics", "invent facts", "fabricate a story", "you may lie".
 const INVENT_RE = /\b(?:make\s+up|invent|fabricate|lie\s+about|you\s+(?:may|can|should)\s+(?:lie|guess|invent|fabricate|make\s+up))\b(?![^.\n]{0,40}\b(?:example|analogy|analogies|sample\s+input|test\s+case)s?\b)/i;
+// Referencing a PDF for examples is a task directive; promoting its embedded
+// instructions above the app's source policy is not.
+const SOURCE_PRIORITY_RE = /\b(?:trust|follow|obey|treat|regard|accept|use)\b.{0,100}\b(?:uploaded|attached|retrieved|pdf|document|file|source)\b.{0,100}\b(?:instructions?|directives?|rules?)\b.{0,100}\b(?:higher\s+priority|above|over|override|system|developer|authoritative)\b/i;
+const SOURCE_COMMANDS_RE = /\b(?:treat|trust|follow|obey|use|accept|regard|count)\b[^.\n]{0,120}\b(?:(?:uploaded|attached|retrieved|pdf|documents?|files?|sources?)\b[^.\n]{0,100}\b(?:commands?|instructions?|directives?|rules?)|(?:commands?|instructions?|directives?|rules?)\b[^.\n]{0,100}\b(?:uploaded|attached|retrieved|pdf|documents?|files?|sources?))\b[^.\n]{0,80}\b(?:as\s+)?(?:policy|system|developer|authoritative|higher\s+priority|above|override)\b/i;
 
 // ── self-claimed EXPERIENCE is not an instruction (Evin's decision, 2026-09-21) ──
 //
@@ -681,13 +685,15 @@ const isGroundingAttack = (sentence: string): boolean => {
   // A prohibition is the opposite of an attack: "Do not invent examples",
   // "Never claim something you are unsure about".
   if (NEGATED_LEAD_RE.test(t)) return false;
-  return GROUNDING_OVERRIDE_RE.test(t) || ASSUMED_EXPERIENCE_RE.test(t) || INVENT_RE.test(t);
+  const grantsDocumentAuthority = !/\bnot\s+as\s+(?:policy|system|developer|authoritative)\b/i.test(t)
+    && SOURCE_COMMANDS_RE.test(t);
+  return GROUNDING_OVERRIDE_RE.test(t) || ASSUMED_EXPERIENCE_RE.test(t) || INVENT_RE.test(t) || SOURCE_PRIORITY_RE.test(t) || grantsDocumentAuthority;
 };
 
 /**
- * The user's text with every grounding-attack SENTENCE removed (line structure
- * and list markers preserved), and how many were removed. Pure. Every carrier
- * renders through this, so no surface can deliver the attack.
+ * The user's text with unsafe clauses removed (line structure and list markers
+ * preserved), and how many were removed. Pure. Every carrier renders through
+ * this, so no surface can deliver the attack.
  */
 export const removeGroundingOverrides = (raw: unknown): { text: string; removed: number } => {
   const text = asText(raw);
@@ -702,13 +708,26 @@ export const removeGroundingOverrides = (raw: unknown): { text: string; removed:
     let altered = false;
     const kept: string[] = [];
     for (const sn of sentences) {
-      if (isGroundingAttack(sn)) { removed++; altered = true; continue; }
-      if (!isExperienceClaim(sn)) { kept.push(sn); continue; }
-      // Clause by clause: "I have 5 years in Java so answer in Java" keeps its instruction.
-      const clauses = splitInstructionClauses(sn);
-      const survivors = clauses.filter(c => !isExperienceClaim(c) && !(FIRST_PERSON_RE.test(c) && NAMED_PLACE_RE.test(c)));
-      removed++; altered = true;
-      if (survivors.length && survivors.length < clauses.length && survivors.some(isDirectiveShaped)) kept.push(survivors.join(', '));
+      // A negation protects its own clause, not the rest of a semicolon-combined
+      // sentence. Keep the original spelling when nothing needs removal.
+      const clauses = splitInstructionClauses(sn.replace(/([,;])(?=\S)/g, '$1 ')
+        .replace(/\s+and\s+(?=(?:assume|pretend|imagine|suppose|ignore|disregard|bypass|override|invent|fabricate|trust|follow|obey|treat|answer|respond|reply|use|act)\b)/gi, '; '));
+      const experienceSentence = isExperienceClaim(sn);
+      const survivors = clauses.filter(c => {
+        if (isGroundingAttack(c) || isExperienceClaim(c) || (experienceSentence && FIRST_PERSON_RE.test(c) && NAMED_PLACE_RE.test(c))) {
+          removed++; altered = true;
+          return false;
+        }
+        return true;
+      });
+      // Bare résumé fragments can be a claim only as a group ("Senior engineer,
+      // Google, 10 years."). If no individual clause explains the claim, retain
+      // only clauses that are independently recognizable directives.
+      const safeSurvivors = experienceSentence && !clauses.some(isExperienceClaim)
+        ? survivors.filter(isDirectiveShaped) : survivors;
+      if (safeSurvivors.length < survivors.length) { removed += survivors.length - safeSurvivors.length; altered = true; }
+      if (safeSurvivors.length === clauses.length) { kept.push(sn); continue; }
+      if (safeSurvivors.some(isDirectiveShaped)) kept.push(safeSurvivors.join('; '));
     }
     if (!altered) lines.push(rawLine);
     else if (kept.some(hasWordChar)) lines.push(`${marker}${kept.join(' ')}`);
@@ -926,7 +945,7 @@ export const renderUserInstructionBlock = (
   const text = sanitizeInstructionText(safe);
   if (!text) return '';
   // Analysed on what SURVIVED: a removed sentence must not resolve into a line.
-  const a = (analysis && safe === asText(raw)) ? analysis : analyzeUserInstructions(safe);
+  const a = (analysis && text === safe && safe === asText(raw)) ? analysis : analyzeUserInstructions(text);
   const binding = renderResolvedInstructionLines(a);
 
 

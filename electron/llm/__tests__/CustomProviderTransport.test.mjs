@@ -72,6 +72,22 @@ for (const lane of ['executeCustomProvider', 'chatWithCurl']) {
     assert.equal(posts[0].stream, false);
   });
 }
+test('custom cURL templates without a SYSTEM placeholder still carry the request policy as system exactly once', async () => {
+  const p = provider({
+    curlCommand: `curl ${endpoint} -H 'Content-Type: application/json' -d '${JSON.stringify({
+      model: 'qwen-local', messages: [{ role: 'user', content: '{{TEXT}}' }], stream: true,
+    })}'`,
+  });
+  respond = (_req, res) => sse(res, `data: ${JSON.stringify(delta('answer'))}\n\ndata: [DONE]\n\n`);
+  const instruction = 'Speak in first person during the interview.';
+  assert.equal(await collect(helper(p).streamWithCustom('question', undefined, undefined, instruction)), 'answer');
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].messages.filter(m => m.role === 'system').length, 1);
+  assert.equal(posts[0].messages[0].role, 'system');
+  assert.equal(posts[0].messages[0].content.split(instruction).length - 1, 1);
+  assert.equal(posts[0].messages.at(-1).content, 'question');
+});
+
 test('streamWithCustom: SSE data without a space, comments, multiline data and split UTF-8', async () => {
   const p = provider();
   respond = async (_req, res) => {

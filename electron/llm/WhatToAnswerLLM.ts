@@ -946,7 +946,9 @@ The user triggered this action with a coding problem on screen and NO new questi
                     && temporalContext?.hasRecentResponses) ? temporalContext.previousResponses : undefined,
                 intentContext,
                 retrievedModeContext: typedModeContext || undefined,
-                pinnedModeInstructions: pinnedModeInstructions || undefined,
+                // V2 already rendered the same instructions into basePrompt.
+                pinnedModeInstructions: v2BasePrompt ? undefined : pinnedModeInstructions || undefined,
+                pinnedModeIsCustom: requestSnapshot?.activeModeInfo?.isCustom === true,
                 candidateProfile: typedCandidateProfile || undefined,
                 tokenBudget: Math.max(1000, assemblerBudget),
                 systemPrompt: finalPromptOverride,
@@ -999,8 +1001,8 @@ The user triggered this action with a coding problem on screen and NO new questi
                 try {
                     const caps = this.llmHelper.getCapabilities();
                     console.log('[TRACE:LONGCTX] prompt_assembled', JSON.stringify({
-                        systemPromptChars: finalPromptOverride.length,
-                        systemPromptTokensEst: estimateTokens(finalPromptOverride),
+                        systemPromptChars: packet.systemPrompt.length,
+                        systemPromptTokensEst: estimateTokens(packet.systemPrompt),
                         userMessageChars: packet.userMessage.length,
                         userMessageTokensEst: estimateTokens(packet.userMessage),
                         transcriptForPromptChars: transcriptForPrompt.length,
@@ -1042,7 +1044,7 @@ The user triggered this action with a coding problem on screen and NO new questi
                                 || packet.userMessage.toLowerCase().includes(escapeUserContent(answerPlan.question.trim()).toLowerCase()))
                             : null,
                         userMessageTail: packet.userMessage.slice(-800),
-                        systemPromptTail: finalPromptOverride.slice(-400),
+                        systemPromptTail: packet.systemPrompt.slice(-400),
                     }));
                 } catch (e) { console.warn('[TRACE:LONGCTX] prompt_assembled logging failed', e); }
             }
@@ -1163,7 +1165,7 @@ The user triggered this action with a coding problem on screen and NO new questi
             // PR #429 Bug 003: `_v3p?.system ?? finalPromptOverride` discarded the
             // ACTIVE SKILL block on every V3 turn — finalPromptOverride is its only
             // carrier and V3 is default ON, so `??` never fell through.
-            let _wtaSystemPrompt = composeWtaSystemPrompt(_v3p?.system, finalPromptOverride, activeSkill);
+            let _wtaSystemPrompt = composeWtaSystemPrompt(_v3p?.system, packet.systemPrompt, activeSkill);
             // A V3 system whose persona was null (v2 kill-switch) has no diagram
             // contract; every other composition already carries exactly one, and
             // the helper never adds a second.

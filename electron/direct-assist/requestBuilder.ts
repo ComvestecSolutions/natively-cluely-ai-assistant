@@ -1,6 +1,7 @@
 import { DirectAssistError } from './errors';
 import { DIRECT_ASSIST_PROVIDERS } from './types';
 import { getModelCapabilities } from '../llm/modelCapabilities';
+import { renderUserInstructionSystemLayer } from '../llm/userInstructionContract';
 // The shared diagram modules are required at the point of use (see
 // diagramModules below): LLMHelper imports this file statically, and the
 // per-file tsc trees two test suites build do not emit `.mjs` modules that
@@ -486,11 +487,6 @@ export function buildDirectAssistRequest(input: DirectAssistRequestInput): Direc
     MIN_MAX_CONTEXT_CHARS,
     (capabilities.maxContextTokens - capabilities.outputBudgetTokens - 1_000) * 4,
   );
-  const maxContextChars = Math.max(
-    MIN_MAX_CONTEXT_CHARS,
-    Math.min(MAX_MAX_CONTEXT_CHARS, modelInputChars, Math.floor(requestedMax)),
-  );
-
   const skill = input.skill && typeof input.skill.instructions === 'string' && input.skill.instructions.trim()
     ? Object.freeze({
         id: typeof input.skill.id === 'string' ? input.skill.id : undefined,
@@ -498,12 +494,25 @@ export function buildDirectAssistRequest(input: DirectAssistRequestInput): Direc
         instructions: input.skill.instructions,
       })
     : null;
+  const pinnedModeInstructions = typeof input.pinnedModeInstructions === 'string' ? input.pinnedModeInstructions : '';
+  const pinnedModeIsCustom = input.pinnedModeIsCustom === true;
+  const modeLayer = skill ? '' : renderUserInstructionSystemLayer(pinnedModeInstructions, { isCustomMode: pinnedModeIsCustom });
+  // A long mode policy is required SYSTEM content, not optional evidence.
+  // Reserve its actual size before sharing the remaining budget with files and
+  // transcript. The old fixed 1,000-token reserve still applies when larger.
+  const systemReserve = Math.max(4_000, DIRECT_ASSIST_SYSTEM_PROMPT.length + (modeLayer ? modeLayer.length + 2 : 0) + 8);
+  const maxContextChars = Math.max(
+    MIN_MAX_CONTEXT_CHARS,
+    Math.min(MAX_MAX_CONTEXT_CHARS, modelInputChars - systemReserve, Math.floor(requestedMax)),
+  );
 
   return Object.freeze({
     requestId: input.requestId,
     source: input.source,
     selection: Object.freeze({ provider: input.selection.provider, model: input.selection.model }),
     currentRequest: input.currentRequest,
+    pinnedModeInstructions,
+    pinnedModeIsCustom,
     skill,
     manualContext: typeof input.manualContext === 'string' ? input.manualContext : '',
     referenceContext: typeof input.referenceContext === 'string' ? input.referenceContext : '',
@@ -1037,8 +1046,14 @@ export function prepareDirectAssistPrompt(input: DirectAssistRequestInput | Dire
   // small model gets, or none — and never makes a turn that fitted fail.
   // (An 8k local model with a full prompt used to throw CONTEXT_TOO_LARGE on
   // "design a URL shortener" and answer "what is a CDN?" fine.)
+  // The mode is request-scoped policy, never reference/meeting/page evidence.
+  // Keep it in SYSTEM on every provider route, including diagram turns.
+  const modeLayer = request.skill ? '' : renderUserInstructionSystemLayer(request.pinnedModeInstructions, {
+    isCustomMode: request.pinnedModeIsCustom,
+  });
+  const baseSystemPrompt = modeLayer ? `${DIRECT_ASSIST_SYSTEM_PROMPT}\n\n${modeLayer}` : DIRECT_ASSIST_SYSTEM_PROMPT;
   const systemPrompt = (() => {
-    if (!diagram.contractSignals) return DIRECT_ASSIST_SYSTEM_PROMPT;
+    if (!diagram.contractSignals) return baseSystemPrompt;
     // 8: the dispatcher estimates the two prompts' tokens separately, each
     // rounded up (LLMHelper's CONTEXT_TOO_LARGE check).
     const room = Number.isFinite(request.modelInputChars)
@@ -1046,10 +1061,10 @@ export function prepareDirectAssistPrompt(input: DirectAssistRequestInput | Dire
       : Number.POSITIVE_INFINITY;
     const tiers: Array<'cloud' | 'local'> = request.smallModel ? ['local'] : ['cloud', 'local'];
     for (const tier of tiers) {
-      const withContract = diagramModules().appendDiagramContract(DIRECT_ASSIST_SYSTEM_PROMPT, diagram.contractSignals, { surface: 'live', tier });
+      const withContract = diagramModules().appendDiagramContract(baseSystemPrompt, diagram.contractSignals, { surface: 'live', tier });
       if (withContract.length <= room) return withContract;
     }
-    return DIRECT_ASSIST_SYSTEM_PROMPT;
+    return baseSystemPrompt;
   })();
   // The contract and the design block go together. The block opens with "the
   // starting point for this turn, as the diagram contract describes": sent
@@ -1060,7 +1075,7 @@ export function prepareDirectAssistPrompt(input: DirectAssistRequestInput | Dire
   // the history this prompt still carries, and the turn is answered from it
   // like any other. (Re-rendering without the block only makes the prompt
   // shorter, so a turn that fitted still fits.)
-  if (diagram.contractSignals && diagram.designBlock && systemPrompt === DIRECT_ASSIST_SYSTEM_PROMPT) {
+  if (diagram.contractSignals && diagram.designBlock && systemPrompt === baseSystemPrompt) {
     parts.omitDesignBlock = true;
     userPrompt = renderUserPrompt(request, parts);
   }

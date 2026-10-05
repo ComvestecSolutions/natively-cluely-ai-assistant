@@ -38,6 +38,21 @@ const turn = (sessionId, question, n, extra = {}) => buildV3Prompt({
   scope: { userId: 'local', sessionId }, ...extra,
 });
 
+describe('V3 standing mode instructions', () => {
+  test('a manual interview turn carries answer-shape policy once in SYSTEM and conversation evidence only in USER', async () => {
+    const instruction = 'For complete MCQs SELECT one option; for a truncated prompt say INCOMPLETE.';
+    const evidence = 'Conversation mentioned user-private salary figure 74219.';
+    const prompt = await turn('mode-policy-manual', 'Which choice fits this question?', 1, {
+      realtimeInstruction: instruction,
+      conversationSummary: evidence,
+    });
+    assert.ok(prompt, 'V3 produced a prompt');
+    assert.equal(prompt.system.split(instruction).length - 1, 1);
+    assert.doesNotMatch(prompt.user, /For complete MCQs SELECT one option/);
+    assert.doesNotMatch(prompt.system, /user-private salary figure 74219/);
+  });
+});
+
 describe('no-evidence notice — branch ordering', () => {
   test('a general-knowledge follow-up gets NO absence narrative, history or not', async () => {
     // The exact case the private-claim guard names: "give me an example" after

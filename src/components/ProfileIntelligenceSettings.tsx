@@ -1307,18 +1307,20 @@ const PIIndexBadge: React.FC<{ status?: string }> = ({ status }) => {
 interface FileUploadEmptyProps {
     hint: string;
     hasAccess: boolean;
+    backendAvailable: boolean;
     onBrowse: () => void;
     onNeedUpgrade: () => void;
     /** Entrance class when this slot is what a finished indexing run landed on
         (i.e. the ingest failed and dropped the user back to the upload CTA). */
     enterClass?: string;
 }
-const FileUploadEmpty = ({ hint, hasAccess, onBrowse, onNeedUpgrade, enterClass }: FileUploadEmptyProps) => (
+const FileUploadEmpty = ({ hint, hasAccess, backendAvailable, onBrowse, onNeedUpgrade, enterClass }: FileUploadEmptyProps) => (
     <div className={`pi-file-empty${enterClass ? ` ${enterClass}` : ''}`} style={{ gap: 12 }}>
-        <p style={{ fontSize: 12, color: 'var(--pi-tertiary)', margin: 0 }}>{hint}{!hasAccess ? ' Requires Pro.' : ''}</p>
+        <p style={{ fontSize: 12, color: 'var(--pi-tertiary)', margin: 0 }}>{backendAvailable ? hint : 'The knowledge engine is unavailable, so this document cannot be checked or uploaded.'}{!hasAccess ? ' Requires Pro.' : ''}</p>
         <button
             className="pi-upload-btn"
-            onClick={() => { if (!hasAccess) { onNeedUpgrade(); return; } onBrowse(); }}
+            disabled={!backendAvailable}
+            onClick={() => { if (!backendAvailable) return; if (!hasAccess) { onNeedUpgrade(); return; } onBrowse(); }}
         >
             <Paperclip size={13} /> Upload file
         </button>
@@ -2003,7 +2005,11 @@ export function ProfileIntelligenceSettings({
         hasProfile: boolean; profileMode: boolean; name?: string; role?: string;
         totalExperienceYears?: number; profileFactsReady?: boolean;
         extractionMode?: 'llm' | 'heuristic' | 'none';
+        backendAvailable?: boolean;
+        backendUnavailable?: 'knowledge_engine_unavailable' | 'status_unavailable' | null;
     }>({ hasProfile: false, profileMode: false });
+    // Unknown status is not permission to send a file to an unverified engine.
+    const backendAvailable = profileStatus.backendAvailable === true;
     const [profileUploading, setProfileUploading] = useState(false);
     // The genie keeps a picture of this card to pour out on the next open
     // (genieSnapshots.ts); it must never picture it half-loaded.
@@ -2397,6 +2403,7 @@ export function ProfileIntelligenceSettings({
     // FileUploadEmpty stays: it also decides the "Requires Pro." hint, so it is
     // doing UI work, not just guarding — and a double gate here is idempotent.
     const browseResume = async () => {
+        if (!backendAvailable) return;
         if (!hasProfileAccess) { openPlans(); return; }
         const fileResult = await window.electronAPI?.profileSelectFile?.();
         if (fileResult?.cancelled || !fileResult?.filePath) return;
@@ -2404,6 +2411,7 @@ export function ProfileIntelligenceSettings({
     };
 
     const browseJD = async () => {
+        if (!backendAvailable) return;
         if (!hasProfileAccess) { openPlans(); return; }
         const fileResult = await window.electronAPI?.profileSelectFile?.();
         if (fileResult?.cancelled || !fileResult?.filePath) return;
@@ -2416,7 +2424,7 @@ export function ProfileIntelligenceSettings({
     // re-buying 14-20 Tavily credits of dossier that is already cached.
     const doCompanyResearch = async (forceRefresh: boolean) => {
         const company = profileData?.activeJD?.company;
-        if (!company) return;
+        if (!backendAvailable || !company) return;
         setCompanyResearching(true); setCompanySearchQuotaExhausted(false);
         try {
             const result = await window.electronAPI?.profileResearchCompany?.(company, forceRefresh);
@@ -2442,8 +2450,8 @@ export function ProfileIntelligenceSettings({
     }, []);
 
     const renderIdentity = () => {
-        const isActive = profileStatus.profileMode && hasProfileAccess;
-        const isDisabled = !profileStatus.hasProfile || !hasProfileAccess;
+        const isActive = backendAvailable && profileStatus.profileMode && hasProfileAccess;
+        const isDisabled = !backendAvailable || !profileStatus.hasProfile || !hasProfileAccess;
         return (
         <>
             {/* Persona Engine toggle card — hidden under Context Intelligence
@@ -2457,20 +2465,23 @@ export function ProfileIntelligenceSettings({
                 <div>
                     <h3 className="pi-section-label" style={{ margin: 0 }}>Persona Engine</h3>
                     <p style={{ fontSize: 12, color: 'var(--pi-secondary)', margin: '4px 0 0' }}>
-                        {profileStatus.profileMode
-                            ? 'Answers rewired around your profile, the role, and your voice.'
-                            : 'Dormant. Your profile is loaded but not shaping answers yet.'}
+                        {!backendAvailable
+                            ? 'Unavailable until the knowledge engine is ready.'
+                            : isActive
+                                ? 'Answers rewired around your profile, the role, and your voice.'
+                                : 'Dormant. Your profile is loaded but not shaping answers yet.'}
                     </p>
                 </div>
                 <button
                     type="button"
                     role="switch"
-                    data-on={String(!!(profileStatus.profileMode && hasProfileAccess))}
-                    aria-checked={!!(profileStatus.profileMode && hasProfileAccess)}
-                    aria-disabled={(!profileStatus.hasProfile || !hasProfileAccess) ? true : undefined}
+                    data-on={String(!!isActive)}
+                    aria-checked={!!isActive}
+                    aria-disabled={isDisabled || undefined}
+                    disabled={isDisabled}
                     aria-label="Persona Engine"
                     onClick={async () => {
-                        if (!profileStatus.hasProfile || !hasProfileAccess) return;
+                        if (isDisabled) return;
                         const newState = !profileStatus.profileMode;
                         setProfileError('');
                         try {
@@ -2517,6 +2528,7 @@ export function ProfileIntelligenceSettings({
                 <FileUploadEmpty
                     hint="Add your resume as real-time context."
                     hasAccess={hasProfileAccess}
+                    backendAvailable={backendAvailable}
                     onBrowse={browseResume}
                     onNeedUpgrade={() => openPlans()}
                     enterClass={profileHandoff.arriving ? 'pi-handoff-in-self' : undefined}
@@ -2531,7 +2543,7 @@ export function ProfileIntelligenceSettings({
                         <PIIndexBadge status={profileUploadStatus} />
                         <button
                             className="pi-press-soft"
-                            disabled={profileUploading}
+                            disabled={profileUploading || !backendAvailable}
                             title={profileUploading
                                 ? 'Indexing — this finishes in the background and cannot be stopped. Delete it once it completes.'
                                 : 'Delete resume'}
@@ -2545,7 +2557,7 @@ export function ProfileIntelligenceSettings({
                                 // enables knowledge mode, so "cancel" produced a UI claiming
                                 // no profile while the resume was in fact saved and live.
                                 // The button is disabled mid-ingest rather than lying.
-                                if (profileUploading) return;
+                                if (profileUploading || !backendAvailable) return;
                                 if (!(await askConfirm({ title: 'Delete your resume and its extracted data?', confirmLabel: 'Delete' }))) return;
                                 setProfileError('');
                                 try {
@@ -2554,7 +2566,7 @@ export function ProfileIntelligenceSettings({
                                         setProfileError(result?.error || 'Failed to delete resume');
                                         return;
                                     }
-                                    setProfileStatus({ hasProfile: false, profileMode: false });
+                                    setProfileStatus(prev => ({ ...prev, hasProfile: false, profileMode: false }));
                                     const freshData = await window.electronAPI?.profileGetProfile?.();
                                     setProfileData(freshData ?? null);
                                 } catch (e: any) {
@@ -2636,6 +2648,7 @@ export function ProfileIntelligenceSettings({
                 <FileUploadEmpty
                     hint="Add a job description as real-time context."
                     hasAccess={hasProfileAccess}
+                    backendAvailable={backendAvailable}
                     onBrowse={browseJD}
                     onNeedUpgrade={() => openPlans()}
                     enterClass={jdHandoff.arriving ? 'pi-handoff-in-self' : undefined}
@@ -2652,7 +2665,7 @@ export function ProfileIntelligenceSettings({
                         <PIIndexBadge status={jdUploadStatus} />
                         <button
                             className="pi-press-soft"
-                            disabled={jdUploading}
+                            disabled={jdUploading || !backendAvailable}
                             title={jdUploading
                                 ? 'Indexing — this finishes in the background and cannot be stopped. Delete it once it completes.'
                                 : 'Delete job description'}
@@ -2662,7 +2675,7 @@ export function ProfileIntelligenceSettings({
                             onClick={async () => {
                                 // Same lie as the resume X — the abort flag only silenced
                                 // this renderer while main finished the JD ingest.
-                                if (jdUploading) return;
+                                if (jdUploading || !backendAvailable) return;
                                 setJdError('');
                                 try {
                                     const result = await window.electronAPI?.profileDeleteJD?.();
@@ -2858,9 +2871,9 @@ export function ProfileIntelligenceSettings({
                             <FileText size={18} style={{ color: 'var(--pi-accent-icon)' }} />
                         </div>
                         <div>
-                            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--pi-primary)', marginBottom: 4 }}>No resume yet</div>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--pi-primary)', marginBottom: 4 }}>{backendAvailable ? 'No resume yet' : 'Profile unavailable'}</div>
                             <div style={{ fontSize: 12, color: 'var(--pi-secondary)', lineHeight: 1.6, maxWidth: 260 }}>
-                                Add your resume in <strong style={{ color: 'var(--pi-primary)' }}>Identity</strong> and I'll summarize it here.
+                                {backendAvailable ? <>Add your resume in <strong style={{ color: 'var(--pi-primary)' }}>Identity</strong> and I'll summarize it here.</> : 'The knowledge engine is unavailable, so your stored profile cannot be checked.'}
                             </div>
                         </div>
                     </div>
@@ -2877,7 +2890,7 @@ export function ProfileIntelligenceSettings({
                     <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 24, padding: '10px 12px', borderRadius: 'var(--pi-r-md)', border: '1px solid rgba(245,158,11,0.20)', background: 'rgba(245,158,11,0.06)' }}>
                         <Info size={14} style={{ color: '#f59e0b', flexShrink: 0 }} />
                         <span style={{ fontSize: 12, color: 'var(--pi-secondary)', lineHeight: 1.5, flex: 1 }}>Read without AI, so some details may be missing.</span>
-                        <button className="pi-pill-btn pi-press" style={{ flexShrink: 0 }} onClick={browseResume}><RefreshCw size={12} /> Re-upload</button>
+                        <button className="pi-pill-btn pi-press" style={{ flexShrink: 0 }} disabled={!backendAvailable} onClick={browseResume}><RefreshCw size={12} /> Re-upload</button>
                     </div>
                 )}
 
@@ -3137,7 +3150,7 @@ export function ProfileIntelligenceSettings({
                         </p>
                     </div>
                     {loaded && (
-                        <button className="pi-pill-btn pi-press" disabled={companyResearching} onClick={() => doCompanyResearch(true)}>
+                        <button className="pi-pill-btn pi-press" disabled={companyResearching || !backendAvailable} onClick={() => doCompanyResearch(true)}>
                             <RefreshCw size={12} className={companyResearching ? 'pi-spinner' : ''} />
                             {companyResearching ? 'Refreshing' : 'Refresh'}
                         </button>
@@ -3152,9 +3165,9 @@ export function ProfileIntelligenceSettings({
                             <Building2 size={18} style={{ color: 'var(--pi-accent-icon)' }} />
                         </div>
                         <div>
-                            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--pi-primary)', marginBottom: 4 }}>No job description yet</div>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--pi-primary)', marginBottom: 4 }}>{backendAvailable ? 'No job description yet' : 'Job description unavailable'}</div>
                             <div style={{ fontSize: 12, color: 'var(--pi-secondary)', lineHeight: 1.6, maxWidth: 260 }}>
-                                Upload a job description in <strong style={{ color: 'var(--pi-primary)' }}>Identity</strong> so I can research the target company.
+                                {backendAvailable ? <>Upload a job description in <strong style={{ color: 'var(--pi-primary)' }}>Identity</strong> so I can research the target company.</> : 'The knowledge engine is unavailable, so company research cannot run.'}
                             </div>
                         </div>
                     </div>
@@ -3196,6 +3209,7 @@ export function ProfileIntelligenceSettings({
                         <button
                             className="pi-pill-btn pi-press"
                             style={{ color: 'var(--pi-cta-accent-text)', borderColor: 'var(--pi-cta-accent-border)', background: 'var(--pi-accent-subtle)', fontWeight: 600, padding: '8px 20px' }}
+                            disabled={!backendAvailable}
                             onClick={() => doCompanyResearch(false)}
                         >
                             Research Now
@@ -3553,6 +3567,7 @@ export function ProfileIntelligenceSettings({
 
     const renderCoverLetter = () => {
         const doGenerate = async (regen: boolean) => {
+            if (!backendAvailable) return;
             setCoverLetterGenerating(true); setCoverLetterError('');
             try {
                 const result = await window.electronAPI?.profileGenerateCoverLetter?.(regen);
@@ -3595,7 +3610,7 @@ export function ProfileIntelligenceSettings({
                         </p>
                     </div>
                     {showOutput && (
-                        <button className="pi-pill-btn pi-press" onClick={() => doGenerate(true)}>
+                        <button className="pi-pill-btn pi-press" disabled={!backendAvailable} onClick={() => doGenerate(true)}>
                             <RefreshCw size={12} className={coverLetterGenerating ? 'pi-spinner' : ''} />
                             Regenerate
                         </button>
@@ -3644,9 +3659,9 @@ export function ProfileIntelligenceSettings({
                             <Mail size={18} style={{ color: 'var(--pi-accent-icon)' }} />
                         </div>
                         <div>
-                            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--pi-primary)', marginBottom: 4 }}>No resume yet</div>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--pi-primary)', marginBottom: 4 }}>{backendAvailable ? 'No resume yet' : 'Cover letters unavailable'}</div>
                             <div style={{ fontSize: 12, color: 'var(--pi-secondary)', lineHeight: 1.6, maxWidth: 260 }}>
-                                Upload your resume in <strong style={{ color: 'var(--pi-primary)' }}>Identity</strong> first — cover letters are tailored from it.
+                                {backendAvailable ? <>Upload your resume in <strong style={{ color: 'var(--pi-primary)' }}>Identity</strong> first — cover letters are tailored from it.</> : 'The knowledge engine is unavailable, so a cover letter cannot be generated.'}
                             </div>
                         </div>
                     </div>
@@ -3682,6 +3697,7 @@ export function ProfileIntelligenceSettings({
                         <button
                             className="pi-pill-btn pi-press"
                             style={{ color: 'var(--pi-cta-accent-text)', borderColor: 'var(--pi-cta-accent-border)', background: 'var(--pi-accent-subtle)', fontWeight: 600, padding: '8px 20px' }}
+                            disabled={!backendAvailable}
                             onClick={() => doGenerate(false)}
                         >
                             Generate Letter
@@ -3754,7 +3770,9 @@ export function ProfileIntelligenceSettings({
     // whether the user has access and how to jump to the sections that supply
     // its sources. That keeps this already-large component from growing another
     // dozen useState hooks.
-    const renderRoleInsight = () => (
+    const renderRoleInsight = () => !backendAvailable ? (
+        <p style={{ color: 'var(--pi-secondary)', fontSize: 12 }}>Role Insight requires the Profile Intelligence knowledge engine.</p>
+    ) : (
         <RoleInsightPanel
             hasAccess={hasProfileAccess}
             onNeedUpgrade={() => openPlans()}
@@ -3896,6 +3914,13 @@ export function ProfileIntelligenceSettings({
 
             {/* ── Right panel ── */}
             <div style={{ flex: 1, minWidth: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+                {statusLoaded && !backendAvailable && (
+                    <div role="alert" data-profile-backend-unavailable="true" style={{ margin: '12px 24px 0', padding: '10px 12px', border: '1px solid var(--pi-danger)', borderRadius: 8, color: 'var(--pi-primary)', fontSize: 12 }}>
+                        {profileStatus.backendUnavailable === 'knowledge_engine_unavailable'
+                            ? 'Profile Intelligence knowledge engine is unavailable. The required backend may not be included in this build. Resume and job-description uploads, profile answers, and generated insights are disabled. Modes and API-key settings remain available.'
+                            : 'Profile Intelligence status could not be confirmed. Engine-backed actions are disabled until it is available.'}
+                    </div>
+                )}
                 {/* Scrollable content — key remounts the block on each switch, which
                     is what re-fires the directional blur-in below it. */}
                 <div ref={panelScrollRef} style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: '24px 32px', boxSizing: 'border-box' }}>

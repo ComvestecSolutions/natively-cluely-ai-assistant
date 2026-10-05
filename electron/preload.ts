@@ -1024,6 +1024,8 @@ interface ElectronAPI {
   // Profile Engine API
   profileUploadResume: (filePath: string) => Promise<{ success: boolean; error?: string }>;
   profileGetStatus: () => Promise<{
+    backendAvailable: boolean;
+    backendUnavailable: 'knowledge_engine_unavailable' | 'status_unavailable' | null;
     hasProfile: boolean;
     profileMode: boolean;
     name?: string;

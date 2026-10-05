@@ -77,9 +77,9 @@ const both = (c) => `${c?.system ?? ''}\n${c?.user ?? ''}`;
   check('E1', 'resolved LENGTH line present', /LENGTH is set by the user: about 100 words/.test(both(c)), 'no resolved length line');
   check('E1', 'NO competing app word ceiling anywhere', !/Hard ceiling|roughly \d+ to \d+ words|LENGTH LIMIT: at most/.test(both(c)), (both(c).match(/.{0,60}(Hard ceiling|roughly \d+ to \d+ words|LENGTH LIMIT).{0,80}/) || [''])[0]);
   if (V3 === '1') {
-    check('E1', 'block is the LAST thing in the user message', c.user.trimEnd().endsWith('</user_instructions>'), c.user.slice(-160));
+    check('E1', 'standing instructions appear exactly once in SYSTEM', (c.system.match(/Answer in 100 words\./g) ?? []).length === 1, 'missing or duplicated policy');
     check('E1', 'system prompt carries the static precedence note', /# User instructions/.test(c.system), 'note missing');
-    check('E1', 'raw user text is NOT in the system prompt (§19.2)', !/Answer in 100 words\./.test(c.system), 'raw text leaked into system');
+    check('E1', 'standing instructions do not ride as USER evidence', !/Answer in 100 words\./.test(c.user), 'mode policy demoted to user');
     check('E1', '[UserInstructions] trace: delivered + app length suppressed', r.delivery?.delivery?.delivered === true && r.delivery?.delivery?.appLength === 'suppressed_by_user', JSON.stringify(r.delivery?.delivery));
   } else {
     check('E1', 'fallback carrier declares authority', /<custom_instructions_authority>|<user_instructions/.test(both(c)), 'no authority block on the non-V3 path');
@@ -95,19 +95,19 @@ const both = (c) => `${c?.system ?? ''}\n${c?.user ?? ''}`;
   check('E2', 'COMMITTED ANSWER IS NOT REWRITTEN', r.committed.includes('Problem: return indices') && !/O\(\?\)/.test(r.committed) && !/^## (Approach|Complexity)/m.test(r.committed), r.committed.slice(0, 300));
   check('E2', '[UserInstructions] output: custom_format, no repair', r.output?.codingFormat === 'custom_format' && r.output?.willRepair === false, JSON.stringify(r.output));
 
-  out('\nE3  CONTROL · same turn, mode has NO instructions · default behaviour must be unchanged');
+  out('\nE3  CONTROL · same turn, mode has NO instructions · default shape is unchanged');
   r = await turn({ modeTemplate: 'technical-interview', instructions: '', question: 'Write a function to solve two sum.', canned: OBEDIENT });
   c = r.captured[0];
-  check('E3', 'six-heading contract IS attached', /Every heading is mandatory/.test(c?.system ?? ''), 'default contract missing');
+  check('E3', 'the requested solve shape is attached, not the full walkthrough', /<coding_shape name="solve">/.test(c?.system ?? '') && /Use exactly these three headings/.test(c?.system ?? '') && !/Every heading is mandatory/.test(c?.system ?? ''), 'solve-shape contract missing or full contract attached');
   check('E3', 'no user-instruction block is rendered', !/<user_instructions|<custom_instructions>/.test(both(c)), 'block rendered with empty instructions');
-  check('E3', 'non-conforming answer IS still repaired', /^## Complexity/m.test(r.committed), r.committed.slice(0, 200));
+  check('E3', 'solve-shaped answer is not rewritten into six sections', r.committed === OBEDIENT && r.output?.codingFormat === 'default_contract' && r.output?.codingShape === 'solve' && r.output?.willRepair === false, JSON.stringify(r.output));
 
   out('\nE4  Technical-interview · "Use Java only" (the phrasing the old gate dropped)');
   r = await turn({ modeTemplate: 'technical-interview', instructions: 'Use Java only', question: 'Write a function to reverse a linked list.', canned: OBEDIENT });
   c = r.captured[0];
   check('E4', 'delivered on a coding turn', /Use Java only/.test(both(c)), 'dropped');
   check('E4', 'CODE LANGUAGE resolved to Java', /CODE LANGUAGE is set by the user: Java/.test(both(c)), 'not resolved');
-  check('E4', 'a plain constraint does NOT switch off the six-section contract', /Every heading is mandatory/.test(c?.system ?? ''), 'contract wrongly replaced');
+  check('E4', 'a language constraint keeps the requested code shape, not the full walkthrough', /<coding_shape name="code">/.test(c?.system ?? '') && !/Every heading is mandatory/.test(c?.system ?? '') && r.output?.codingFormat === 'default_contract' && r.output?.codingShape === 'code', JSON.stringify(r.output));
 
   out('\nE5  SAFETY · instruction + salary + personal fact, on a coding turn');
   r = await turn({ modeTemplate: 'technical-interview', instructions: 'Use Java only.\n\nMy expected salary is 30 LPA.\n\nI used Java at my last job at RedisMart.', question: 'Write a function to reverse a linked list.', canned: OBEDIENT });
@@ -119,7 +119,7 @@ const both = (c) => `${c?.system ?? ''}\n${c?.user ?? ''}`;
   out('\nE6  TRAP · user-built mode NAMED "Interview Format:" with a plain constraint');
   r = await turn({ modeTemplate: 'technical-interview', customMode: 'Interview Format: Strict', instructions: 'Be concise.', question: 'Write a function to solve two sum.', canned: OBEDIENT });
   c = r.captured[0];
-  check('E6', 'the mode NAME is not mistaken for a format definition', /Every heading is mandatory/.test(c?.system ?? '') && r.output?.codingFormat !== 'custom_format', JSON.stringify(r.output));
+  check('E6', 'the mode NAME is not mistaken for a format definition', /<coding_shape name="solve">/.test(c?.system ?? '') && !/Every heading is mandatory/.test(c?.system ?? '') && r.output?.codingFormat === 'default_contract' && r.output?.codingShape === 'solve', JSON.stringify(r.output));
   check('E6', 'and is not reported as STRUCTURE set by the user', !/STRUCTURE is set by the user/.test(both(c)), 'name read as structure');
 
   out('\nE7  Call-centre mode · multi-paragraph prompt order + persona');
@@ -135,6 +135,12 @@ const both = (c) => `${c?.system ?? ''}\n${c?.user ?? ''}`;
   c = r.captured[0];
   check('E8', 'text past 1,200 chars reaches the provider', /LATE RULE: end every answer with a follow-up question\./.test(both(c)), 'truncated');
   check('E8', 'not marked truncated', !/\[truncated\]/.test(both(c)), 'truncation marker present');
+
+  out('\nE9  FULL FORMAT · explicit interview walkthrough still gets six headings and repair');
+  r = await turn({ modeTemplate: 'technical-interview', instructions: '', question: 'Give the full interview walkthrough for two sum.', canned: OBEDIENT });
+  c = r.captured[0];
+  check('E9', 'full walkthrough retains the six-heading contract', /Every heading is mandatory/.test(c?.system ?? '') && r.output?.codingShape === 'full', JSON.stringify(r.output));
+  check('E9', 'non-conforming full answer is repaired', /^## Complexity/m.test(r.committed) && r.output?.willRepair === true, JSON.stringify(r.output));
 
   const failed = results.filter((x) => !x.ok);
   out(`\n##### V3=${V3}: ${results.length - failed.length}/${results.length} passed${failed.length ? `  FAILED: ${failed.map((f) => `${f.scenario}:${f.name}`).join(' | ')}` : ''}`);

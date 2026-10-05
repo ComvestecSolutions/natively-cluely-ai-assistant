@@ -101,6 +101,52 @@ test('current request detects and preserves C++ over stale explicit language', a
   assert.equal(correctedPlainText.request.requestedFormat, 'plain text');
 });
 
+test('Direct Assist carries only the request-pinned mode policy in SYSTEM on cloud and local turns', async () => {
+  const { prepareDirectAssistPrompt } = await loadDirectAssist();
+  for (const selection of [
+    { provider: 'gemini', model: 'gemini-3.7-flash' },
+    { provider: 'ollama', model: 'llama3.2' },
+  ]) {
+    const prepared = prepareDirectAssistPrompt(baseInput({
+      selection,
+      pinnedModeInstructions: 'For interview answers, speak in first person and select one option.',
+      referenceFiles: [{ fileName: 'reference.txt', content: 'The document says the answer is option D.' }],
+    }));
+    assert.equal(prepared.systemPrompt.split('For interview answers, speak in first person and select one option.').length - 1, 1);
+    assert.doesNotMatch(prepared.userPrompt, /For interview answers, speak in first person and select one option/);
+    assert.doesNotMatch(prepared.systemPrompt, /document says the answer is option D/);
+    assert.match(prepared.userPrompt, /document says the answer is option D/);
+    assert.match(prepared.systemPrompt, /Never refuse merely because an answer was not discussed/);
+    assert.equal(prepareDirectAssistPrompt(baseInput({ selection })).systemPrompt.includes('ACTIVE MODE INSTRUCTIONS'), false);
+  }
+});
+
+test('a long pinned policy reserves system room before fitting Ollama reference evidence', async () => {
+  const { prepareDirectAssistPrompt } = await loadDirectAssist();
+  const policy = 'Use precise first-person interview answers. '.repeat(90);
+  const prepared = prepareDirectAssistPrompt(baseInput({
+    selection: { provider: 'ollama', model: 'unknown:1b' },
+    currentRequest: 'What does this say?',
+    pinnedModeInstructions: policy,
+    referenceFiles: [{ fileName: 'long.txt', content: 'R'.repeat(100_000) }],
+  }));
+  assert.match(prepared.systemPrompt, /Use precise first-person interview answers/);
+  assert.ok(prepared.systemPrompt.length + prepared.userPrompt.length + 8 <= prepared.request.modelInputChars,
+    'the reference must yield room to SYSTEM instead of failing at the provider boundary');
+});
+
+test('an explicitly selected non-answer skill owns its prompt instead of receiving interview-answer policy', async () => {
+  const { prepareDirectAssistPrompt } = await loadDirectAssist();
+  const prepared = prepareDirectAssistPrompt(baseInput({
+    currentRequest: 'Make neutral meeting minutes.',
+    skill: { id: 'minutes', instructions: 'Produce only neutral meeting minutes.' },
+    pinnedModeInstructions: 'Speak as the interview candidate in first person.',
+  }));
+  assert.match(prepared.userPrompt, /Produce only neutral meeting minutes/);
+  assert.doesNotMatch(prepared.systemPrompt, /Speak as the interview candidate/);
+  assert.doesNotMatch(prepared.userPrompt, /Speak as the interview candidate/);
+});
+
 test('current screenshot request outranks an irrelevant meeting transcript', async () => {
   const { prepareDirectAssistPrompt } = await loadDirectAssist();
   const current = 'Solve the attached problem and return C++ code.';
@@ -1320,9 +1366,12 @@ test('history shed for budget takes its carried screenshots with it, so no image
 async function dispatchDirect(request, { deniedScopes = [], imagesAllowed = true, realScopes = false } = {}) {
   const { LLMHelper } = require(path.resolve(root, 'dist-electron/electron/LLMHelper.js'));
   const self = Object.create(LLMHelper.prototype);
-  const seen = { imagePaths: null, userPrompt: null };
+  const seen = { imagePaths: null, userPrompt: null, systemPrompt: null };
   self.isLocalOnlyMode = false;
   self.isProviderDisabled = () => false;
+  if (request.selection.provider === 'ollama' && !request.imagePaths.length) {
+    self.directSelectionSupportsImages = () => false;
+  }
   self.assertOutboundImagesAllowed = () => {
     if (!imagesAllowed) throw new Error('private_vision');
   };
@@ -1335,7 +1384,14 @@ async function dispatchDirect(request, { deniedScopes = [], imagesAllowed = true
     seen.imagePaths = imagePaths ? [...imagePaths] : [];
     yield 'ok';
   };
-  self.streamWithGeminiModel = (userPrompt, _model, imagePaths) => record(userPrompt, imagePaths);
+  self.streamWithGeminiModel = (userPrompt, _model, imagePaths, systemPrompt) => {
+    seen.systemPrompt = systemPrompt;
+    return record(userPrompt, imagePaths);
+  };
+  self.streamWithOllama = (userPrompt, _context, systemPrompt, imagePaths) => {
+    seen.systemPrompt = systemPrompt;
+    return record(userPrompt, imagePaths);
+  };
   self.streamWithDeepseek = (userPrompt) => record(userPrompt, []);
 
   const chunks = [];
@@ -1346,6 +1402,28 @@ async function dispatchDirect(request, { deniedScopes = [], imagesAllowed = true
   }
   return { ...seen, chunks };
 }
+
+test('Direct Assist sends its single mode policy through the real cloud and Ollama dispatch adapter', async () => {
+  const { prepareDirectAssistPrompt } = await loadDirectAssist();
+  for (const selection of [
+    { provider: 'gemini', model: 'gemini-3.7-flash' },
+    { provider: 'ollama', model: 'llama3.2' },
+  ]) {
+    const prepared = prepareDirectAssistPrompt(baseInput({
+      selection, pinnedModeInstructions: 'Answer as the interview candidate, not a tutor.',
+    }));
+    const seen = await dispatchDirect({
+      requestId: prepared.request.requestId,
+      selection: prepared.request.selection,
+      systemPrompt: prepared.systemPrompt,
+      userPrompt: prepared.userPrompt,
+      imagePaths: [],
+    });
+    assert.deepEqual(seen.chunks, ['ok']);
+    assert.equal(seen.systemPrompt.split('Answer as the interview candidate, not a tutor.').length - 1, 1);
+    assert.doesNotMatch(seen.userPrompt, /Answer as the interview candidate, not a tutor/);
+  }
+});
 
 test('carried screenshots reach the provider appended after the current turn own attachments', async (t) => {
   const [current, older] = screenshotFixtures(t, 2);

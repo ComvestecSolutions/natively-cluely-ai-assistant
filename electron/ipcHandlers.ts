@@ -8124,9 +8124,26 @@ export function initializeIpcHandlers(appState: AppState): void {
     // trimmedFields notice exists to close, so a load failure should not be
     // invisible to both the notice AND the logs.
     let referenceFiles: { fileName: string; content: string }[] = [];
+    let pinnedModeInstructions = '';
+    let pinnedModeIsCustom = false;
     try {
       const { ModesManager } = require('./services/ModesManager');
-      const activeModeId = ModesManager.getInstance().getActiveModeInfo()?.id;
+      const modesManager = ModesManager.getInstance();
+      const modeInfo = modesManager.getActiveModeInfo();
+      const activeModeId = modeInfo?.id;
+      // Snapshot the active mode and answer-type-scoped policy before course
+      // grounding (async): a mode switch must not change an in-flight request.
+      // Selected skills own their instructions, including non-answer tasks.
+      if (activeModeId && !resolvedSkill.skill) {
+        const { answerType } = planAnswer({
+          question: resolvedSkill.currentRequest,
+          source: 'manual_input',
+          speakerPerspective: 'user',
+          activeMode: modeInfo,
+        });
+        pinnedModeInstructions = modesManager.getActiveModePinnedInstructions?.(answerType, activeModeId) || '';
+        pinnedModeIsCustom = modeInfo.isCustom === true;
+      }
       if (activeModeId) {
         // Handed over STRUCTURED, not pre-rendered: prepareDirectAssistPrompt
         // shares the real prompt budget across the files (see
@@ -8134,7 +8151,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         // used to let the oldest attachment consume the whole ceiling and
         // starve every other file, resume included, with no notice anywhere.
         // Each file is still bounded so one corrupt row cannot balloon main.
-        referenceFiles = (ModesManager.getInstance().getReferenceFiles(activeModeId) as {
+        referenceFiles = (modesManager.getReferenceFiles(activeModeId) as {
           fileName?: string;
           content?: string;
         }[]).map((file) => {
@@ -8175,6 +8192,8 @@ export function initializeIpcHandlers(appState: AppState): void {
       source: request.source,
       selection,
       currentRequest: resolvedSkill.currentRequest,
+      pinnedModeInstructions,
+      pinnedModeIsCustom,
       skill: resolvedSkill.skill ?? null,
       manualContext: request.manualContext,
       referenceFiles,
@@ -17332,6 +17351,8 @@ export function initializeIpcHandlers(appState: AppState): void {
   // Profile Engine IPC Handlers
   // ==========================================
 
+  const PROFILE_ENGINE_UNAVAILABLE = 'Profile Intelligence knowledge engine is unavailable. The required backend may not be included in this build.';
+
   // Allowlist of file paths the user explicitly selected via profile:select-file.
   // Without this, a compromised renderer could pass arbitrary filesystem paths
   // (e.g. /etc/passwd, ~/.ssh/id_rsa) to the upload handlers and exfiltrate
@@ -17377,13 +17398,10 @@ export function initializeIpcHandlers(appState: AppState): void {
         console.warn('[IPC] profile:upload-resume rejected: path was not produced by profile:select-file or has expired.');
         return { success: false, error: 'Please re-select the resume file.' };
       }
-      console.log(`[IPC] profile:upload-resume called with: ${resolvedPath}`);
+      console.log('[IPC] profile:upload-resume called');
       const orchestrator = appState.getKnowledgeOrchestrator();
       if (!orchestrator) {
-        return {
-          success: false,
-          error: 'Knowledge engine not initialized. Please ensure API keys are configured.',
-        };
+        return { success: false, error: PROFILE_ENGINE_UNAVAILABLE };
       }
       const { DocType } = require('../premium/electron/knowledge/types');
       const result = await orchestrator.ingestDocument(resolvedPath, DocType.RESUME);
@@ -17431,7 +17449,7 @@ export function initializeIpcHandlers(appState: AppState): void {
     try {
       const orchestrator = appState.getKnowledgeOrchestrator();
       if (!orchestrator) {
-        return { hasProfile: false, profileMode: false };
+        return { hasProfile: false, profileMode: false, backendAvailable: false, backendUnavailable: 'knowledge_engine_unavailable' };
       }
       // Map new KnowledgeStatus back to legacy UI shape temporarily, plus explicit
       // readiness flags used by eval/UI polling. profileFactsReady is true as soon
@@ -17449,6 +17467,8 @@ export function initializeIpcHandlers(appState: AppState): void {
       // deliberately excluded from the resume readiness signal.
       const { DocType: StatusDocType } = require('../premium/electron/knowledge/types');
       return {
+        backendAvailable: true,
+        backendUnavailable: null,
         hasProfile: status.hasResume,
         profileMode: status.activeMode,
         name: status.resumeSummary?.name,
@@ -17469,7 +17489,7 @@ export function initializeIpcHandlers(appState: AppState): void {
           : 'none',
       };
     } catch (error: any) {
-      return { hasProfile: false, profileMode: false };
+      return { hasProfile: false, profileMode: false, backendAvailable: false, backendUnavailable: 'status_unavailable' };
     }
   });
 
@@ -17485,7 +17505,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       }
       const orchestrator = appState.getKnowledgeOrchestrator();
       if (!orchestrator) {
-        return { success: false, error: 'Knowledge engine not initialized' };
+        return { success: false, error: PROFILE_ENGINE_UNAVAILABLE };
       }
       orchestrator.setKnowledgeMode(enabled);
 
@@ -17507,7 +17527,7 @@ export function initializeIpcHandlers(appState: AppState): void {
     try {
       const orchestrator = appState.getKnowledgeOrchestrator();
       if (!orchestrator) {
-        return { success: false, error: 'Knowledge engine not initialized' };
+        return { success: false, error: PROFILE_ENGINE_UNAVAILABLE };
       }
       const { DocType } = require('../premium/electron/knowledge/types');
       // Both tiers in ONE transaction. Deleting only Tier 1 here left Tier 2's
@@ -17605,13 +17625,10 @@ export function initializeIpcHandlers(appState: AppState): void {
         console.warn('[IPC] profile:upload-jd rejected: path was not produced by profile:select-file or has expired.');
         return { success: false, error: 'Please re-select the JD file.' };
       }
-      console.log(`[IPC] profile:upload-jd called with: ${resolvedPath}`);
+      console.log('[IPC] profile:upload-jd called');
       const orchestrator = appState.getKnowledgeOrchestrator();
       if (!orchestrator) {
-        return {
-          success: false,
-          error: 'Knowledge engine not initialized. Please ensure API keys are configured.',
-        };
+        return { success: false, error: PROFILE_ENGINE_UNAVAILABLE };
       }
       const { DocType } = require('../premium/electron/knowledge/types');
       const result = await orchestrator.ingestDocument(resolvedPath, DocType.JD);
@@ -17644,7 +17661,7 @@ export function initializeIpcHandlers(appState: AppState): void {
     try {
       const orchestrator = appState.getKnowledgeOrchestrator();
       if (!orchestrator) {
-        return { success: false, error: 'Knowledge engine not initialized' };
+        return { success: false, error: PROFILE_ENGINE_UNAVAILABLE };
       }
       const { DocType } = require('../premium/electron/knowledge/types');
       // Same cross-tier transaction as profile:delete above — see the comment
@@ -17775,7 +17792,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       }
       const orchestrator = appState.getKnowledgeOrchestrator();
       if (!orchestrator) {
-        return { success: false, error: 'Knowledge engine not initialized' };
+        return { success: false, error: PROFILE_ENGINE_UNAVAILABLE };
       }
       const engine = orchestrator.getCompanyResearchEngine();
 
@@ -17825,7 +17842,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       }
       const orchestrator = appState.getKnowledgeOrchestrator();
       if (!orchestrator) {
-        return { success: false, error: 'Knowledge engine not initialized' };
+        return { success: false, error: PROFILE_ENGINE_UNAVAILABLE };
       }
       const status = orchestrator.getStatus();
       if (!status.hasResume) {
@@ -17863,7 +17880,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       }
       const orchestrator = appState.getKnowledgeOrchestrator();
       if (!orchestrator) {
-        return { success: false, error: 'Knowledge engine not initialized' };
+        return { success: false, error: PROFILE_ENGINE_UNAVAILABLE };
       }
       const status = orchestrator.getStatus();
       if (!status.hasResume) {

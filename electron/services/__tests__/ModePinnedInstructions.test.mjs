@@ -112,6 +112,13 @@ describe('W2: getActiveModePinnedInstructions', () => {
         assert.doesNotMatch(coding, /180k/);
         const nego = mgr.getActiveModePinnedInstructions('negotiation_answer');
         assert.match(nego, /180k/);
+        const assembler = new PromptAssembler();
+        const packetFor = pinnedModeInstructions => assembler.assemble({
+            transcript: 'What would you say?', modeTemplateType: 'looking-for-work',
+            pinnedModeInstructions, tokenBudget: 4000, systemPrompt: 'SYSTEM',
+        });
+        assert.doesNotMatch(packetFor(coding).systemPrompt, /180k/);
+        assert.match(packetFor(nego).systemPrompt, /180k/);
     });
 
     // Was "caps at ~1,200 chars". The Modes editor's textarea accepts 8,000, so a
@@ -146,7 +153,7 @@ describe('W2: getActiveModePinnedInstructions', () => {
     });
 });
 
-describe('W2: PromptAssembler pinned block', () => {
+describe('W2: PromptAssembler pinned system policy', () => {
     test('pinned instructions ALWAYS land in the packet (not retrieval-scored)', () => {
         const assembler = new PromptAssembler();
         const packet = assembler.assemble({
@@ -156,10 +163,8 @@ describe('W2: PromptAssembler pinned block', () => {
             tokenBudget: 4000,
             systemPrompt: 'SYSTEM',
         });
-        const block = packet.blocks.find(b => b.type === 'active_mode_custom_instructions');
-        assert.ok(block, 'pinned block missing');
-        assert.match(block.content, /premium tier first/);
-        assert.match(packet.userMessage, /premium tier first/);
+        assert.equal(packet.systemPrompt.split('Always position our premium tier first.').length - 1, 1);
+        assert.doesNotMatch(packet.userMessage, /premium tier first/);
     });
 
     test('injection patterns in pinned text are escaped', () => {
@@ -171,10 +176,24 @@ describe('W2: PromptAssembler pinned block', () => {
             tokenBudget: 4000,
             systemPrompt: 'SYSTEM',
         });
-        const block = packet.blocks.find(b => b.type === 'active_mode_custom_instructions');
-        assert.ok(block);
-        assert.doesNotMatch(block.content, /ignore\s*previous\s*instructions/i);
-        assert.match(block.content, /REDACTED/);
+        assert.doesNotMatch(packet.systemPrompt, /ignore\s*previous\s*instructions/i);
+        assert.doesNotMatch(packet.userMessage, /ignore\s*previous\s*instructions/i);
+    });
+
+    test('reference files stay USER evidence when their mode instructions are pinned as SYSTEM', () => {
+        const packet = new PromptAssembler().assemble({
+            transcript: 'What is the answer?', modeTemplateType: 'general',
+            modeContext: {
+                templateType: 'general', customContext: 'Respond like a candidate.',
+                referenceFiles: [{ id: 'ref', modeId: 'mode', fileName: 'notes.txt', content: 'Secret reference-only fact 74219.', createdAt: '' }],
+            },
+            pinnedModeInstructions: 'Respond like a candidate.',
+            tokenBudget: 4000, systemPrompt: 'SYSTEM',
+        });
+        assert.equal(packet.systemPrompt.split('Respond like a candidate.').length - 1, 1);
+        assert.doesNotMatch(packet.systemPrompt, /reference-only fact 74219/);
+        assert.match(packet.userMessage, /reference-only fact 74219/);
+        assert.doesNotMatch(packet.userMessage, /Respond like a candidate/);
     });
 
     test('no duplicate when the legacy modeContext path already carries customContext', () => {
@@ -187,8 +206,8 @@ describe('W2: PromptAssembler pinned block', () => {
             tokenBudget: 4000,
             systemPrompt: 'SYSTEM',
         });
-        const blocks = packet.blocks.filter(b => b.type === 'active_mode_custom_instructions');
-        assert.equal(blocks.length, 1);
+        assert.equal(packet.systemPrompt.split('Pinned twice?').length - 1, 1);
+        assert.doesNotMatch(packet.userMessage, /Pinned twice\?/);
     });
 });
 

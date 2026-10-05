@@ -40,6 +40,13 @@ describe('buildV3Prompt call sites', () => {
     assert.ok(sites.length >= 4, `expected at least 4 call sites, found ${sites.length}`);
   });
 
+  test('each V3 call site passes scoped standing instructions into the composer once', () => {
+    const missing = sites
+      .filter((s) => !/realtimeInstruction\s*[:,]/.test(s.body))
+      .map((s) => `${s.file}:${s.line}`);
+    assert.deepEqual(missing, [], 'V3-owned requests skip legacy reinjection; standing mode policy must enter the composer: ' + missing.join(', '));
+  });
+
   test('every one passes multiTurnHistory, so the rollback reaches every surface', () => {
     const missing = sites
       .filter((s) => !/multiTurnHistory\s*:/.test(s.body))

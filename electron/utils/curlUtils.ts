@@ -15,6 +15,7 @@ import {
     placeholderReachesTheWire,
     explainMissingPlaceholder,
 } from './curlPlaceholderPolicy';
+import { readScreenUnderstandingMode, VisionPolicyError, PRIVATE_VISION_NO_LOCAL_MESSAGE } from '../llm/visionPolicy';
 
 /**
  * Validates if the cURL command is parseable and contains required variables
@@ -142,11 +143,100 @@ export function applyCurlVariables(
     for (const [k, v] of Object.entries(variables)) {
         forUrl[k] = encodeURIComponent(String(v ?? ''));
     }
+    // A URL alone does not identify the request dialect: some cURL templates
+    // send prompt/image fields even to /chat/completions. Anthropic messages
+    // carry SYSTEM at the top level, never as a message with role:system.
+    const systemPrompt = variables.SYSTEM_PROMPT;
+    const url = String(config.url ?? '');
+    const original = Array.isArray(config.data?.messages) ? config.data.messages : [];
+    const anthropic = /\/v1\/messages(?:[/?#]|$)/i.test(url)
+        || Object.prototype.hasOwnProperty.call(config.data ?? {}, 'system')
+        || Object.keys(config.header ?? {}).some(key => key.toLowerCase() === 'anthropic-version');
+    const openAiMessages = !anthropic && !/\/api\/(?:chat|generate)(?:[/?#]|$)/i.test(url)
+        && original.some((message: any) => ['system', 'developer', 'user', 'assistant', 'tool'].includes(message?.role));
+    const hasSystemSlot = original.some((message: any) => message?.role === 'system'
+        && typeof message.content === 'string'
+        && /\{\{\s*SYSTEM_PROMPT\s*\}\}/.test(message.content));
+    const bodyVariables = { ...variables };
+    if (systemPrompt && (openAiMessages || (anthropic && Array.isArray(config.data?.messages))) && !hasSystemSlot
+        && typeof variables.USER_MESSAGE === 'string') {
+        // Only unfold an exact composer-produced SYSTEM prefix. The remainder
+        // still contains the original question AND any context/evidence; a user
+        // message that merely starts with the same words stays untouched.
+        const user = variables.USER_MESSAGE;
+        const context = variables.CONTEXT;
+        const remainders = [user];
+        if (context) {
+            remainders.push(`${context}\n\n${user}`, `CONTEXT:\n${context}\n\nUSER QUESTION:\n${user}`);
+        }
+        for (const key of ['TEXT', 'PROMPT']) {
+            if (bodyVariables[key] === user) continue;
+            const remainder = remainders.find(text => bodyVariables[key] === `${systemPrompt}\n\n${text}`);
+            if (remainder !== undefined) bodyVariables[key] = remainder;
+        }
+    }
+    const data = deepVariableReplacer(config.data || {}, bodyVariables);
+    if (variables.IMAGE_BASE64 && readScreenUnderstandingMode() === 'private_vision'
+        && !/\{\{\s*IMAGE_BASE64\s*\}\}/i.test(JSON.stringify(config.data ?? {}))
+        && !(openAiMessages && original.some((message: any) => message?.role === 'user'))) {
+        // A prompt-only local endpoint is not a vision endpoint, even if its
+        // URL says /chat/completions. Fail before dispatch with the existing
+        // privacy refusal rather than silently answering without the image.
+        throw new VisionPolicyError('custom_provider', PRIVATE_VISION_NO_LOCAL_MESSAGE);
+    }
+    if (systemPrompt && anthropic && Array.isArray(data?.messages)) {
+        const templateSystem = config.data?.system;
+        const systemSlot = typeof templateSystem === 'string'
+            && /\{\{\s*SYSTEM_PROMPT\s*\}\}/.test(templateSystem);
+        if (typeof data.system === 'string') {
+            if (!systemSlot) data.system = data.system ? `${data.system}\n\n${systemPrompt}` : systemPrompt;
+        } else if (Array.isArray(data.system)) {
+            const blocks = data.system.slice();
+            const templateBlocks = Array.isArray(templateSystem) ? templateSystem : [];
+            const slotted: any[] = [];
+            for (let i = blocks.length - 1; i >= 0; i--) {
+                if (typeof templateBlocks[i]?.text === 'string'
+                    && /\{\{\s*SYSTEM_PROMPT\s*\}\}/.test(templateBlocks[i].text)) {
+                    slotted.unshift(blocks[i]);
+                    blocks.splice(i, 1);
+                }
+            }
+            data.system = [...blocks, ...(slotted.length ? slotted : [{ type: 'text', text: systemPrompt }])];
+        } else if (data.system == null) {
+            data.system = systemPrompt;
+        } else {
+            throw new Error('Anthropic system template must be a string or text blocks.');
+        }
+    } else if (systemPrompt && openAiMessages && Array.isArray(data?.messages)) {
+        // Keep static/developer instructions and the original turn order. The
+        // OpenAI system message leads a user-only template; vision consumers
+        // select the image-bearing message by role, not by array index.
+        const messages = data.messages.slice();
+        const slotted: any[] = [];
+        for (let i = messages.length - 1; i >= 0; i--) {
+            if (original[i]?.role === 'system'
+                && typeof original[i].content === 'string'
+                && /\{\{\s*SYSTEM_PROMPT\s*\}\}/.test(original[i].content)) {
+                slotted.unshift(messages[i]);
+                messages.splice(i, 1);
+            }
+        }
+        let lastSystem = -1;
+        for (let i = 0; i < messages.length; i++) {
+            if (messages[i]?.role === 'system') lastSystem = i;
+        }
+        // An explicit first system slot keeps its original position; only move
+        // it when another saved system instruction would otherwise follow it.
+        const insertAt = lastSystem >= 0 ? lastSystem + 1 : 0;
+        messages.splice(insertAt, 0,
+            ...(slotted.length ? slotted : [{ role: 'system', content: systemPrompt }]));
+        data.messages = messages;
+    }
     return {
         url: deepVariableReplacer(config.url, forUrl),
         headers: deepVariableReplacer(config.header || {}, forHeaders),
         // Raw — see above. The serializer escapes this one.
-        data: deepVariableReplacer(config.data || {}, variables),
+        data,
     };
 }
 
