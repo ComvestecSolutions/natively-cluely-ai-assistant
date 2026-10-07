@@ -244,10 +244,13 @@ export default function LessonMarkdown({ courseId, content, lessonUrls, onNaviga
           hr: () => <hr className="my-6 border-border-muted" />,
 
           ul: ({ children }) => (
-            <ul className="space-y-1.5 pl-5 list-disc leading-relaxed marker:text-text-tertiary">{children}</ul>
+            <ul className="list-outside list-disc space-y-1.5 pl-6 leading-relaxed marker:text-text-tertiary">{children}</ul>
           ),
           ol: ({ children }) => (
-            <ol className="space-y-1.5 pl-5 list-decimal leading-relaxed marker:text-text-tertiary">{children}</ol>
+            <ol className="list-outside list-decimal space-y-1.5 pl-6 leading-relaxed marker:text-text-tertiary">{children}</ol>
+          ),
+          li: ({ children, className }) => (
+            <li className={`pl-1 [&>ul]:mt-2 [&>ol]:mt-2 [&>p+p]:mt-2 ${className ?? ''}`}>{children}</li>
           ),
         }}
       >

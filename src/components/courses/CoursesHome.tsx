@@ -1,11 +1,10 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { AlertTriangle, ArrowLeft, CheckCircle2, ChevronRight, GraduationCap, XCircle } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, BookOpen, CheckCircle2, CircleHelp, Download, GraduationCap, Layers3, Loader2, RefreshCw, Trash2, XCircle } from 'lucide-react';
 import { useT } from '../../i18n';
 import CourseProgressCard, { type CourseImportRun } from './CourseProgressCard';
 import LessonReader from './LessonReader';
-import { AipBadge } from '../settings/AIProvidersSettings';
 import LiquidGlassButton from '../../ui-components/LiquidGlassButton';
-import { SETTINGS_BTN_BASE, SETTINGS_BTN_NEUTRAL, SETTINGS_CARD, SETTINGS_INPUT, SettingsNotice, SettingsSwitch, useSettingsTones } from '../settings/SettingsRow';
+import { SETTINGS_CARD, SETTINGS_INPUT, SettingsNotice, SettingsSwitch, useSettingsTones } from '../settings/SettingsRow';
 import { getCoursePinIds, isCourseGroundingEnabled, notifyCourseStateChanged, setCourseGroundingEnabled, setCoursePinIds, subscribeCourseStateChanged } from '../../lib/coursePins';
 
 // Mirrors CourseSummary in electron/courses/courseStore.ts — the renderer has no
@@ -21,6 +20,9 @@ interface CourseSummary {
     updatedAt: string;
     lessonCount?: number;
     chunkCount?: number;
+    timedLessonCount?: number | null;
+    readingMinutes?: number | null;
+    providedMinutes?: number | null;
 }
 
 interface CoursesHomeProps {
@@ -37,6 +39,10 @@ const statusLabel = (t: (key: string) => string, status: string): string => {
     if (status === 'partial') return t('Partial');
     return status;
 };
+
+const validCount = (value: unknown): number | null =>
+    typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+
 
 const isHttpUrl = (value: string): boolean => {
     try {
@@ -316,7 +322,6 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
             notifyCourseStateChanged();
         } catch (e) {
             setFormError(e instanceof Error && e.message ? e.message : t('Import failed. Try again.'));
-            setNotice({ tone: 'err', text: e instanceof Error && e.message ? e.message : t('Import failed. Try again.') });
         } finally {
             setSubmitting(false);
         }
@@ -475,15 +480,6 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
 
     // App card surface (the settings Card recipe); muted border stays visible in both themes.
     const rowTone = SETTINGS_CARD;
-    // Ghost styling shared by the per-row P4 management buttons (settings button consts).
-    const actionBtnClass = `${SETTINGS_BTN_BASE} ${SETTINGS_BTN_NEUTRAL} focus-visible:ring-2 focus-visible:ring-accent-focus`;
-    // In-flight row action: border spinner + dimmed original label — never a bare "…".
-    const actionSpinner = (label: string) => (
-        <>
-            <span aria-hidden className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-current border-t-transparent motion-reduce:animate-none" />
-            <span className="opacity-60">{label}</span>
-        </>
-    );
 
     // URL input + actions, shared by the empty-state and list-view import forms.
     const importControls = (
@@ -512,22 +508,22 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                     <span className="min-w-0 break-words">{formError}</span>
                 </p>
             )}
-            <div className="mt-3 flex items-center justify-end gap-2">
-                <button
-                    type="button"
+            <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+                <LiquidGlassButton
+                    variant="clear"
+                    className="lg-sm text-text-primary focus-visible:ring-2 focus-visible:ring-accent-focus"
                     onClick={() => setImportOpen(false)}
                     disabled={submitting || !!run}
-                    className={actionBtnClass}
                 >
                     {t('Cancel')}
-                </button>
+                </LiquidGlassButton>
                 <LiquidGlassButton
                     type="submit"
                     variant="action"
                     className="lg-sm"
                     disabled={submitting || !!run}
                     icon={submitting ? (
-                        <span aria-hidden className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                        <span aria-hidden className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-current border-t-transparent motion-reduce:animate-none" />
                     ) : undefined}
                 >
                     {t('Start import')}
@@ -541,7 +537,7 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
     return (
         <div className="h-full min-h-0 w-full flex flex-col bg-bg-primary text-text-primary font-sans overflow-hidden selection:bg-accent-subtle">
             {/* Header (back + title) */}
-            <section className={`${isLight ? 'bg-bg-secondary' : 'bg-bg-elevated'} px-8 pt-5 pb-6 border-b border-border-subtle shrink-0`}>
+            <section className={`${isLight ? 'bg-bg-secondary' : 'bg-bg-elevated'} px-4 sm:px-8 pt-5 pb-6 border-b border-border-subtle shrink-0`}>
                 <div className="max-w-3xl mx-auto">
                     <div className="flex items-center gap-3">
                         {onBack && (
@@ -569,7 +565,7 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                     <div className="mx-auto max-w-3xl px-6 pt-4">
                         <SettingsNotice tone={tones.danger} icon={<XCircle size={14} />} alert className="">
                             {listError}
-                            <button type="button" onClick={() => { void refreshCourses(); }} className={`${actionBtnClass} mt-2 focus-visible:ring-2 focus-visible:ring-accent-focus`}>{t('Retry')}</button>
+                            <LiquidGlassButton variant="clear" className="lg-sm mt-2 text-text-primary focus-visible:ring-2 focus-visible:ring-accent-focus" onClick={() => { void refreshCourses(); }}>{t('Retry')}</LiquidGlassButton>
                         </SettingsNotice>
                     </div>
                 )}
@@ -607,7 +603,7 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                             <p className="mt-2 text-sm leading-relaxed text-text-secondary">
                                 {t('Courses Studio requires Pro or an active trial and available local course storage. Check access or retry.')}
                             </p>
-                            <button type="button" onClick={() => { void refreshCourses(); }} className={`${actionBtnClass} mx-auto mt-4`}>{t('Retry')}</button>
+                            <LiquidGlassButton variant="clear" className="lg-sm mx-auto mt-4 text-text-primary focus-visible:ring-2 focus-visible:ring-accent-focus" onClick={() => { void refreshCourses(); }}>{t('Retry')}</LiquidGlassButton>
                             {onUpgrade && (
                                 <LiquidGlassButton
                                     variant="clear"
@@ -646,7 +642,7 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                                     {importControls}
                                 </form>
                             ) : (
-                                <div className="mt-5 flex items-center justify-center gap-2">
+                                <div className="mt-5 flex flex-wrap items-center justify-center gap-2">
                                     <LiquidGlassButton
                                         variant="clear"
                                         className="lg-sm text-text-primary"
@@ -663,7 +659,7 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                         </div>
                     </div>
                 ) : (
-                    <div className="max-w-3xl mx-auto px-8 py-6">
+                    <div className="max-w-3xl mx-auto px-4 sm:px-8 py-6">
                         {run && (
                             <div className="mb-4">
                                 {/* Full-width banner while courses exist; the card splits stages/meter left, counters right. */}
@@ -671,11 +667,10 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                             </div>
                         )}
                         {!importOpen && !run && (
-                            <div className="mb-4 flex items-center justify-end gap-2">
-                                {/* Course count anchors the row so the right-aligned actions aren't orphaned. */}
-                                <span className="mr-auto text-xs font-medium tabular-nums text-text-secondary">
-                                    {courses.length} {t(courses.length === 1 ? 'course' : 'courses')}
-                                </span>
+                            <div className="mb-4 flex flex-wrap items-center gap-2">
+                                <div className="mr-auto min-w-0 pr-3">
+                                    <p className="text-xs font-semibold uppercase tracking-wider text-text-primary">{t('Your library')}</p>
+                                </div>
                                 <LiquidGlassButton
                                     variant="clear"
                                     className="lg-sm text-text-primary"
@@ -709,12 +704,29 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                                 const ridxKey = `ridx:${course.id}`;
                                 const delKey = `del:${course.id}`;
                                 const rowBusy = busyAction !== null;
+                                const statusTone = course.status === 'ready' || course.status === 'complete'
+                                    ? tones.ok : course.status === 'partial' ? tones.warn
+                                        : course.status === 'importing' ? 'border-accent-border bg-accent-subtle text-text-primary'
+                                            : 'border-border-subtle bg-bg-component text-text-secondary';
+                                const StatusIcon = course.status === 'ready' || course.status === 'complete'
+                                    ? CheckCircle2 : course.status === 'partial' ? AlertTriangle
+                                        : course.status === 'importing' ? Loader2 : CircleHelp;
                                 // Premium card details, derived once per render of the row.
                                 const stats = courseStats(course.stats);
-                                const lessonCount = course.lessonCount ?? 0;
-                                const noLessons = lessonCount === 0;
-                                const showBar = stats.planned > 0 && (course.status === 'importing' || course.status === 'partial');
-                                const barPct = showBar ? Math.min(100, Math.round((stats.succeeded / stats.planned) * 100)) : 0;
+                                const lessonCount = validCount(course.lessonCount);
+                                const chunkCount = validCount(course.chunkCount);
+                                const timedLessonCount = validCount(course.timedLessonCount);
+                                const partialTiming = lessonCount !== null && lessonCount > 0 && timedLessonCount !== null && timedLessonCount < lessonCount;
+                                const noLessons = lessonCount === null || lessonCount === 0;
+                                const readingMinutes = validCount(course.readingMinutes);
+                                const providedMinutes = Math.min(validCount(course.providedMinutes) ?? 0, readingMinutes ?? 0);
+                                const estimatedMinutes = (readingMinutes ?? 0) - providedMinutes;
+                                const showBar = (course.status === 'importing' || course.status === 'partial')
+                                    && validCount(stats.planned) !== null && stats.planned > 0
+                                    && validCount(stats.succeeded) !== null
+                                    && run?.courseId !== course.id;
+                                const importedPages = showBar ? Math.min(stats.succeeded, stats.planned) : 0;
+                                const barPct = showBar ? Math.min(100, Math.round((importedPages / stats.planned) * 100)) : 0;
                                 // One-line preview of the first failures; the full list lives in the tooltip.
                                 const failuresPreview = course.status === 'partial' && stats.failures.length > 0
                                     ? stats.failures.slice(0, 3).join(' · ')
@@ -722,27 +734,43 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                                 return (
                                     <li
                                         key={course.id}
-                                        className={`group flex flex-wrap items-center gap-3 px-4 py-3 transition-colors ${rowTone}`}
+                                        className={`group min-w-0 p-4 transition-[border-color,box-shadow] hover:border-accent-border ${rowTone}`}
                                     >
-                                        {/* A native button opens the reader without nesting management controls. */}
-                                        <div className="min-w-0 flex-1 basis-48">
-                                            <button type="button" onClick={() => setOpenCourseId(course.id)} aria-label={`${t('Open')}: ${course.name}`} title={course.name} className="block w-full truncate rounded text-left text-sm font-semibold text-text-primary hover:text-accent-primary focus-visible:ring-2 focus-visible:ring-accent-focus">{course.name}</button>
-                                            <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-1.5 text-xs">
-                                                {updatedLabel !== '' && (
-                                                    <span className="truncate text-text-secondary">{t('Updated')} {updatedLabel}</span>
-                                                )}
-                                                {!noLessons ? (
-                                                    <>
-                                                        {updatedLabel !== '' && <span aria-hidden className="shrink-0 text-text-tertiary">·</span>}
-                                                        <span className="shrink-0 tabular-nums text-text-secondary">{lessonCount} {t('lessons')} · {course.chunkCount ?? 0} {t('chunks')}</span>
-                                                    </>
-                                                ) : (
-                                                    <>
-                                                        {updatedLabel !== '' && <span aria-hidden className="shrink-0 text-text-tertiary">·</span>}
-                                                        <span className="shrink-0 text-text-tertiary">{t('No lessons yet')}</span>
-                                                    </>
-                                                )}
+                                        <div className="flex min-w-0 flex-wrap items-start justify-between gap-2">
+                                            <div className="min-w-0 flex-1">
+                                                <span title={course.name} className="block max-w-full truncate text-sm font-semibold text-text-primary">{course.name}</span>
+                                                {updatedLabel !== '' && <p className="mt-0.5 text-xs text-text-secondary">{t('Updated')} {updatedLabel}</p>}
                                             </div>
+                                            <span className={`inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium ${statusTone}`}>
+                                                <StatusIcon size={13} aria-hidden className={course.status === 'importing' ? 'animate-spin motion-reduce:animate-none' : ''} />
+                                                {statusLabel(t, course.status)}
+                                            </span>
+                                        </div>
+                                        <div className="mt-3 flex min-w-0 flex-wrap gap-2 text-xs">
+                                            <span className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 tabular-nums ${lessonCount !== null && lessonCount > 0 ? 'border-accent-border bg-accent-subtle text-text-primary' : 'border-border-subtle bg-bg-component text-text-secondary'}`}>
+                                                <BookOpen size={13} aria-hidden className="shrink-0" />
+                                                {lessonCount === null ? t('Lessons unavailable') : lessonCount === 0 ? t('No lessons yet') : `${lessonCount} ${t(lessonCount === 1 ? 'lesson' : 'lessons')}`}
+                                            </span>
+                                            {chunkCount !== null && chunkCount > 0 && (
+                                                <span className="inline-flex items-center gap-1.5 rounded-lg border border-border-subtle bg-bg-component px-2.5 py-1.5 tabular-nums text-text-secondary">
+                                                    <Layers3 size={13} aria-hidden className="shrink-0" />
+                                                    {chunkCount} {t('chunks')}
+                                                </span>
+                                            )}
+                                            <span className="rounded-lg border border-accent-border bg-accent-subtle px-2.5 py-1.5 text-text-primary">
+                                                <span className="font-semibold">{t('Reading time')}:</span>{' '}
+                                                <span className="tabular-nums">{readingMinutes !== null && readingMinutes > 0 ? `${estimatedMinutes > 0 ? '~' : ''}${readingMinutes} ${t('min')}` : t('Not available')}</span>
+                                                {(partialTiming || (readingMinutes !== null && readingMinutes > 0)) && (
+                                                    <span className="ml-1 text-text-secondary">
+                                                        ({partialTiming && <>{timedLessonCount}/{lessonCount} {t('timed lessons')}{readingMinutes !== null && readingMinutes > 0 ? ' · ' : ''}</>}
+                                                        {readingMinutes !== null && readingMinutes > 0 && (providedMinutes > 0 && estimatedMinutes > 0
+                                                            ? <>{providedMinutes} {t('min source durations')} · ~{estimatedMinutes} {t('min estimated from lesson content')}</>
+                                                            : providedMinutes > 0 ? t('source durations') : t('estimated from lesson content'))})
+                                                    </span>
+                                                )}
+                                            </span>
+                                        </div>
+                                        <div className="min-w-0">
                                             {failuresPreview !== '' && (
                                                 <p
                                                     className={`mt-0.5 truncate text-xs ${tones.text.warn}`}
@@ -752,98 +780,101 @@ const CoursesHome: React.FC<CoursesHomeProps> = ({ isLight, onBack, onUpgrade })
                                                 </p>
                                             )}
                                             {showBar && (
-                                                <div className="mt-1.5 flex items-center gap-2">
-                                                    {/* `natively-meter-*` carries the material (see index.css). */}
-                                                    <div className="h-[4px] flex-1 natively-meter-track">
-                                                        <div
-                                                            className="natively-meter-fill transition-[width] duration-700 ease-out motion-reduce:transition-none"
-                                                            style={{ width: `${barPct}%` }}
-                                                        />
+                                                <div className="mt-3">
+                                                    <div className="mb-1 flex justify-between gap-2 text-xs text-text-secondary">
+                                                        <span>{t('Import progress')}</span>
+                                                        <span className="tabular-nums">{importedPages} / {stats.planned} {t('pages')} · {barPct}%</span>
                                                     </div>
-                                                    <span className="shrink-0 text-xs tabular-nums text-text-secondary">{barPct}%</span>
+                                                    {/* `natively-meter-*` carries the material (see index.css). */}
+                                                    <div role="progressbar" aria-label={t('Import progress')} aria-valuemin={0} aria-valuemax={100} aria-valuenow={barPct} className="h-[4px] natively-meter-track">
+                                                        <div className="natively-meter-fill transition-[width] duration-700 ease-out motion-reduce:transition-none" style={{ width: `${barPct}%` }} />
+                                                    </div>
                                                 </div>
                                             )}
                                         </div>
-                                        {/* One status primitive per row: the settings badge language. */}
-                                        {course.status === 'ready' || course.status === 'complete' ? (
-                                            <AipBadge tone="ok" label={t('Complete')} className="shrink-0" />
-                                        ) : course.status === 'partial' ? (
-                                            <AipBadge tone="warn" label={t('Partial')} className="shrink-0" />
-                                        ) : course.status === 'importing' ? (
-                                            <AipBadge tone="info" busy label={t('Importing')} className="shrink-0" />
-                                        ) : (
-                                            // Unknown wire status — same badge language as the known ones.
-                                            <AipBadge tone="neutral" label={statusLabel(t, course.status)} className="shrink-0" />
-                                        )}
-                                        {/* P4 management actions — ghost buttons that never open the reader. */}
-                                        <div className="flex flex-wrap items-center gap-1">
-                                            <button
-                                                type="button"
-                                                onClick={(e) => { e.stopPropagation(); void exportCourseBundle(course.id); }}
-                                                disabled={rowBusy || noLessons}
-                                                aria-busy={busyAction === expKey}
-                                                title={noLessons ? t('No lessons imported yet') : undefined}
-                                                className={actionBtnClass}
-                                            >
-                                                {busyAction === expKey ? actionSpinner(t('Export')) : t('Export')}
-                                            </button>
-                                            <button
-                                                type="button"
-                                                onClick={(e) => { e.stopPropagation(); void reindexCourse(course.id); }}
-                                                disabled={rowBusy || noLessons}
-                                                aria-busy={busyAction === ridxKey}
-                                                title={noLessons ? t('No lessons imported yet') : undefined}
-                                                className={actionBtnClass}
-                                            >
-                                                {busyAction === ridxKey ? actionSpinner(t('Re-index')) : t('Re-index')}
-                                            </button>
-                                            {confirmDelete === course.id ? (
-                                                <>
-                                                    {/* Armed: Confirm runs the delete, Cancel (or timeout) disarms. */}
-                                                    <button
-                                                        type="button"
-                                                        onClick={(e) => { e.stopPropagation(); void deleteCourse(course); }}
-                                                        disabled={rowBusy}
-                                                        className={`${SETTINGS_BTN_BASE} ${tones.danger}`}
-                                                    >
-                                                        {t('Confirm')}
-                                                    </button>
-                                                    <button
-                                                        type="button"
-                                                        onClick={(e) => { e.stopPropagation(); cancelDeleteConfirm(); }}
-                                                        disabled={rowBusy}
-                                                        className={actionBtnClass}
-                                                    >
-                                                        {t('Cancel')}
-                                                    </button>
-                                                </>
-                                            ) : (
-                                                <button
-                                                    type="button"
-                                                    onClick={(e) => { e.stopPropagation(); armDeleteConfirm(course.id); }}
-                                                    disabled={rowBusy}
-                                                    aria-busy={busyAction === delKey}
-                                                    className={actionBtnClass}
+                                        <div className="mt-4 flex flex-wrap items-center gap-3 border-t border-border-subtle pt-3">
+                                            <div className="flex min-w-0 flex-wrap items-center gap-2">
+                                                <LiquidGlassButton
+                                                    variant="clear"
+                                                    className="lg-sm text-text-primary focus-visible:ring-2 focus-visible:ring-accent-focus"
+                                                    onClick={(e) => { e.stopPropagation(); void exportCourseBundle(course.id); }}
+                                                    disabled={rowBusy || noLessons}
+                                                    aria-busy={busyAction === expKey}
+                                                    title={noLessons ? t('No lessons imported yet') : undefined}
+                                                    icon={busyAction === expKey ? <Loader2 size={14} className="animate-spin motion-reduce:animate-none" /> : <Download size={14} />}
                                                 >
-                                                    {busyAction === delKey ? actionSpinner(t('Delete')) : t('Delete')}
-                                                </button>
-                                            )}
+                                                    {t('Export')}
+                                                </LiquidGlassButton>
+                                                <LiquidGlassButton
+                                                    variant="clear"
+                                                    className="lg-sm text-text-primary focus-visible:ring-2 focus-visible:ring-accent-focus"
+                                                    onClick={(e) => { e.stopPropagation(); void reindexCourse(course.id); }}
+                                                    disabled={rowBusy || noLessons}
+                                                    aria-busy={busyAction === ridxKey}
+                                                    title={noLessons ? t('No lessons imported yet') : undefined}
+                                                    icon={busyAction === ridxKey ? <Loader2 size={14} className="animate-spin motion-reduce:animate-none" /> : <RefreshCw size={14} />}
+                                                >
+                                                    {t('Re-index')}
+                                                </LiquidGlassButton>
+                                                {confirmDelete === course.id ? (
+                                                    <>
+                                                        <LiquidGlassButton
+                                                            variant="clear"
+                                                            className="lg-sm ring-1 ring-red-500/20 focus-visible:ring-2 focus-visible:ring-accent-focus"
+                                                            onClick={(e) => { e.stopPropagation(); void deleteCourse(course); }}
+                                                            disabled={rowBusy}
+                                                            aria-label={`${t('Confirm delete')}: ${course.name}`}
+                                                            icon={<AlertTriangle size={14} className={tones.text.danger} />}
+                                                        >
+                                                            <span className={tones.text.danger}>{t('Confirm')}</span>
+                                                        </LiquidGlassButton>
+                                                        <LiquidGlassButton
+                                                            variant="clear"
+                                                            className="lg-sm text-text-primary focus-visible:ring-2 focus-visible:ring-accent-focus"
+                                                            onClick={(e) => { e.stopPropagation(); cancelDeleteConfirm(); }}
+                                                            disabled={rowBusy}
+                                                        >
+                                                            {t('Cancel')}
+                                                        </LiquidGlassButton>
+                                                    </>
+                                                ) : (
+                                                    <LiquidGlassButton
+                                                        variant="clear"
+                                                        className="lg-sm focus-visible:ring-2 focus-visible:ring-accent-focus"
+                                                        onClick={(e) => { e.stopPropagation(); armDeleteConfirm(course.id); }}
+                                                        disabled={rowBusy}
+                                                        aria-busy={busyAction === delKey}
+                                                        aria-label={`${t('Delete')}: ${course.name}`}
+                                                        icon={busyAction === delKey ? <Loader2 size={14} className={`animate-spin motion-reduce:animate-none ${tones.text.danger}`} /> : <Trash2 size={14} className={tones.text.danger} />}
+                                                    >
+                                                        <span className={tones.text.danger}>{t('Delete')}</span>
+                                                    </LiquidGlassButton>
+                                                )}
+                                            </div>
+                                            <div className="ml-auto flex flex-wrap items-center justify-end gap-3">
+                                                <span
+                                                    title={course.enabled ? t('Disable') : t('Enable')}
+                                                    className="shrink-0"
+                                                    onClick={(e) => { e.stopPropagation(); }}
+                                                >
+                                                    <SettingsSwitch
+                                                        checked={isCourseGroundingEnabled(course, pins)}
+                                                        onChange={() => { void toggleCourseEnabled(course); }}
+                                                        label={isCourseGroundingEnabled(course, pins) ? t('Disable') : t('Enable')}
+                                                        disabled={busy}
+                                                    />
+                                                </span>
+                                                <LiquidGlassButton
+                                                    variant="action"
+                                                    className="lg-sm bg-accent-primary focus-visible:ring-2 focus-visible:ring-accent-focus"
+                                                    onClick={() => setOpenCourseId(course.id)}
+                                                    aria-label={`${t('Open course')}: ${course.name}`}
+                                                    icon={<BookOpen size={14} />}
+                                                >
+                                                    {t('Open course')}
+                                                </LiquidGlassButton>
+                                            </div>
                                         </div>
-                                        {/* The settings switch; the span keeps a toggle click from opening the reader. */}
-                                        <span
-                                            title={course.enabled ? t('Disable') : t('Enable')}
-                                            className="shrink-0"
-                                            onClick={(e) => { e.stopPropagation(); }}
-                                        >
-                                            <SettingsSwitch
-                                                checked={isCourseGroundingEnabled(course, pins)}
-                                                onChange={() => { void toggleCourseEnabled(course); }}
-                                                label={isCourseGroundingEnabled(course, pins) ? t('Disable') : t('Enable')}
-                                                disabled={busy}
-                                            />
-                                        </span>
-                                        {/* Row affordance: revealed on hover and keyboard focus. */}
-                                        <ChevronRight size={14} aria-hidden className="shrink-0 text-text-tertiary opacity-0 transition-opacity motion-reduce:transition-none group-hover:opacity-100 group-focus-visible:opacity-100" />
                                     </li>
                                 );
                             })}

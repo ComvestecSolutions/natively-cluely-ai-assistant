@@ -3519,11 +3519,12 @@ export class LLMHelper {
         }
       };
       if (this.isThinkingModel(ollamaModel)) ollamaBody.think = false;
+      // This blocking helper has no caller signal; do not impose a wall-clock
+      // limit on a local model that is loading or generating an answer.
       const response = await fetch(`${this.ollamaUrl}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(ollamaBody),
-        signal: AbortSignal.timeout(120_000),
       });
 
       if (!response.ok) {
@@ -7611,6 +7612,7 @@ let isMultimodal = !!(imagePaths?.length);
     this.assertOutboundScopes('custom_curl', userMessage, imagePath ? [imagePath] : undefined);
 
     const { curlCommand, responsePath } = this.activeCurlProvider;
+    const providerIsLocal = customProviderIsLocal(this.activeCurlProvider);
 
     // 1. Parse cURL to config object
     // @ts-ignore
@@ -7708,9 +7710,8 @@ let isMultimodal = !!(imagePaths?.length);
     }
 
     // 5. Execute
-    // Bounded timeout: without it a hung user-configured endpoint stalls the
-    // whole session indefinitely. 5 min is generous for local models that may
-    // need to load into VRAM, while still failing over in bounded time.
+    // Buffered cloud calls retain the transport timeout. Local endpoints wait
+    // for completion or caller cancellation, including while loading a model.
     data = customRequestBody(data, false);
     const templateSource = JSON.stringify(curlConfig.data ?? {});
     const markerIntegrity = /\{\{\s*TEXT\s*\}\}/.test(templateSource);
@@ -7721,7 +7722,7 @@ let isMultimodal = !!(imagePaths?.length);
       serializedPayload: (() => { try { return JSON.stringify(data); } catch { return undefined; } })(),
       markerIntegrity,
     });
-    return await this.collectCustomResponse(url, headers, data, curlConfig.method || 'POST', responsePath, abortSignal);
+    return await this.collectCustomResponse(url, headers, data, curlConfig.method || 'POST', responsePath, abortSignal, providerIsLocal);
   }
 
   /**
@@ -7819,6 +7820,9 @@ let isMultimodal = !!(imagePaths?.length);
     abortSignal?: AbortSignal,
   ): Promise<string> {
     this.assertOutboundScopes('custom_provider', combinedMessage, imagePath ? [imagePath] : undefined);
+    const providerIsLocal = this.customProvider?.curlCommand === curlCommand
+      ? customProviderIsLocal(this.customProvider)
+      : customProviderIsLocal({ curlCommand });
 
     // 1. Parse cURL to JSON object
     const requestConfig = curl2Json(curlCommand);
@@ -7925,14 +7929,14 @@ let isMultimodal = !!(imagePaths?.length);
       serializedPayload: serializedBody,
       markerIntegrity,
     });
-    return await this.collectCustomResponse(url, headers, body, requestConfig.method || 'POST', responsePath, abortSignal);
+    return await this.collectCustomResponse(url, headers, body, requestConfig.method || 'POST', responsePath, abortSignal, providerIsLocal);
   }
 
-  private async collectCustomResponse(url: string, headers: Record<string, string>, body: unknown, method: string, responsePath?: string, signal?: AbortSignal): Promise<string> {
+  private async collectCustomResponse(url: string, headers: Record<string, string>, body: unknown, method: string, responsePath?: string, signal?: AbortSignal, providerIsLocal = customProviderIsLocal({ curlCommand: url })): Promise<string> {
     let answer = '';
     for await (const piece of streamCustomTransport({
       url, headers, body: customRequestBody(body, false), method, signal,
-      state: { outputStreamed: false },
+      state: { outputStreamed: false }, providerIsLocal,
       extractWhole: data => this.extractCustomAnswer(data, responsePath),
       extractDelta: data => this.extractFromCommonFormats(data),
       extractLine: data => this.extractCustomAnswer(data, responsePath, false),
@@ -9211,7 +9215,10 @@ let isMultimodal = !!(imagePaths?.length);
       // so a local custom vision endpoint still works in local-only mode.
       const customIsLocal = customProviderIsLocal(this.customProvider);
       if (!localOnly || customIsLocal) {
+        // Local reasoning and cold model loads are not cloud TTFT/stall events.
+        // The caller may still cancel; remote custom endpoints retain the cloud budgets.
         local.push({ id: 'custom', name: `Custom (${this.customProvider.name})`, isLocal: customIsLocal, priority: 100,
+          noTimeout: customIsLocal,
           open: (sig) => this.streamWithCustom(message, context, imagePaths, systemPrompt, sig) });
       }
     }
@@ -9233,7 +9240,7 @@ let isMultimodal = !!(imagePaths?.length);
       }
     }
     if (ollamaVisionModel) {
-      local.push({ id: 'ollama', name: `Ollama (${ollamaVisionModel})`, isLocal: true, priority: 101,
+      local.push({ id: 'ollama', name: `Ollama (${ollamaVisionModel})`, isLocal: true, priority: 101, noTimeout: true,
         open: (sig) => this.streamWithOllama(message, context, systemPrompt, imagePaths, sig, ollamaVisionModel) });
     }
 
@@ -9442,9 +9449,9 @@ let isMultimodal = !!(imagePaths?.length);
 
   private getProviderStreamPolicy(signal?: AbortSignal, hasImages = false): ProviderStreamPolicy | undefined {
     const turn = signal ? this.textTurn(signal) : this;
-    if (!customProviderIsLocal(this.customProvider ?? this.activeCurlProvider)) return undefined;
+    if (!this.useOllama && !customProviderIsLocal(this.customProvider ?? this.activeCurlProvider)) return undefined;
     if (!hasImages && turn.fastPickForTextTurn()) return undefined;
-    return { firstUsefulDeadlineMs: CUSTOM_REQUEST_TIMEOUT_MS, interTokenStallMs: CUSTOM_LOCAL_IDLE_TIMEOUT_MS, signal };
+    return { firstUsefulDeadlineMs: CUSTOM_REQUEST_TIMEOUT_MS, interTokenStallMs: CUSTOM_LOCAL_IDLE_TIMEOUT_MS, noDeadlines: true, signal };
   }
 
   /** Grounded answers use the exact selected model, never Gemini's tier list or
@@ -13243,9 +13250,8 @@ let isMultimodal = !!(imagePaths?.length);
           // every 7B coder's multi-function answer, and even a 800-token cap is
           // wrong for a 70B model that legitimately needs 3000+ tokens for a
           // system-design answer. Ollama stops on EOS by default; the existing
-          // inter-token stall guard (LIVE_INTER_TOKEN_STALL_MS = 8s in
-          // liveDeadlines.ts) still aborts a genuinely hung stream, and the
-          // 120s hard ceiling on the fetch aborts a runaway generation loop.
+          // a local generation is allowed to run until completion or user
+          // cancellation, with no implicit wall-clock ceiling.
           //
           // Escape hatch: set OLLAMA_MAX_OUTPUT_TOKENS in the environment to
           // re-enable a client-side cap (useful for power users with custom
@@ -13256,14 +13262,9 @@ let isMultimodal = !!(imagePaths?.length);
         }
       };
       if (this.isThinkingModel(ollamaModel)) streamBody.think = false;
-      // Combine the 120s hard ceiling with the caller's user-cancel signal.
-      // AbortSignal.any() returns a signal aborted as soon as ANY of its
-      // inputs abort, so the caller can cancel an Ollama generation that's
-      // taking too long (or just navigate away mid-stream) without waiting
-      // for the 2-minute timeout.
-      const ollamaSignal = abortSignal
-        ? AbortSignal.any([AbortSignal.timeout(120_000), abortSignal])
-        : AbortSignal.timeout(120_000);
+      // Local generation has no wall-clock deadline; the caller's signal still
+      // closes the socket immediately when the user cancels the turn.
+      const ollamaSignal = abortSignal;
       const serializedBody = JSON.stringify(streamBody);
       require('./llm/providerPayloadCapture').captureProviderPayload({
         provider: 'ollama',
@@ -13392,7 +13393,7 @@ let isMultimodal = !!(imagePaths?.length);
       throw new DirectAssistError('INVALID_REQUEST', `The custom provider endpoint was refused: ${blockedHost}`);
     }
 
-    yield* this.streamCustomAttempt(url, headers, customRequestBody(data, true), curlConfig.method || 'POST', true, abortSignal, imagePaths, { outputStreamed: false }, provider.responsePath, userMessage);
+    yield* this.streamCustomAttempt(url, headers, customRequestBody(data, true), curlConfig.method || 'POST', true, abortSignal, imagePaths, { outputStreamed: false }, customProviderIsLocal(provider), provider.responsePath, userMessage);
   }
 
   // --- CUSTOM PROVIDER STREAMING ---
@@ -13538,7 +13539,7 @@ let isMultimodal = !!(imagePaths?.length);
       if (abortSignal?.aborted) return;
       const attemptState: CustomAttemptState = { outputStreamed: false };
       try {
-        yield* this.streamCustomAttempt(url, headers, body, requestConfig.method || 'POST', strictErrors, abortSignal, imagePaths, attemptState, selectedCustomProvider.responsePath, combinedMessage);
+        yield* this.streamCustomAttempt(url, headers, body, requestConfig.method || 'POST', strictErrors, abortSignal, imagePaths, attemptState, customProviderIsLocal(selectedCustomProvider), selectedCustomProvider.responsePath, combinedMessage);
         // Normal completion — or a silent end on caller cancel; the stream is over either way.
         return;
       } catch (e: any) {
@@ -13563,6 +13564,7 @@ let isMultimodal = !!(imagePaths?.length);
     abortSignal: AbortSignal | undefined,
     imagePaths: string[] | undefined,
     attemptState: CustomAttemptState,
+    providerIsLocal: boolean,
     responsePath?: string,
     outboundText?: string,
   ): AsyncGenerator<string, void, unknown> {
@@ -13577,7 +13579,7 @@ let isMultimodal = !!(imagePaths?.length);
     const startedAt = Date.now();
     try {
       yield* streamCustomTransport({
-        url, headers, body, method: requestMethod, signal: abortSignal, state: attemptState,
+        url, headers, body, method: requestMethod, signal: abortSignal, state: attemptState, providerIsLocal,
         connectTimeoutMs: strictErrors
           ? (imagePaths?.length ? DIRECT_ASSIST_VISION_CONNECT_TIMEOUT_MS : DIRECT_ASSIST_CONNECT_TIMEOUT_MS)
           : undefined,
@@ -14437,7 +14439,7 @@ let isMultimodal = !!(imagePaths?.length);
       ? Object.freeze({ ...this.activeCurlProvider })
       : null;
 
-    if (!customProviderIsLocal(custom ?? curl)) {
+    if (provider !== 'ollama' && !customProviderIsLocal(custom ?? curl)) {
       return this.streamDirectAssistFrozen(frozenRequest, custom, curl, abortSignal, rung);
     }
     // Expose the frozen rung's policy for deadline consumers; Direct Assist's
@@ -14446,6 +14448,7 @@ let isMultimodal = !!(imagePaths?.length);
     const policy: ProviderStreamPolicy = {
       firstUsefulDeadlineMs: CUSTOM_REQUEST_TIMEOUT_MS,
       interTokenStallMs: CUSTOM_LOCAL_IDLE_TIMEOUT_MS,
+      noDeadlines: true,
       signal: abortSignal,
     };
     view._providerStreamPolicy = policy;

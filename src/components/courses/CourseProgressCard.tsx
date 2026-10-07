@@ -1,8 +1,9 @@
 import React from 'react';
-import { Check } from 'lucide-react';
+import { Check, RotateCcw, X } from 'lucide-react';
 import { useT } from '../../i18n';
+import LiquidGlassButton from '../../ui-components/LiquidGlassButton';
 import { AipBadge, type AipTone } from '../settings/AIProvidersSettings';
-import { SETTINGS_BTN_BASE, SETTINGS_BTN_NEUTRAL, useSettingsTones } from '../settings/SettingsRow';
+import { useSettingsTones } from '../settings/SettingsRow';
 
 export type CourseImportPhase = 'plan' | 'page' | 'assets' | 'importing' | 'done' | 'failed';
 
@@ -77,7 +78,7 @@ const CourseProgressCard: React.FC<CourseProgressCardProps> = ({ progress, onRet
     const meterWidth = indeterminate ? 40 : (percent ?? 0);
 
     // One elevation step up from list rows while work is in flight; terminal states settle back down.
-    const cardShell = `w-full rounded-xl border bg-bg-item-surface p-5 transition-[border-color,box-shadow] duration-300 ${running
+    const cardShell = `w-full rounded-xl border bg-bg-item-surface p-5 transition-[border-color,box-shadow] duration-300 motion-reduce:transition-none ${running
         ? 'border-accent-border shadow-md ring-1 ring-accent-focus'
         : 'border-border-muted'}`;
 
@@ -124,7 +125,7 @@ const CourseProgressCard: React.FC<CourseProgressCardProps> = ({ progress, onRet
             {/* Status badge + phase, one primitive for the run's whole lifetime. */}
             <div className="flex items-center gap-3">
                 <AipBadge tone={badgeTone} busy={running} label={badgeLabel} className="shrink-0" />
-                <p className="min-w-0 flex-1 truncate text-sm font-medium text-text-primary">{phaseLabel(t, progress.phase)}</p>
+                {running && <p className="min-w-0 flex-1 truncate text-sm font-medium text-text-primary">{phaseLabel(t, progress.phase)}</p>}
             </div>
 
             {/* Stages + meter on the left; live counters and terminal lines on the right. */}
@@ -188,29 +189,31 @@ const CourseProgressCard: React.FC<CourseProgressCardProps> = ({ progress, onRet
                         </p>
                     )}
 
-                    {/* Terminal states cross-fade in; the badge swap fades on its own. */}
+                    {/* The badge names the terminal state; the summary shows pages imported. */}
                     {finishedOk && (
-                        <p className={`animate-scale-in font-medium ${tones.text.ok}`}>
-                            {progress.total > 0 ? `${progress.done}/${progress.total} ` : ''}{t('Complete')}
+                        <p className={`animate-scale-in motion-reduce:animate-none font-medium ${tones.text.ok}`}>
+                            {progress.done} {t('pages')}
                         </p>
                     )}
 
                     {failedState && (
                         <div className="min-w-0">
-                            <p className={`truncate font-medium ${tones.text.danger}`} title={detail !== '' ? detail : undefined}>
-                                {detail !== '' ? detail : t('Failed')}
-                            </p>
+                            {detail.trim() !== '' && (
+                                <p className={`truncate font-medium ${tones.text.danger}`} title={detail}>
+                                    {detail}
+                                </p>
+                            )}
                             {(onRetry || onDismiss) && (
-                                <div className="mt-3 flex items-center gap-2">
+                                <div className={`${detail.trim() !== '' ? 'mt-3 ' : ''}flex flex-wrap items-center gap-2`}>
                                     {onRetry && (
-                                        <button type="button" onClick={onRetry} className={`${SETTINGS_BTN_BASE} border-accent-border bg-accent-subtle text-accent-primary`}>
+                                        <LiquidGlassButton variant="action" className="lg-sm focus-visible:ring-2 focus-visible:ring-accent-focus" onClick={onRetry} icon={<RotateCcw size={13} />}>
                                             {t('Retry')}
-                                        </button>
+                                        </LiquidGlassButton>
                                     )}
                                     {onDismiss && (
-                                        <button type="button" onClick={onDismiss} className={`${SETTINGS_BTN_BASE} ${SETTINGS_BTN_NEUTRAL}`}>
+                                        <LiquidGlassButton variant="clear" className="lg-sm text-text-primary focus-visible:ring-2 focus-visible:ring-accent-focus" onClick={onDismiss} icon={<X size={13} />}>
                                             {t('Dismiss')}
-                                        </button>
+                                        </LiquidGlassButton>
                                     )}
                                 </div>
                             )}

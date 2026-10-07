@@ -25,6 +25,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import ts from 'typescript';
 import { createTranscriptTailWaiter, TAIL_WAIT_MS, TAIL_GRACE_MS } from '../answerTailWait.mjs';
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -39,6 +40,32 @@ function section(startMarker, endMarker) {
   const end = interfaceSource.indexOf(endMarker, start + startMarker.length);
   assert.ok(end > start, `missing end marker: ${endMarker}`);
   return interfaceSource.slice(start, end);
+}
+
+function meetingResetSection() {
+  const file = ts.createSourceFile('NativelyInterface.tsx', interfaceSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const subscriptions = [];
+  const visit = node => {
+    if (ts.isCallExpression(node) && node.expression.getText(file) === 'window.electronAPI.onSessionReset') subscriptions.push(node);
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  assert.equal(subscriptions.length, 1, 'expected exactly one session-reset subscription');
+  const handler = subscriptions[0].arguments[0];
+  assert.ok(ts.isArrowFunction(handler) && ts.isBlock(handler.body), 'session-reset handler must have a block body');
+  const statements = handler.body.statements;
+  const complete = statements.findIndex(node => ts.isIfStatement(node) && /\.phase\s*===\s*['"]complete['"]/.test(node.expression.getText(file)));
+  const explicit = statements.findIndex(node => ts.isIfStatement(node) && /\.preserveWindowSize\b/.test(node.expression.getText(file)));
+  assert.ok(complete >= 0 && explicit > complete, 'completion and explicit chat reset must exit before the meeting-only teardown');
+  for (const index of [complete, explicit]) {
+    const branch = statements[index].thenStatement;
+    assert.ok(ts.isBlock(branch) && ts.isReturnStatement(branch.statements.at(-1)), 'non-meeting reset branch must return before meeting teardown');
+  }
+  const explicitBody = statements[explicit].thenStatement.getText(file);
+  assert.match(explicitBody, /resetChatStateRef\.current\(true\)/, 'explicit reset clears chat without running meeting layout teardown');
+  const meeting = statements.slice(explicit + 1).map(node => node.getText(file)).join('\n');
+  assert.match(meeting, /resetChatStateRef\.current\(\)/, 'meeting reset must clear the reused chat tree');
+  return meeting;
 }
 
 function fakeTimers() {
@@ -134,7 +161,7 @@ test('source: handleAnswerNow keeps the recording ref open until the tail wait r
 });
 
 test('source: a session reset clears the dictation refs, not only the React state', () => {
-  const reset = section("window.electronAPI.onSessionReset(() => {", 'analytics.trackConversationStarted();');
+  const reset = meetingResetSection();
   assert.match(reset, /voiceInputRef\.current = ''/, 'BUG: the merge reads voiceInputRef, so a stale ref prepends the previous meeting to the next question');
   assert.match(reset, /isRecordingRef\.current = false/);
   assert.match(reset, /answerStopInFlightRef\.current = false/);

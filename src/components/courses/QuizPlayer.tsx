@@ -28,7 +28,7 @@ interface HistoryEntry {
 // Structural only — each state branch below contributes exactly one border/fill/text set, so a
 // tone can never lose a class-conflict against the base (Tailwind resolves conflicts by
 // stylesheet order, not by class-list order).
-const OPTION_BASE = 'flex w-full items-center gap-2 rounded-lg border p-2.5 text-left text-[13px] transition-all duration-150 active:scale-[0.985] motion-reduce:transition-none focus-visible:ring-2 focus-visible:ring-accent-focus';
+const OPTION_BASE = 'flex w-full items-start gap-2 rounded-lg border p-2.5 text-left text-[13px] transition-all duration-150 active:scale-[0.985] motion-reduce:transition-none focus-visible:ring-2 focus-visible:ring-accent-focus';
 
 function QuizPlayer({ questions, onExit }: QuizPlayerProps) {
     const originalRef = useRef(questions);
@@ -79,7 +79,7 @@ function QuizPlayer({ questions, onExit }: QuizPlayerProps) {
                 <div className="w-full max-w-md rounded-2xl border border-border-muted bg-bg-item-surface p-8 text-center">
                     <h2 className="text-lg font-medium text-text-primary">No questions yet</h2>
                     <p className="mt-2 text-[13px] leading-relaxed text-text-secondary">This study set has no quiz questions.</p>
-                    <LiquidGlassButton variant="clear" className="mt-5 lg-sm text-text-primary" onClick={onExit} title="Close">
+                    <LiquidGlassButton variant="clear" className="mt-5 lg-sm text-text-primary focus-visible:ring-2 focus-visible:ring-accent-focus" onClick={onExit} title="Close">
                         Close
                     </LiquidGlassButton>
                 </div>
@@ -122,12 +122,12 @@ function QuizPlayer({ questions, onExit }: QuizPlayerProps) {
                 {/* Footer — retry the missed subset, or close back out */}
                 <div className="flex shrink-0 items-center gap-2 border-t border-border-muted bg-bg-secondary px-4 py-3">
                     {missedEntries.length > 0 ? (
-                        <LiquidGlassButton variant="action" className="lg-sm" onClick={retryWrongsOnly} title="Replay only the questions you missed">
+                        <LiquidGlassButton variant="action" className="lg-sm focus-visible:ring-2 focus-visible:ring-accent-focus" onClick={retryWrongsOnly} title="Replay only the questions you missed">
                             Retry wrongs only
                         </LiquidGlassButton>
                     ) : null}
                     <span className="flex-1" />
-                    <LiquidGlassButton variant="clear" className="lg-sm text-text-primary" onClick={onExit} title="Close quiz">
+                    <LiquidGlassButton variant="clear" className="lg-sm text-text-primary focus-visible:ring-2 focus-visible:ring-accent-focus" onClick={onExit} title="Close quiz">
                         Close
                     </LiquidGlassButton>
                 </div>
@@ -142,7 +142,7 @@ function QuizPlayer({ questions, onExit }: QuizPlayerProps) {
             <div className="shrink-0 border-b border-border-muted bg-bg-secondary">
                 <div className="flex items-center justify-between px-4 py-2.5">
                     <span className="text-[12px] tabular-nums text-text-secondary">Question {idx + 1}/{order.length}</span>
-                    <LiquidGlassButton variant="clear" className="lg-sm text-text-secondary" onClick={onExit} title="Exit quiz">
+                    <LiquidGlassButton variant="clear" className="lg-sm text-text-primary focus-visible:ring-2 focus-visible:ring-accent-focus" onClick={onExit} title="Exit quiz">
                         Exit
                     </LiquidGlassButton>
                 </div>
@@ -168,17 +168,20 @@ function QuizPlayer({ questions, onExit }: QuizPlayerProps) {
                         const isWrongPick = revealed && picked === i && i !== question.answer;
                         const dimmed = revealed && !isCorrect && !isWrongPick;
                         return (
-                            <button key={i} type="button" disabled={revealed} onClick={() => setPicked(i)}
+                            <button key={i} type="button" disabled={revealed} aria-pressed={picked === i} onClick={() => setPicked(i)}
                                 className={`${OPTION_BASE} ${dimmed ? 'border-border-muted text-text-secondary opacity-60' : isCorrect ? `${tones.ok} cursor-default` : isWrongPick ? `${tones.danger} cursor-default` : picked === i ? 'border-accent-primary bg-bg-input text-text-primary' : 'border-border-muted text-text-secondary hover:bg-bg-input hover:text-text-primary'}`}>
-                                {/* The slot stays put in every state so option text never shifts on reveal */}
-                                <span aria-hidden className="flex h-4 w-3.5 shrink-0 items-center">
-                                    {isCorrect ? <Check size={13} /> : isWrongPick ? <X size={13} /> : null}
+                                {/* Keep the marker aligned with the first line of wrapped answers. */}
+                                <span aria-hidden className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center text-[11px] font-semibold">
+                                    {isCorrect ? <Check size={13} /> : isWrongPick ? <X size={13} /> : String.fromCharCode(65 + i)}
                                 </span>
-                                <span>{opt}</span>
+                                <span className="min-w-0 flex-1 leading-relaxed"><span className="sr-only">Option {String.fromCharCode(65 + i)}: </span>{opt}</span>
                             </button>
                         );
                     })}
                 </div>
+                </div>
+                <div role="status" className="sr-only">
+                    {revealed ? `${picked === question.answer ? 'Correct' : 'Incorrect'}. Correct answer: ${question.options[question.answer]}` : ''}
                 </div>
 
                 {/* Explanation card after reveal — its own fade so it lands on check, not with the question */}
@@ -195,13 +198,13 @@ function QuizPlayer({ questions, onExit }: QuizPlayerProps) {
                     <p id="quiz-check-hint" className="text-[11px] text-text-tertiary">Select an answer first</p>
                 ) : null}
                 {revealed ? (
-                    <LiquidGlassButton variant="action" className="lg-sm" onClick={goNext} title={isLast ? 'See results' : 'Next question'}>
+                    <LiquidGlassButton variant="action" className="lg-sm focus-visible:ring-2 focus-visible:ring-accent-focus" onClick={goNext} title={isLast ? 'See results' : 'Next question'}>
                         {isLast ? 'See results' : 'Next question'}
                     </LiquidGlassButton>
                 ) : (
                     <LiquidGlassButton
                         variant="action"
-                        className="lg-sm"
+                        className="lg-sm focus-visible:ring-2 focus-visible:ring-accent-focus"
                         onClick={checkAnswer}
                         disabled={picked === null}
                         aria-describedby={picked === null ? 'quiz-check-hint' : undefined}

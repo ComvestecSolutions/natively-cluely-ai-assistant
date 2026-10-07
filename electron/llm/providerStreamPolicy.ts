@@ -6,6 +6,8 @@ const POLICY = Symbol.for('natively.provider-stream-policy');
 export interface ProviderStreamPolicy {
   readonly firstUsefulDeadlineMs: number;
   readonly interTokenStallMs: number;
+  /** Selected local generation has no implicit deadline; explicit caller budgets still apply. */
+  readonly noDeadlines?: boolean;
   readonly signal?: AbortSignal;
   lastActivityAt?: number;
 }

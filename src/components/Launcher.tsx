@@ -166,6 +166,19 @@ const Launcher: React.FC<LauncherProps> = ({ request, onStartMeeting, onOpenSett
 
     // Keybinds
     const { isShortcutPressed } = useShortcuts();
+    const resetPendingRef = useRef(false);
+    const resetConversation = useCallback(async () => {
+        if (resetPendingRef.current) return;
+        resetPendingRef.current = true;
+        try {
+            const result = await window.electronAPI.resetIntelligence();
+            if (!result.success) console.error('[Launcher] Chat reset failed:', result.error);
+        } catch (error) {
+            console.error('[Launcher] Chat reset failed:', error);
+        } finally {
+            resetPendingRef.current = false;
+        }
+    }, []);
     const isLight = useResolvedTheme() === 'light';
     useEffect(() => {
         let mounted = true;
@@ -321,7 +334,12 @@ const Launcher: React.FC<LauncherProps> = ({ request, onStartMeeting, onOpenSett
     // Separate effect for keyboard listener — re-registers when isShortcutPressed changes
     useEffect(() => {
         const handleKeyDown = (e: KeyboardEvent) => {
-            if (isShortcutPressed(e, 'toggleVisibility')) {
+            if (isGlobalChatOpen && (e.target as HTMLElement)?.closest?.('[data-global-chat]') &&
+                e.key.toLowerCase() === 'r' && (isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey) &&
+                !e.altKey && !e.shiftKey && isShortcutPressed(e, 'resetCancel')) {
+                e.preventDefault();
+                void resetConversation();
+            } else if (isShortcutPressed(e, 'toggleVisibility')) {
                 e.preventDefault();
                 window.electronAPI.toggleWindow();
             } else if (isShortcutPressed(e, 'moveWindowUp')) {
@@ -342,7 +360,11 @@ const Launcher: React.FC<LauncherProps> = ({ request, onStartMeeting, onOpenSett
         return () => {
             window.removeEventListener('keydown', handleKeyDown);
         };
-    }, [isShortcutPressed]);
+    }, [isShortcutPressed, isGlobalChatOpen, resetConversation]);
+
+    useEffect(() => window.electronAPI?.onGlobalShortcut?.(({ action }) => {
+        if (action === 'resetCancel') void resetConversation();
+    }), [resetConversation]);
 
     // Declared above the `!window.electronAPI` early return below — a hook after
     // that guard would break the rules of hooks on the error path.

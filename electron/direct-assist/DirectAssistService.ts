@@ -214,6 +214,11 @@ export class DirectAssistService {
       };
       const armIdleWatchdog = () => {
         if (idleTimer !== undefined) this.timerScheduler.clear(idleTimer);
+        if (activePolicy?.noDeadlines && !this.callerIdleBudget
+          && !this.fallbackConfigOverrides.ttftTimeoutMs && !this.fallbackConfigOverrides.interChunkTimeoutMs) {
+          idlePromise = new Promise<never>(() => {});
+          return;
+        }
         idlePromise = new Promise<never>((_resolve, reject) => {
           const check = () => {
             const remaining = activePolicy ? localRemaining() : 0;
@@ -403,6 +408,10 @@ export class DirectAssistService {
           // open() is synchronous: publish timing BEFORE the engine arms TTFT.
           // Only one attempt is live (hedging is pinned off). Restore defaults
           // per rung so a local policy cannot leak into a later cloud attempt.
+          const unboundedLocal = activePolicy?.noDeadlines === true && !this.callerIdleBudget
+            && !this.fallbackConfigOverrides.ttftTimeoutMs && !this.fallbackConfigOverrides.interChunkTimeoutMs;
+          const openedRung = engineRungs.find(candidate => candidate.id === rungIdOf(rung));
+          if (openedRung) openedRung.noTimeout = unboundedLocal;
           engineConfig.ttftTimeoutMs = activePolicy
             ? Math.min(activePolicy.firstUsefulDeadlineMs, this.fallbackConfigOverrides.ttftTimeoutMs ?? activePolicy.firstUsefulDeadlineMs)
             : this.fallbackConfigOverrides.ttftTimeoutMs ?? DEFAULT_DIRECT_ASSIST_FALLBACK_CONFIG.ttftTimeoutMs;

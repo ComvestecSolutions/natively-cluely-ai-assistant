@@ -69,12 +69,12 @@ describe('CourseStore (P0 batch 1)', () => {
     it('addLessons upserts on url conflict keeping one row per url', () => {
         store.upsertCourse({ id: 'c1', name: 'C', sourceUrl: 'https://example.com/c' });
         store.addLessons('c1', [
-            { id: 'l1', title: 'Intro', url: 'https://site/a', orderNo: 0 },
+            { id: 'l1', title: 'Intro', url: 'https://site/a', parent: 'modules/old', orderNo: 0 },
             { id: 'l2', title: 'Joins', url: 'https://site/b', orderNo: 1 },
         ]);
 
         // Re-adding url /a under a different row id must not duplicate it.
-        store.addLessons('c1', [{ id: 'l1b', title: 'Intro (revised)', url: 'https://site/a', orderNo: 5 }]);
+        store.addLessons('c1', [{ id: 'l1b', title: 'Intro (revised)', url: 'https://site/a', parent: 'modules/new', orderNo: 5 }]);
 
         const lessons = store.listLessons('c1');
         assert.equal(lessons.length, 2);
@@ -86,6 +86,7 @@ describe('CourseStore (P0 batch 1)', () => {
         const a = lessons.find((l) => l.url === 'https://site/a');
         assert.equal(a.title, 'Intro (revised)');
         assert.equal(a.orderNo, 5);
+        assert.equal(a.parent, 'modules/new', 're-indexed lessons follow their current module');
     });
 
     it('markLessonsCompleted toggles completed_at', () => {
@@ -110,6 +111,7 @@ describe('CourseStore (P0 batch 1)', () => {
         store.addLessons('c1', [
             { id: 'l1', title: 'A', url: 'https://site/a' },
             { id: 'l2', title: 'B', url: 'https://site/b' },
+            { id: 'lab', title: 'Lab', url: 'https://site/lab', kind: 'reference' },
         ]);
         const insertChunk = db.prepare('INSERT INTO course_chunks (course_id, lesson_id, text) VALUES (?, ?, ?)');
         insertChunk.run('c1', 'l1', 'chunk one');

@@ -2156,7 +2156,13 @@ export class AppState {
         } else if (actionId === 'general:process-screenshots') {
           this.sendToMeetingSurfaces('global-shortcut', { action: 'processScreenshots' });
         } else if (actionId === 'general:reset-cancel') {
-          this.sendToMeetingSurfaces('global-shortcut', { action: 'resetCancel' });
+          const launcher = this.windowHelper.getLauncherWindow();
+          const overlay = this.windowHelper.getOverlayWindow();
+          const [active, fallback] = this.windowHelper.getCurrentWindowMode() === 'overlay'
+            ? [overlay, launcher] : [launcher, overlay];
+          if (!this.sendToWindow(active, 'global-shortcut', { action: 'resetCancel' })) {
+            this.sendToWindow(fallback, 'global-shortcut', { action: 'resetCancel' });
+          }
         }
       } catch (e: any) {
         if (e.message !== "Selection cancelled" && e.message !== "Screenshot capture already in progress") {

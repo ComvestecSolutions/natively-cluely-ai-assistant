@@ -13,6 +13,7 @@ import GlassSurface from '../ui-components/GlassSurface';
 import '../ui-components/LiquidGlassButton.css';
 import { LiquidGlassButton } from '../ui-components/LiquidGlassButton';
 import EditableTextBlock from './EditableTextBlock';
+import { MessageCopyButton } from './MessageCopyButton';
 import NativelyLogo from './icon.png';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -665,15 +666,12 @@ const CodingAnswerBlock: React.FC<{ sections: CodingSection[]; firstView?: boole
     );
 };
 
-// The timestamp row under a question bubble and under an answer. One string so
-// the two can never drift: h-6 (the row the removed Copy button set) + mt-2 gives
-// both the same gap from the card above and the same space before the next one.
-const USAGE_TIME_ROW = 'flex items-center h-6 mt-2 opacity-0 translate-y-1 [@media(hover:none)]:opacity-100 transition-all duration-[160ms] ease-out select-none';
+// The timestamp and copy actions share a row below each saved exchange.
+const USAGE_TIME_ROW = 'flex items-center gap-3 min-h-6 mt-2 select-none';
 
 // One Q&A pair in the usage/history tab. Owns its first-view entrance (question
 // enters from the right, answer settles just after) and the answer's
-// hover-revealed timestamp. Copying is the tab's own "Copy usage" — there is no
-// per-answer copy. Entrance plays only the first time this interaction is seen
+// timestamp and per-message copy action. Entrance plays only the first time this interaction is seen
 // this session — history is read-mostly, so re-viewing must be instant, never a
 // re-cascade.
 const UsageInteraction: React.FC<{
@@ -738,9 +736,8 @@ const UsageInteraction: React.FC<{
                     <motion.div {...enter({ x: 8 }, staggerDelay)} className="lg-bubble px-5 py-2.5 rounded-2xl rounded-tr-sm max-w-[80%] text-[15px] leading-relaxed select-text">
                         {interaction.question}
                     </motion.div>
-                    {/* Same row as the answer's timestamp below (USAGE_TIME_ROW): equal
-                        height, equal gap from the card above, same reveal rules. */}
-                    <div className={`${USAGE_TIME_ROW} justify-end pr-1 [@media(hover:hover)]:group-hover/q:opacity-100 [@media(hover:hover)]:group-hover/q:translate-y-0 group-focus-within/q:opacity-100 group-focus-within/q:translate-y-0`}>
+                    <div className={`${USAGE_TIME_ROW} justify-end pr-1`}>
+                        <MessageCopyButton text={interaction.question} kind="prompt" />
                         <span className="text-[11px] text-text-tertiary cursor-default">{formatTime(interaction.timestamp)}</span>
                     </div>
                     </>)}
@@ -761,9 +758,8 @@ const UsageInteraction: React.FC<{
                                 ? <CodingAnswerBlock sections={codingSections} firstView={firstView} />
                                 : <AnswerMarkdown>{answerBody}</AnswerMarkdown>}
                         </div>
-                        {/* Timestamp — bottom-left, revealed on hover/focus-within. Same row
-                            as the question's (USAGE_TIME_ROW). */}
-                        <div className={`${USAGE_TIME_ROW} [@media(hover:hover)]:group-hover/a:opacity-100 [@media(hover:hover)]:group-hover/a:translate-y-0 group-focus-within/a:opacity-100 group-focus-within/a:translate-y-0`}>
+                        <div className={USAGE_TIME_ROW}>
+                            {answerBody && <MessageCopyButton text={answerBody} kind="response" />}
                             <span className="text-[11px] text-text-tertiary cursor-default">{formatTime(interaction.timestamp)}</span>
                         </div>
                     </div>

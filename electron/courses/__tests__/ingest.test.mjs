@@ -16,12 +16,14 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distRoot = path.resolve(__dirname, '../../../dist-electron/electron/courses');
-const [ingest, storeMod] = await Promise.all([
+const [ingest, storeMod, durationMod] = await Promise.all([
   import(pathToFileURL(path.join(distRoot, 'ingest.js')).href),
   import(pathToFileURL(path.join(distRoot, 'courseStore.js')).href),
+  import(pathToFileURL(path.join(distRoot, 'lessonDuration.js')).href),
 ]);
 const { runCourseImport, runPool, parseRobotsDisallows, resolveRetryDelayMs } = ingest;
 const { COURSES_SCHEMA_SQL, CourseStore } = storeMod;
+const { getLessonDuration } = durationMod;
 
 // Fixtures mirror the planner shapes proven in microsoftLearn.test.mjs.
 const ORIGIN = 'https://learn.microsoft.com';
@@ -108,9 +110,9 @@ test('runCourseImport imports a learning path end-to-end (e2e)', async () => {
       [CRED_URL, { body: credentialHtml() }],
       [TOC_URL, { body: tocJson() }],
       [ROBOTS_URL, { body: 'User-agent: *\nDisallow: /private/\n' }],
-      [unitUrl(1), { body: lessonHtml(T1, `<img src="${IMG_URL}" alt="overview">`) }],
+      [unitUrl(1), { body: lessonHtml(T1, `<img src="${IMG_URL}" alt="overview">`).replace('</head>', '<meta name="lesson-duration" content="PT7M"></head>') }],
       [unitUrl(2), { status: 500, body: '<html><body>boom</body></html>' }],
-      [unitUrl(3), { body: lessonHtml(T3) }],
+      [unitUrl(3), { body: lessonHtml(T3, `<p>${'word '.repeat(401)}</p>`) }],
     ]));
     const httpBuffer = makeHttp(new Map([[IMG_URL, { body: Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]) }]]));
     const progress = [];
@@ -157,6 +159,12 @@ test('runCourseImport imports a learning path end-to-end (e2e)', async () => {
     assert.ok(md.startsWith('---'), 'lesson markdown starts with front matter');
     assert.ok(md.includes(`course-media://${COURSE_ID}/assets/`), 'image rewritten to course-media protocol');
     assert.ok(!md.includes('cdn.learn.microsoft.com'), 'original image host removed from markdown');
+    assert.match(md, /^lessonDuration: 7$/m, 'explicit HTML duration survives in front matter');
+    assert.deepEqual(getLessonDuration(md), { minutes: 7, source: 'provided' });
+    const unmarked = fs.readFileSync(path.join(rootDir, COURSE_ID, 'lessons', 'unit-3.md'), 'utf8');
+    assert.doesNotMatch(unmarked, /^lessonDuration:/m, 'unmarked lesson is not stamped with an estimate');
+    assert.match(unmarked, /Body copy for this unit/, 'unmarked body remains available for estimation');
+    assert.deepEqual(getLessonDuration(unmarked), { minutes: 3, source: 'estimated' });
     assert.equal(fs.existsSync(path.join(rootDir, COURSE_ID, 'lessons', 'unit-2.md')), false);
 
     const assets = fs.readdirSync(path.join(rootDir, COURSE_ID, 'assets'));
@@ -179,6 +187,89 @@ test('runCourseImport imports a learning path end-to-end (e2e)', async () => {
 
     // The failing page was retried exactly once.
     assert.equal(http.calls.filter((u) => u === unitUrl(2)).length, 2, 'failed page fetched twice (one retry)');
+  } finally {
+    fs.rmSync(rootDir, { recursive: true, force: true });
+    db.close();
+  }
+});
+
+test('runCourseImport persists scoped body and time durations, not module totals or non-lesson durations', async () => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'natively-ingest-'));
+  const db = new Database(':memory:');
+  db.exec(COURSES_SCHEMA_SQL);
+  const store = new CourseStore(db);
+  const assessmentUrl = `${ORIGIN}/en-us/learn/practice-assessment/`;
+  const referenceUrl = `${ORIGIN}/reference/handbook.pdf`;
+  const pages = [
+    [unitUrl(1), lessonHtml(T1, '<p><strong>Unit duration:</strong> 4 minutes</p>')],
+    [unitUrl(2), lessonHtml(T2, '<time class="lesson-duration" datetime="PT3M">3 min</time>')],
+    [unitUrl(3), lessonHtml(T3, '<p>Read this lesson without a duration marker.</p>').replace('</head>', '<meta name="module-duration" content="40 min"><meta name="duration" content="50 min"><meta name="lesson-duration" content="999 min"></head>')],
+    [assessmentUrl, lessonHtml('Practice', '<p><strong>Lesson duration:</strong> 8 min</p>')],
+    [referenceUrl, lessonHtml('Reference', '<p><strong>Lesson duration:</strong> 6 min</p>')],
+  ];
+  try {
+    const toc = JSON.stringify({ children: pages.map(([url], index) => ({ metadata: {
+      title: `Item ${index + 1}`, href: url,
+    } })) });
+    const http = makeHttp(new Map([
+      [CRED_URL, { body: credentialHtml() }],
+      [TOC_URL, { body: toc }],
+      ...pages.map(([url, body]) => [url, { body }]),
+    ]));
+    const { stats } = await runCourseImport(CRED_URL, COURSE_ID, {
+      courseId: COURSE_ID, rootDir, store, http, concurrency: 1, delayMs: 0,
+      retryDelayMs: 0, onProgress: () => {},
+    });
+    assert.equal(stats.succeeded, pages.length);
+    const lessons = store.listLessons(COURSE_ID);
+    assert.deepEqual(lessons.map((lesson) => lesson.kind),
+      ['lesson', 'lesson', 'lesson', 'assessment', 'reference']);
+    for (const [url, expected] of [[unitUrl(1), 4], [unitUrl(2), 3]]) {
+      const markdown = fs.readFileSync(lessons.find((lesson) => lesson.url === url).localMdPath, 'utf8');
+      assert.match(markdown, new RegExp(`^lessonDuration: ${expected}$`, 'm'));
+      assert.deepEqual(getLessonDuration(markdown), { minutes: expected, source: 'provided' });
+    }
+    for (const url of [unitUrl(3), assessmentUrl, referenceUrl]) {
+      const markdown = fs.readFileSync(lessons.find((lesson) => lesson.url === url).localMdPath, 'utf8');
+      assert.doesNotMatch(markdown, /^lessonDuration:/m, `${url} must not receive a lesson duration`);
+    }
+    const unmarked = fs.readFileSync(lessons.find((lesson) => lesson.url === unitUrl(3)).localMdPath, 'utf8');
+    assert.deepEqual(getLessonDuration(unmarked), { minutes: 1, source: 'estimated' });
+  } finally {
+    fs.rmSync(rootDir, { recursive: true, force: true });
+    db.close();
+  }
+});
+
+test('runCourseImport preserves scoped duration on a generic course lesson, not a reference', async () => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'natively-ingest-'));
+  const db = new Database(':memory:');
+  db.exec(COURSES_SCHEMA_SQL);
+  const store = new CourseStore(db);
+  const root = 'https://docs.example.com/course/';
+  const lessonUrl = `${root}unit-one/`;
+  const otherUrl = `${root}unit-two/`;
+  const referenceUrl = `${root}handbook.pdf`;
+  try {
+    const http = makeHttp(new Map([
+      ['https://docs.example.com/sitemap.xml', { body: `<urlset>${[lessonUrl, otherUrl, referenceUrl].map((url) => `<url><loc>${url}</loc></url>`).join('')}</urlset>` }],
+      [lessonUrl, { body: lessonHtml('Unit one').replace('</head>', '<meta name="unit-duration" content="5 minutes"></head>') }],
+      [otherUrl, { body: lessonHtml('Unit two').replace('</head>', '<meta name="module-duration" content="25 minutes"></head>') }],
+      [referenceUrl, { body: lessonHtml('Handbook').replace('</head>', '<meta name="lesson-duration" content="8 minutes"></head>') }],
+    ]));
+    const { stats } = await runCourseImport(root, 'generic-course', {
+      courseId: 'generic-course', rootDir, store, http, concurrency: 1,
+      delayMs: 0, retryDelayMs: 0, onProgress: () => {},
+    });
+    assert.equal(stats.succeeded, 3);
+    const lessons = store.listLessons('generic-course');
+    const saved = (url) => fs.readFileSync(lessons.find((lesson) => lesson.url === url).localMdPath, 'utf8');
+    assert.match(saved(lessonUrl), /^lessonDuration: 5$/m);
+    assert.deepEqual(getLessonDuration(saved(lessonUrl)), { minutes: 5, source: 'provided' });
+    assert.doesNotMatch(saved(otherUrl), /^lessonDuration:/m);
+    assert.deepEqual(getLessonDuration(saved(otherUrl)), { minutes: 1, source: 'estimated' });
+    assert.equal(lessons.find((lesson) => lesson.url === referenceUrl).kind, 'reference');
+    assert.doesNotMatch(saved(referenceUrl), /^lessonDuration:/m);
   } finally {
     fs.rmSync(rootDir, { recursive: true, force: true });
     db.close();

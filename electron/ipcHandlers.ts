@@ -30,8 +30,10 @@ import { resolveCoursesStudioSettings } from './courses/defaults';
 import { runCourseImport } from './courses/ingest';
 import { resolveCourseDataDir, safeCourseDirName } from './courses/courseDir';
 import { buildCourseGroundedBlock, courseGroundingAsReference } from './courses/chatGrounding';
-import { generateStudyAid } from './courses/studyAids';
+import { generateStudyAid, lookupStudyAid, type StudyAidType } from './courses/studyAids';
+import { searchCourses } from './courses/retrieval';
 import { stripCourseFrontmatter } from './courses/markdown';
+import { getLessonDuration, type LessonDuration } from './courses/lessonDuration';
 import JSZip from 'jszip';
 import { BUNDLE_SCHEMA_VERSION, exportCourseBundle, importCourseBundle, rekeyLessons, slugOfLesson, type CourseBundleMeta } from './courses/bundle';
 import { planGeneric } from './courses/profiles/generic';
@@ -10140,7 +10142,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       }
     }
 
-    if (!settings.set('reranker', { ...stored, localModelId: id })) {
+    if (!settings.set('reranker', { ...stored, provider: 'local', localModelId: id })) {
       return { success: false, error: 'settings_store_degraded' };
     }
     // The constructor reads the setting, so the switch only happens once the
@@ -10383,6 +10385,18 @@ export function initializeIpcHandlers(appState: AppState): void {
           success: false,
           error: 'busy',
           message: `Couldn't check ${model.name} right now: other local models (transcription or reranking) are using every model slot. Try again in a moment.`,
+        };
+      }
+      if (
+        probeErr?.code === 'MODULE_NOT_FOUND' ||
+        probeErr?.code === 'ERR_MODULE_NOT_FOUND' ||
+        /(?:cannot find|cannot resolve) (?:module|package)\b|(?:ERR_)?MODULE_NOT_FOUND/i.test(detail)
+      ) {
+        console.error('[LocalEmbedding] Missing runtime module during model validation:', probeErr);
+        return {
+          success: false,
+          error: 'validation_failed',
+          message: `${model.name} failed the runtime check: a required app runtime module is missing. Reinstall or update the app to restore it.`,
         };
       }
       return {
@@ -12785,6 +12799,16 @@ export function initializeIpcHandlers(appState: AppState): void {
       if (cm.isCredentialStoreDegraded()) return customProviderWriteFailure(true);
       if (!cm.saveCurlProvider(provider as any)) return customProviderWriteFailure(cm.isCredentialStoreDegraded());
       await refreshRuntimeDefaultIfUnavailable();
+      // Availability refresh only changes the model when its id disappears. An
+      // edit keeps the id but replaces its cURL template, so the active helper
+      // must pick up the newly persisted provider for the next request.
+      const llmHelper = appState.processingHelper.getLLMHelper();
+      const savedProvider = cm.getCurlProviders().find((p: any) => p.id === (provider as any).id);
+      if (savedProvider && llmHelper?.getActiveCustomProvider()?.id === savedProvider.id) {
+        llmHelper.setModel(savedProvider.id, [...cm.getCurlProviders(), ...(cm.getCustomProviders() || [])]);
+      } else if (savedProvider && llmHelper?.getActiveCurlProvider()?.id === savedProvider.id) {
+        llmHelper.switchToCurl(savedProvider);
+      }
       broadcastCredentialsChanged();
       return { success: true };
     } catch {
@@ -15143,15 +15167,22 @@ export function initializeIpcHandlers(appState: AppState): void {
       if (!store) return { disabled: true };
       // Per-row lesson/chunk counts for the renderer ("N lessons · M chunks"); a corrupt or
       // partial DB must not break list rendering, so fall back to zeros on any count error.
-      return store.listCourses().map((course) => {
+      const courses = [];
+      for (const course of store.listCourses()) {
         let stats = { lessons: 0, chunks: 0 };
         try {
           stats = store.countCourseStats(course.id);
         } catch (e: any) {
           console.warn(`[CoursesStudio] count failed for course ${course.id}:`, e?.message);
         }
-        return { ...course, lessonCount: stats.lessons, chunkCount: stats.chunks };
-      });
+        const lessons = store.listLessons(course.id).filter((lesson) => lesson.kind === 'lesson');
+        const durations = await courseLessonDurations(course.id, lessons);
+        const timedLessonCount = durations.filter((duration) => duration !== null).length;
+        const readingMinutes = durations.reduce((total, duration) => total + (duration?.minutes ?? 0), 0);
+        const providedMinutes = durations.reduce((total, duration) => total + (duration?.source === 'provided' ? duration.minutes : 0), 0);
+        courses.push({ ...course, lessonCount: stats.lessons, chunkCount: stats.chunks, timedLessonCount, readingMinutes, providedMinutes });
+      }
+      return courses;
     } catch (e: any) {
       console.warn('[CoursesStudio] list failed:', e?.message);
       return { disabled: true };
@@ -15164,7 +15195,16 @@ export function initializeIpcHandlers(appState: AppState): void {
       const store = getCourseStore();
       if (!store) return { disabled: true };
       if (typeof id !== 'string' || !id) return { course: null, lessons: [] };
-      return { course: store.getCourse(id), lessons: store.listLessons(id) };
+      const lessons = store.listLessons(id);
+      const durations = await courseLessonDurations(id, lessons);
+      return {
+        course: store.getCourse(id),
+        lessons: lessons.map((lesson, index) => ({
+          ...lesson,
+          durationMinutes: durations[index]?.minutes ?? null,
+          durationSource: durations[index]?.source ?? null,
+        })),
+      };
     } catch (e: any) {
       console.warn('[CoursesStudio] get failed:', e?.message);
       return { disabled: true };
@@ -15189,17 +15229,17 @@ export function initializeIpcHandlers(appState: AppState): void {
   // ingest.ts — files live under <userData>/courses/<courseId>/ (assets/<name>,
   // lessons/<slug>.md). local_md_path, when set, is absolute or course-dir-relative;
   // when null the path is derived from the lesson id ('<courseId>:<slug>'), because
-  // addLessons does not persist it yet. Shared by the reader and study-aid handlers:
-  // resolves a lesson's markdown file (absolute local_md_path trusted as-is; relative or
-  // id-derived paths must stay inside the course dir) and reads it.
+  // addLessons does not persist it yet. Shared by the reader, study aids, and duration
+  // reads; pathOnly lets duration reads use the same validation without synchronous I/O.
   const readCourseLessonMd = (
     courseId: string,
     lesson: { id: string; localMdPath?: unknown },
+    pathOnly = false,
+    courseDir?: string,
   ): { md?: string; path?: string; error?: string } => {
-    const coursesRoot = path.join(app.getPath('userData'), 'courses');
     // On-disk course dirs use the sanitized id (courseDir.ts); the resolver keeps
     // pre-fix raw-id dirs working and never throws for missing ones.
-    const resolvedCourseDir = resolveCourseDataDir(coursesRoot, courseId);
+    const resolvedCourseDir = courseDir ?? resolveCourseDataDir(path.join(app.getPath('userData'), 'courses'), courseId);
     let mdFile: string | null = null;
     if (typeof lesson.localMdPath === 'string' && lesson.localMdPath) {
       mdFile = path.isAbsolute(lesson.localMdPath)
@@ -15218,6 +15258,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       const courseDir = path.resolve(resolvedCourseDir) + path.sep;
       if (!resolvedMd.startsWith(courseDir)) return { error: 'invalid markdown path' };
     }
+    if (pathOnly) return { path: resolvedMd };
     let content: string;
     try {
       content = fs.readFileSync(resolvedMd, 'utf8');
@@ -15229,6 +15270,49 @@ export function initializeIpcHandlers(appState: AppState): void {
     // bundle export reads the raw file and must keep it); drop it so consumers see clean markdown.
     return { md: stripCourseFrontmatter(content), path: resolvedMd };
   };
+
+  // Files may be imported after a partial list was shown or removed outside the app.
+  // Re-stat on each request, but reuse the parsed duration while the file and row are unchanged.
+  const lessonDurationCache = new Map<string, { version: string; duration: LessonDuration }>();
+  const courseLessonDurations = async (
+    courseId: string,
+    lessons: Array<{ id: string; kind: string; localMdPath: string | null; updatedAt: string }>,
+  ): Promise<Array<LessonDuration | null>> => {
+    const results: Array<LessonDuration | null> = Array(lessons.length).fill(null);
+    // The legacy-dir resolver stats/renames synchronously. Run it once per course,
+    // not once per lesson, to keep large IPC requests responsive.
+    const courseDir = resolveCourseDataDir(path.join(app.getPath('userData'), 'courses'), courseId);
+    let next = 0;
+    const worker = async () => {
+      while (next < lessons.length) {
+        const index = next++;
+        const lesson = lessons[index];
+        if (lesson.kind !== 'lesson') continue;
+        const resolved = readCourseLessonMd(courseId, lesson, true, courseDir);
+        if (!resolved.path) continue;
+        const key = JSON.stringify([courseId, lesson.id]);
+        try {
+          const stat = await fs.promises.stat(resolved.path);
+          if (!stat.isFile()) { lessonDurationCache.delete(key); continue; }
+          const version = JSON.stringify([resolved.path, lesson.updatedAt, stat.mtimeMs, stat.size]);
+          const cached = lessonDurationCache.get(key);
+          if (cached?.version === version) { results[index] = cached.duration; continue; }
+          // Read the raw file: stripping frontmatter here would lose explicit duration markers.
+          const raw = await fs.promises.readFile(resolved.path, 'utf8');
+          const duration = getLessonDuration(raw);
+          if (duration.source === 'estimated' && !stripCourseFrontmatter(raw).trim()) { lessonDurationCache.delete(key); continue; }
+          results[index] = duration;
+          if (lessonDurationCache.size >= 10000) lessonDurationCache.clear();
+          lessonDurationCache.set(key, { version, duration });
+        } catch {
+          lessonDurationCache.delete(key);
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(16, lessons.length) }, () => worker()));
+    return results;
+  };
+
 
   safeHandle('courses:lesson-content', async (_event, { courseId, lessonId }: { courseId: string; lessonId: string }) => {
     try {
@@ -15295,38 +15379,111 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 
-  // Study aids (P3): one LLM call per (type, content) over up to four lessons; the engine
-  // caches results at <userData>/courses/<courseId>/study-aids.json keyed on prepared text.
-  // Same premium/store guards and {ok,error} envelope as courses:lesson-content — never
-  // throws out of IPC.
-  safeHandle('courses:generate-study-aid', async (_event, payload?: { courseId?: string; type?: 'summary' | 'glossary' | 'quiz' | 'flashcards'; lessonIds?: unknown; force?: boolean }) => {
+  // Only persistently registered lessons may supply study material. Never silently
+  // shrink a requested scope: generation and cache lookup must hash the same sources.
+  const resolveStudyAidSources = (
+    store: CourseStore, courseId: unknown, type: unknown, lessonIds: unknown,
+  ): { ok: true; courseId: string; type: StudyAidType; sources: { title: string; md: string }[] } | { ok: false; error: string } => {
+    if (typeof courseId !== 'string' || !courseId) return { ok: false, error: 'invalid course id' };
+    if (type !== 'summary' && type !== 'glossary' && type !== 'quiz' && type !== 'flashcards') {
+      return { ok: false, error: 'invalid study aid type' };
+    }
+    if (!Array.isArray(lessonIds) || lessonIds.length === 0) return { ok: false, error: 'no lesson ids provided' };
+    if (!store.getCourse(courseId)) return { ok: false, error: 'course not found' };
+    const lessons = new Map(store.listLessons(courseId).map((lesson) => [lesson.id, lesson]));
+    if (lessonIds.length > lessons.size) return { ok: false, error: 'invalid lesson scope' };
+    const seen = new Set<string>();
+    const sources: { title: string; md: string }[] = [];
+    for (const lessonId of lessonIds) {
+      if (typeof lessonId !== 'string' || !lessonId || seen.has(lessonId)) {
+        return { ok: false, error: 'invalid or duplicate lesson id' };
+      }
+      seen.add(lessonId);
+      const lesson = lessons.get(lessonId);
+      if (!lesson) return { ok: false, error: 'lesson not found in course' };
+      const resolved = readCourseLessonMd(courseId, lesson);
+      if (resolved.error || !resolved.md?.trim()) {
+        return { ok: false, error: `lesson markdown unavailable (lesson ${sources.length + 1} of ${lessonIds.length})` };
+      }
+      sources.push({ title: lesson.title || lessonId, md: resolved.md });
+    }
+    return { ok: true, courseId, type, sources };
+  };
+
+  // Title hits lead; body hits come from the course's FTS index. Return only
+  // navigable lesson metadata, never source URLs or raw markdown paths.
+  safeHandle('courses:search', async (_event, payload?: { courseId?: unknown; query?: unknown }) => {
     try {
       if (!isProOrTrialActive()) return { disabled: true };
       const store = getCourseStore();
       if (!store) return { disabled: true };
-      const courseId = typeof payload?.courseId === 'string' ? payload.courseId : '';
-      const type = payload?.type;
+      const courseId = payload?.courseId;
+      const query = typeof payload?.query === 'string' ? payload.query.trim().slice(0, 200) : '';
       if (typeof courseId !== 'string' || !courseId) return { ok: false, error: 'invalid course id' };
-      if (type !== 'summary' && type !== 'glossary' && type !== 'quiz' && type !== 'flashcards') {
-        return { ok: false, error: 'invalid study aid type' };
-      }
-      const lessonIds = Array.isArray(payload?.lessonIds)
-        ? payload.lessonIds.filter((v): v is string => typeof v === 'string' && v.length > 0).slice(0, 4)
-        : [];
-      if (lessonIds.length < 1) return { ok: false, error: 'no lesson ids provided' };
-      if (!store.getCourse(courseId)) return { ok: false, error: `course not found: ${courseId}` };
-
+      if (!query) return { ok: false, error: 'missing query' };
+      if (!store.getCourse(courseId)) return { ok: false, error: 'course not found' };
       const lessons = store.listLessons(courseId);
-      const sources: { title: string; md: string }[] = [];
-      for (const lessonId of lessonIds) {
-        const lesson = lessons.find((l) => l.id === lessonId);
-        if (!lesson) return { ok: false, error: `lesson not found: ${lessonId}` };
-        const resolved = readCourseLessonMd(courseId, lesson);
-        // Skip empty/unreadable lessons; require at least one with content.
-        if (resolved.error || !resolved.md || resolved.md.trim() === '') continue;
-        sources.push({ title: lesson.title || lessonId, md: resolved.md });
+      const byUrl = new Map(lessons.filter((lesson) => lesson.url).map((lesson) => [lesson.url, lesson]));
+      const results: Array<{ lessonId: string; title: string; snippet: string; parent: string | null }> = [];
+      const seen = new Set<string>();
+      const add = (lesson: (typeof lessons)[number], snippet: string) => {
+        if (seen.has(lesson.id) || results.length >= 20) return;
+        seen.add(lesson.id);
+        results.push({ lessonId: lesson.id, title: lesson.title.slice(0, 200), snippet: snippet.slice(0, 240), parent: lesson.parent });
+      };
+      const normalizedQuery = query.toLocaleLowerCase();
+      const titleMatches = lessons.filter((lesson) => lesson.title.toLocaleLowerCase().includes(normalizedQuery));
+      const db = DatabaseManager.getInstance().getDb();
+      if (!db) return { disabled: true };
+      const hits = await searchCourses({ db, query, courseIds: [courseId], limit: 64 });
+      const bodyMatches: Array<{ lesson: (typeof lessons)[number]; snippet: string }> = [];
+      const bodyIds = new Set<string>();
+      for (const hit of hits) {
+        const lesson = hit.url ? byUrl.get(hit.url) : undefined;
+        if (!lesson || bodyIds.has(lesson.id)) continue;
+        bodyIds.add(lesson.id);
+        const text = hit.text.replace(/\s+/g, ' ').trim();
+        const matchAt = text.toLocaleLowerCase().indexOf(normalizedQuery);
+        const start = matchAt < 0 ? 0 : Math.max(0, matchAt - 60);
+        bodyMatches.push({ lesson, snippet: text.slice(start, start + 240) });
       }
-      if (sources.length < 1) return { ok: false, error: 'no lesson content available' };
+      const titleIds = new Set(titleMatches.map((lesson) => lesson.id));
+      const bodyOnly = bodyMatches.filter(({ lesson }) => !titleIds.has(lesson.id));
+      const reserved = Math.min(10, bodyOnly.length);
+      for (const lesson of titleMatches.slice(0, 20 - reserved)) add(lesson, lesson.title);
+      for (const { lesson, snippet } of bodyOnly) add(lesson, snippet);
+      for (const { lesson, snippet } of bodyMatches) add(lesson, snippet);
+      for (const lesson of titleMatches) add(lesson, lesson.title);
+      return { ok: true, results };
+    } catch (e: any) {
+      console.warn('[CoursesStudio] search failed:', e?.message);
+      return { ok: false, error: 'course search failed' };
+    }
+  });
+
+  // Cache reads never create study aids or invoke a model.
+  safeHandle('courses:lookup-study-aid', async (_event, payload?: { courseId?: unknown; type?: unknown; lessonIds?: unknown }) => {
+    try {
+      if (!isProOrTrialActive()) return { disabled: true };
+      const store = getCourseStore();
+      if (!store) return { disabled: true };
+      const resolved = resolveStudyAidSources(store, payload?.courseId, payload?.type, payload?.lessonIds);
+      if (!resolved.ok) return resolved;
+      return await lookupStudyAid({ rootDir: path.join(app.getPath('userData'), 'courses'), ...resolved });
+    } catch (e: any) {
+      console.warn('[CoursesStudio] lookup-study-aid failed:', e?.message);
+      return { ok: false, error: 'study aid lookup failed' };
+    }
+  });
+
+  // Generation uses the exact same validated scope as cache hydration.
+  safeHandle('courses:generate-study-aid', async (_event, payload?: { courseId?: unknown; type?: unknown; lessonIds?: unknown; force?: boolean }) => {
+    try {
+      if (!isProOrTrialActive()) return { disabled: true };
+      const store = getCourseStore();
+      if (!store) return { disabled: true };
+      const resolved = resolveStudyAidSources(store, payload?.courseId, payload?.type, payload?.lessonIds);
+      if (!resolved.ok) return resolved;
 
       const helper = appState.processingHelper?.getLLMHelper?.();
       if (!helper) return { ok: false, error: 'no language model configured' };
@@ -15369,17 +15526,16 @@ export function initializeIpcHandlers(appState: AppState): void {
       };
       const result = await generateStudyAid({
         rootDir: path.join(app.getPath('userData'), 'courses'),
-        courseId,
-        type,
-        sources,
+        courseId: resolved.courseId,
+        type: resolved.type,
+        sources: resolved.sources,
         force: payload?.force === true,
         llm: runBatchCompletion,
       });
       return result;
     } catch (e: any) {
       console.warn('[CoursesStudio] generate-study-aid failed:', e?.message);
-      const message = e && typeof e.message === 'string' && e.message.trim() !== '' ? e.message : 'study aid generation failed';
-      return { ok: false, error: message };
+      return { ok: false, error: 'study aid generation failed' };
     }
   });
 
@@ -16509,6 +16665,13 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   // Reset intelligence state
   safeHandle('reset-intelligence', async () => {
+    let began = false;
+    let success = false;
+    const broadcastReset = (phase: 'begin' | 'complete') => {
+      BrowserWindow.getAllWindows().forEach(win => {
+        if (!win.isDestroyed()) win.webContents.send('session-reset', { preserveWindowSize: true, phase, success });
+      });
+    };
     try {
       // Invalidation, not merely abort: providers can finish after cancellation.
       const { abortAndInvalidateChatStreams } = require('./services/chatStreamRegistry') as typeof import('./services/chatStreamRegistry');
@@ -16524,13 +16687,17 @@ export function initializeIpcHandlers(appState: AppState): void {
       const intelligenceManager = appState.getIntelligenceManager();
       intelligenceManager.reset();
       appState.clearQueues();
+      // Clear both renderers before live-index shutdown drains pending embeds.
+      // A completion event must only release new turns, never clear them again.
+      began = true;
+      broadcastReset('begin');
       await appState.resetConversationTransientState();
-      BrowserWindow.getAllWindows().forEach(win => {
-        if (!win.isDestroyed()) win.webContents.send('session-reset');
-      });
+      success = true;
       return { success: true };
     } catch (error: any) {
       return { success: false, error: error.message };
+    } finally {
+      if (began) broadcastReset('complete');
     }
   });
 

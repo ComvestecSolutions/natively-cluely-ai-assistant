@@ -1,4 +1,3 @@
-import { customProviderIsLocal } from './visionCapability';
 
 export const CUSTOM_REQUEST_TIMEOUT_MS = 300_000;
 export const CUSTOM_LOCAL_IDLE_TIMEOUT_MS = 60_000;
@@ -47,6 +46,7 @@ interface TransportOptions {
   signal?: AbortSignal;
   connectTimeoutMs?: number;
   state: CustomAttemptState;
+  providerIsLocal: boolean;
   extractWhole: (data: unknown) => string;
   extractDelta: (data: unknown) => string;
   /** JSONL packets use the configured answer path, unlike SSE deltas. */
@@ -63,19 +63,19 @@ export async function* streamCustomTransport(options: TransportOptions): AsyncGe
     timeoutCode = code;
     controller.abort();
   };
-  const totalTimer = setTimeout(() => abortOnTimeout(options.state.responseStarted ? 'STREAM_IDLE_TIMEOUT' : 'CONNECT_TIMEOUT'), CUSTOM_REQUEST_TIMEOUT_MS);
+  const totalTimer = options.providerIsLocal ? undefined : setTimeout(() => abortOnTimeout(options.state.responseStarted ? 'STREAM_IDLE_TIMEOUT' : 'CONNECT_TIMEOUT'), CUSTOM_REQUEST_TIMEOUT_MS);
   let connectTimer: ReturnType<typeof setTimeout> | undefined;
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
   const onAbort = () => controller.abort(options.signal?.reason);
   options.signal?.addEventListener('abort', onAbort, { once: true });
   if (options.signal?.aborted) onAbort();
-  const local = customProviderIsLocal({ curlCommand: options.url });
-  if (options.connectTimeoutMs && !local) {
+  if (options.connectTimeoutMs && !options.providerIsLocal) {
     connectTimer = setTimeout(() => abortOnTimeout('CONNECT_TIMEOUT'), options.connectTimeoutMs);
   }
   const armIdle = () => {
+    if (options.providerIsLocal) return; // Only cancellation, not a timer, ends a local generation.
     clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => abortOnTimeout('STREAM_IDLE_TIMEOUT'), local ? CUSTOM_LOCAL_IDLE_TIMEOUT_MS : 30_000);
+    idleTimer = setTimeout(() => abortOnTimeout('STREAM_IDLE_TIMEOUT'), 30_000);
   };
   let response: Response | undefined;
   try {
@@ -97,10 +97,9 @@ export async function* streamCustomTransport(options: TransportOptions): AsyncGe
     // body read/parse failure can duplicate generation even before answer text.
     options.state.responseStarted = true;
     if (!response.body) throw new CustomProviderTransportError('Custom provider returned no answer body.');
-    // Local servers can flush headers before loading / prompt evaluation. The
-    // existing five-minute total budget covers that warmup; once bytes arrive,
-    // a separate idle budget detects a dead connection even during reasoning.
-    if (!local) armIdle();
+    // Cloud requests retain a bounded warmup and idle budget. Local model
+    // loading, reasoning and streaming end only on completion or cancellation.
+    if (!options.providerIsLocal) armIdle();
     yield* decodeCustomResponse(response, options, armIdle);
   } catch (error) {
     if (options.signal?.aborted) throw options.signal.reason ?? new DOMException('Cancelled', 'AbortError');

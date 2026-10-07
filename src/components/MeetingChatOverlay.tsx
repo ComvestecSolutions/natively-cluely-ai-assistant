@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useStreamBuffer } from '../hooks/useStreamBuffer';
 import { X } from 'lucide-react';
+import { ChatResponseMarkdown } from './ChatResponseMarkdown';
+import { MessageCopyButton } from './MessageCopyButton';
 import { motion, AnimatePresence } from 'framer-motion';
 import { genMessageId } from '../utils/messageId';
-import { mapLanguageForPrism, isBlockCode } from '../utils/prismLanguage';
-import { registerPrismLanguages } from '../utils/registerPrismLanguages';
 import nativelyIcon from './icon.png';
 import { useResolvedTheme } from '../hooks/useResolvedTheme';
 import { splitGistLineStreaming } from '../lib/displayMarkup';
@@ -12,17 +12,6 @@ import { splitGistLineStreaming } from '../lib/displayMarkup';
 // MeetingDetails having loaded the stylesheet first.
 import '../ui-components/LiquidGlassButton.css';
 import { getCoursePinIds } from '../lib/coursePins';
-
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import remarkMath from 'remark-math';
-import rehypeKatex from 'rehype-katex';
-import 'katex/dist/katex.min.css';
-import SyntaxHighlighter from 'react-syntax-highlighter/dist/esm/prism-light';
-import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import { DiagramAwareMarkdown } from './diagram/DiagramAwareMarkdown';
-
-registerPrismLanguages();
 
 // ============================================
 // Types 
@@ -89,22 +78,17 @@ const UserMessage: React.FC<{ content: string }> = ({ content }) => (
         initial={{ opacity: 0, y: 8 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.15 }}
-        className="flex justify-end mb-6"
+        className="flex flex-col items-end mb-6"
     >
-        {/* The same subtle Liquid Glass as the Usage tab's question bubble
-            (.lg-bubble, ui-components): fill and white text from
-            --bubble-user-*, so a question reads the same in both places. The
-            box and radius stay this chat's own. */}
-        <div className="lg-bubble px-5 py-3 rounded-2xl rounded-tr-md max-w-[70%] text-[15px] leading-relaxed">
+        <div className="lg-bubble px-5 py-3 rounded-2xl rounded-tr-md max-w-[70%] text-[15px] leading-relaxed whitespace-pre-wrap">
             {content}
         </div>
+        <MessageCopyButton text={content} kind="prompt" className="mt-2" />
     </motion.div>
 );
 
 const AssistantMessage: React.FC<{ content: string; isStreaming?: boolean; isLatest?: boolean }> = ({ content, isStreaming, isLatest }) => {
-    // Teleprompter gist: answers can end with a [[GIST]] line. The marker line
-    // is still split off so it never shows as text, but this chat does not
-    // render it — no gist chip here, and no copy button, by owner request.
+    // The trailing gist is metadata, not part of the displayed or copied answer.
     const { body: gistBody } = splitGistLineStreaming(content);
 
     return (
@@ -115,80 +99,9 @@ const AssistantMessage: React.FC<{ content: string; isStreaming?: boolean; isLat
             className="flex flex-col items-start mb-6"
         >
             <div className="text-text-primary text-[15px] leading-relaxed max-w-[85%]">
-                {/* Markdown Content with tight line height and spacing */}
-                <div className="markdown-content">
-                    {/* A ```mermaid block is drawn by the shared diagram card; everything
-                        else goes through this chat's own Markdown renderer, unchanged. */}
-                    <DiagramAwareMarkdown
-                      text={gistBody}
-                      streaming={Boolean(isStreaming)}
-                      // Only the answer just given may be repaired by itself (one model
-                      // call); an older answer in the thread keeps its "Try to fix" button.
-                      allowAutoRepair={Boolean(isLatest)}
-                      renderMarkdown={(chunk, key) => (
-                    <ReactMarkdown
-                        key={key}
-                        remarkPlugins={[remarkGfm, remarkMath]}
-                        rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false, errorColor: '#cc0000' }]]}
-                        components={{
-                            p: ({ node, ...props }: any) => <p className="mb-[6px] last:mb-0 leading-relaxed whitespace-pre-wrap text-[13.5px]" {...props} />,
-                            a: ({ node, ...props }: any) => <a className="text-accent-primary hover:underline" {...props} />,
-                            h1: ({ node, ...props }: any) => <h1 className="text-sm font-bold mt-2 mb-[4.5px] leading-relaxed uppercase tracking-wide" {...props} />,
-                            h2: ({ node, ...props }: any) => <h2 className="text-xs font-bold mt-1.5 mb-[4.5px] leading-relaxed uppercase tracking-wide" {...props} />,
-                            h3: ({ node, ...props }: any) => <h3 className="text-xs font-semibold mt-1.5 mb-[4.5px] leading-relaxed" {...props} />,
-                            ul: ({ node, ...props }: any) => <ul className="list-disc pl-4 mt-[4.5px] mb-[4.5px] space-y-0 leading-relaxed text-[13.5px]" {...props} />,
-                            ol: ({ node, ...props }: any) => <ol className="list-decimal pl-4 mt-[4.5px] mb-[4.5px] space-y-0 leading-relaxed text-[13.5px]" {...props} />,
-                            li: ({ node, ...props }: any) => <li className="pl-1 mb-[4.5px] last:mb-0 leading-relaxed text-[13.5px]" {...props} />,
-                            pre: ({ children }: any) => <div className="not-prose mb-3 mt-1.5">{children}</div>,
-                            code: ({ node, className, children, ...props }: any) => {
-                                const match = /language-([\w+#-]+)/.exec(className || '');
-                                const isBlock = isBlockCode(className, String(children));
-                                const lang = match ? match[1] : '';
-                                const resolved = mapLanguageForPrism(lang, String(children));
-
-                                return isBlock ? (
-                                    <div className="my-2 rounded-xl overflow-hidden border border-white/[0.08] shadow-lg bg-zinc-800/60 backdrop-blur-md">
-                                        <div className="bg-white/[0.04] px-3 py-1 border-b border-white/[0.08]">
-                                            <span className="text-[9px] uppercase tracking-widest font-semibold text-white/40 font-mono">
-                                                {resolved || 'CODE'}
-                                            </span>
-                                        </div>
-                                        <div className="bg-transparent">
-                                            <SyntaxHighlighter
-                                                language={resolved}
-                                                style={vscDarkPlus}
-                                                customStyle={{
-                                                    margin: 0,
-                                                    borderRadius: 0,
-                                                    fontSize: '12px',
-                                                    lineHeight: '1.45',
-                                                    background: 'transparent',
-                                                    padding: '12px',
-                                                    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace'
-                                                }}
-                                                wrapLongLines={true}
-                                                showLineNumbers={true}
-                                                lineNumberStyle={{ minWidth: '2.5em', paddingRight: '1.2em', color: 'rgba(255,255,255,0.2)', textAlign: 'right', fontSize: '10px' }}
-                                                {...props}
-                                            >
-                                                {String(children).replace(/\n$/, '')}
-                                            </SyntaxHighlighter>
-                                        </div>
-                                    </div>
-                                ) : (
-                                    <code className="bg-bg-tertiary px-1.5 py-0.5 rounded text-[12px] font-mono text-text-primary border border-border-subtle whitespace-pre-wrap" {...props}>
-                                        {children}
-                                    </code>
-                                );
-                            },
-                        }}
-                    >
-                        {chunk}
-                    </ReactMarkdown>
-                      )}
-                    />
-                </div>
+                <ChatResponseMarkdown text={gistBody} streaming={isStreaming} isLatest={isLatest} />
             </div>
+            {!isStreaming && gistBody && <MessageCopyButton text={gistBody} kind="response" className="mt-3" />}
         </motion.div>
     );
 };

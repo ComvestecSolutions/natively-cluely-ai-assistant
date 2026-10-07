@@ -83,6 +83,7 @@ test('KeybindManager syncs only accepted changes to Reset, including swaps and R
     ]),
     normalizeAccelerator: acc => acc.toLowerCase().split('+').sort().join('+'),
     getKeybind: id => receiver.keybinds.get(id)?.accelerator,
+    isCustomResetChord: acc => !!acc && receiver.normalizeAccelerator(acc) !== receiver.normalizeAccelerator('CommandOrControl+R'),
     save() {}, registerGlobalShortcuts() {}, broadcastUpdate() {},
     notifyResetChordChanged: () => updates.push(receiver.getKeybind('general:reset-cancel')),
   };

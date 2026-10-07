@@ -14,6 +14,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+import { transformSync } from 'esbuild';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '../../..');
@@ -55,6 +56,62 @@ function makeRegistry(overrides = {}) {
   });
   return { registry, outcomes, warnings };
 }
+
+test('IPC provider and local model selections reach the running reranker seam', async () => {
+  const settings = {
+    reranker: { provider: 'local' },
+    get(key) { return this[key]; },
+    set(key, value) { this[key] = value; return true; },
+  };
+  const handlers = new Map();
+  let failProbe = false;
+  const modules = {
+    './services/SettingsManager': { SettingsManager: { getInstance: () => settings } },
+    './rag/rerankerModelCatalog': { findCatalogModel: () => ({ supported: true, runtime: 'onnx' }) },
+    './services/reranking/localModelInstaller': { statusOf: () => ({ state: 'installed' }) },
+    './rag/LocalReranker': {
+      reloadLocalReranker: () => {},
+      getLocalReranker: () => ({ rerank: async () => {
+        if (failProbe) throw new Error('model load failed');
+        return [{ index: 1, score: 1 }, { index: 0, score: 0 }];
+      } }),
+    },
+    './services/reranking/rerankerConfig': { resetLocalGgufPort: () => {} },
+  };
+  const source = fs.readFileSync(path.join(repoRoot, 'electron/ipcHandlers.ts'), 'utf8');
+  for (const channel of ['reranker:set-config', 'reranker:use-local-model']) {
+    const start = source.indexOf(`  safeHandle('${channel}'`);
+    assert.notEqual(start, -1, `${channel} must be registered`);
+    const end = source.indexOf('\n  });', start);
+    assert.notEqual(end, -1);
+    const code = transformSync(source.slice(start, end + '\n  });'.length), { loader: 'ts' }).code;
+    new Function('safeHandle', 'require', 'RERANK_CANDIDATE_POOL', code)(
+      (name, handler) => handlers.set(name, handler),
+      (name) => { assert.ok(modules[name], `unexpected import ${name}`); return modules[name]; },
+      30,
+    );
+  }
+  const hostedPort = { rerank: async () => [{ index: 0, score: 1 }] };
+  const { registry } = makeRegistry({
+    source: null,
+    hostedPort: () => settings.reranker.provider === 'jina' ? hostedPort : null,
+  });
+
+  assert.equal(registry.resolvePort(), null, 'local starts on the built-in seam');
+  assert.equal((await handlers.get('reranker:set-config')(null, { provider: 'jina', jinaModel: 'rerank-v1' })).success, true);
+  assert.equal(typeof registry.resolvePort()?.rerank, 'function', 'hosted selection applies without recreating registry');
+  failProbe = true;
+  assert.equal((await handlers.get('reranker:use-local-model')(null, 'local-onnx')).success, false);
+  assert.equal(settings.reranker.provider, 'jina', 'failed local validation restores the hosted provider');
+  assert.ok(registry.resolvePort(), 'failed switch retains the hosted port');
+  failProbe = false;
+  assert.equal((await handlers.get('reranker:use-local-model')(null, 'local-onnx')).success, true);
+  assert.equal(settings.reranker.provider, 'local', 'Use must make the validated local model active');
+  assert.equal(settings.reranker.localModelId, 'local-onnx');
+  assert.equal(registry.resolvePort(), null, 'local selection drops the hosted port immediately');
+  assert.equal((await handlers.get('reranker:set-config')(null, { provider: 'jina', jinaModel: 'rerank-v2' })).success, true);
+  assert.ok(registry.resolvePort(), 'hosted re-selection takes effect on the same registry');
+});
 
 // ── who owns the seam ─────────────────────────────────────────────────────
 

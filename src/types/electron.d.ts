@@ -132,7 +132,12 @@ export interface ElectronAPI {
   coursesReindex: (id: string) => Promise<any>
   // Courses Studio reader: lesson markdown + metadata / completion toggles.
   coursesLessonContent: (courseId: string, lessonId: string) => Promise<any>
-  // Courses Studio study aids: one cached LLM pass over up to four lessons.
+  // Courses Studio search: scoped title/FTS matches with navigable lesson ids.
+  coursesSearch: (courseId: string, query: string) =>
+    Promise<{ ok?: boolean; disabled?: boolean; results?: Array<{ lessonId: string; title: string; snippet: string; parent: string | null }>; error?: string }>
+  // Courses Studio study aids: cached lookup never invokes a model; generation batches the full scope.
+  coursesLookupStudyAid: (courseId: string, type: 'summary' | 'glossary' | 'quiz' | 'flashcards', lessonIds: string[]) =>
+    Promise<{ ok?: boolean; disabled?: boolean; cached?: boolean; data?: unknown; error?: string }>
   coursesGenerateStudyAid: (courseId: string, type: 'summary' | 'glossary' | 'quiz' | 'flashcards', lessonIds: string[], force?: boolean) =>
     Promise<{ ok?: boolean; disabled?: boolean; cached?: boolean; data?: unknown; error?: string }>
   // Courses Studio P4 portability: zip bundle export/import + cascade delete.
@@ -855,7 +860,7 @@ export interface ElectronAPI {
   onIntelligenceModeChanged: (callback: (data: { mode: string }) => void) => () => void
   onIntelligenceError: (callback: (data: { error: string, mode: string }) => void) => () => void;
   // Session Management
-  onSessionReset: (callback: () => void) => () => void;
+  onSessionReset: (callback: (data?: { preserveWindowSize?: boolean; phase?: 'begin' | 'complete'; success?: boolean }) => void) => () => void;
 
   // Streaming listeners
   streamGeminiChat: (message: string, imagePaths?: string[], context?: string, options?: { skipSystemPrompt?: boolean, ignoreKnowledgeMode?: boolean, courseIds?: string[], surface?: 'live' | 'chat', liveQuestion?: boolean, selectedModelOnly?: boolean, requestId?: string }) => Promise<void>

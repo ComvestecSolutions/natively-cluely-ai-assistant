@@ -24,7 +24,8 @@ import {
   mergeRollingTranscriptPartial,
 } from '../../electron/utils/rollingTranscriptState.ts';
 import { categorizeSttError } from '../lib/sttErrorMapper';
-import { splitGistLine, splitGistLineStreaming, collapseBlockGaps } from '../lib/displayMarkup';
+import { splitGistLine, splitGistLineStreaming, stripGistTrailer, collapseBlockGaps } from '../lib/displayMarkup';
+import { MessageCopyButton } from './MessageCopyButton';
 
 import type { SkillSummary } from '../types/electron';
 
@@ -1354,6 +1355,13 @@ const MessageRow = React.memo(
                 </span>
               </div>
             )}
+            {!msg.isStreaming && msg.text && (msg.role === 'user' || (msg.role === 'system' && (!msg.failure || msg.failure.partial))) && (
+              <MessageCopyButton
+                text={msg.role === 'system' ? stripGistTrailer(msg.text) : msg.text}
+                kind={msg.role === 'user' ? 'prompt' : 'response'}
+                className="mt-2"
+              />
+            )}
           </div>
         </div>
       </div>
@@ -2077,7 +2085,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   const pendingCaptureRef = useRef<{ path: string; preview: string } | null>(null);
   const chatResetEpochRef = useRef(0);
   const chatResetPendingRef = useRef(false);
-  const resetChatStateRef = useRef<() => void>(() => {});
+  const resetChatStateRef = useRef<(preserveWindowSize?: boolean) => void>(() => {});
 
   // Latent Context State (Screenshots attached but not sent)
   const [attachedContext, setAttachedContext] = useState<Array<{ path: string; preview: string }>>(
@@ -5333,8 +5341,21 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // Session Reset Listener - Clears UI when a NEW meeting starts
   useEffect(() => {
     if (!window.electronAPI?.onSessionReset) return;
-    const unsubscribe = window.electronAPI.onSessionReset(() => {
+    const unsubscribe = window.electronAPI.onSessionReset((data) => {
       console.log('[NativelyInterface] Resetting session state...');
+      // Completion only releases submissions. Clearing again here would erase
+      // a fresh turn begun while main finished its live-index drain.
+      if (data?.phase === 'complete') {
+        chatResetPendingRef.current = false;
+        return;
+      }
+      // An explicit chat clear is not a new meeting: retain the user's window
+      // envelope and live audio status instead of restoring the default size.
+      if (data?.preserveWindowSize) {
+        if (data.phase === 'begin') chatResetPendingRef.current = true;
+        resetChatStateRef.current(true);
+        return;
+      }
       resetChatStateRef.current();
       window.electronAPI?.cancelChatStream?.();
       chatStreamIdRef.current = null;
@@ -7170,7 +7191,16 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     }
   }, [flushToken, settleDirectAssistIncomplete]);
 
-  const resetChatState = useCallback(() => {
+  const resetChatState = useCallback((preserveWindowSize = false) => {
+    if (preserveWindowSize && window.innerHeight > 0) {
+      // The empty viewport must keep occupying the height that the previous
+      // conversation held; otherwise the content observer shrinks the native
+      // window. A floor (not a ceiling) lets the next answer grow normally.
+      customOverlayHeightRef.current = window.innerHeight;
+      heightPinIsCeilingRef.current = false;
+      heightPinStreamIdRef.current = null;
+      setHeightPinned(true);
+    }
     chatResetEpochRef.current++;
     cancelActiveChatStream();
     forceFinalizeStaleRagStream();
@@ -7234,7 +7264,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     // The backend broadcasts session-reset before acknowledging. Do not accept
     // a new turn against outgoing context or let that broadcast erase it.
     chatResetPendingRef.current = true;
-    resetChatState();
+    resetChatState(true);
     try {
       const result = await window.electronAPI.resetIntelligence();
       if (!result.success) console.error('[NativelyInterface] Chat reset failed:', result.error);

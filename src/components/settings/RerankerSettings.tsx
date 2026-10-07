@@ -887,7 +887,6 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
                 }
                 await window.electronAPI.setExtensionEnabled?.(id, true);
             } else {
-                await window.electronAPI.setRerankerConfig?.({ provider: 'local' });
                 for (const ext of extensions.filter(e => e.type === 'reranker' && e.enabled)) {
                     await window.electronAPI.setExtensionEnabled?.(ext.id, false);
                 }

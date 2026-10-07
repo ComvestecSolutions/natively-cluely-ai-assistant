@@ -1,12 +1,12 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { AlertTriangle, ArrowLeft, Check, ChevronLeft, ChevronRight, ExternalLink, PanelRightOpen, X, XCircle } from 'lucide-react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { AlertTriangle, ArrowLeft, BookOpen, Check, CheckCircle2, ChevronLeft, ChevronRight, Clock3, ExternalLink, PanelRightOpen, Search, X, XCircle } from 'lucide-react';
 import LessonMarkdown from './LessonMarkdown';
 import StudyRail from './StudyRail';
 import LiquidGlassButton from '../../ui-components/LiquidGlassButton';
-import { SETTINGS_BTN, SETTINGS_CARD, SETTINGS_INPUT, SettingsNotice, useSettingsTones } from '../settings/SettingsRow';
+import { SETTINGS_CARD, SETTINGS_INPUT, SettingsNotice, useSettingsTones } from '../settings/SettingsRow';
 
 // Courses Studio P3 — single-course reader. Loads the course + its lessons once, then renders one
-// lesson's stored markdown in the center with a flat (depth-indented) rail on the left. Completion
+// lesson's stored markdown in the center with a module-grouped rail on the left. Completion
 // is optimistic; internal links resolve back to a lesson so reading stays inside the app. Self-
 // contained: local type shapes mirror the preload contract (coursesGet / coursesLessonContent)
 // instead of importing electron internals into the renderer.
@@ -33,6 +33,8 @@ interface Lesson {
     tocPath: string | null;
     localMdPath: string;
     completedAt: string | null;
+    durationMinutes?: number | null;
+    durationSource?: 'provided' | 'estimated' | null;
 }
 
 interface LessonReaderProps {
@@ -75,17 +77,45 @@ interface ContentState {
     error: string | null;
 }
 
+interface CourseSearchHit {
+    lessonId: string;
+    title: string;
+    snippet: string;
+    parent: string | null;
+}
+
+interface SearchState {
+    key: string;
+    status: 'loading' | 'ready';
+    hits: CourseSearchHit[];
+    error: string | null;
+}
+
+const moduleKeysForOverview = (lesson: Lesson): { direct: string; hashed: string } | null => {
+    try {
+        const pathname = new URL(lesson.url).pathname.replace(/\/+$/, '');
+        if (!/\/modules\/[^/]+$/i.test(pathname)) return null;
+        const segment = decodeURIComponent(pathname.split('/').pop() ?? '');
+        const normalize = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+        // Detail-feed parents store the raw slug (60 chars); TOC parents use makeId's
+        // 48-character slug followed by a hash, then normalize the whole ID.
+        const direct = normalize(segment).slice(0, 60);
+        const hashed = normalize(segment.replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48));
+        return direct && hashed ? { direct: `modules/${direct}`, hashed: `modules/${hashed}` } : null;
+    } catch { return null; }
+};
+const moduleTitle = (key: string, overviews: Map<string, string>): string =>
+    overviews.get(key) || key.replace(/^modules\//, '').replace(/-[a-f\d]{8}$/i, '').replace(/[-_]+/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase()) || 'Module';
+
 function Notice({ title, body, onBack, onRetry }: { title: string; body?: string; onBack: () => void; onRetry?: () => void }) {
     return (
-        <div className="h-full min-h-0 overflow-y-auto px-6 py-6 text-text-primary">
+        <div className="flex h-full min-h-0 items-center justify-center overflow-y-auto px-6 py-6 text-text-primary">
             <div className={`mx-auto w-full max-w-md p-6 text-center ${SETTINGS_CARD}`}>
                 <h2 className="text-lg font-medium text-text-primary">{title}</h2>
                 {body ? <p className="mt-2 text-xs leading-relaxed text-text-secondary">{body}</p> : null}
                 <div className="mt-5 flex flex-wrap justify-center gap-2">
-                    <button type="button" onClick={onBack} className={`${SETTINGS_BTN} focus-visible:ring-2 focus-visible:ring-accent-focus`}>
-                        <ArrowLeft size={14} aria-hidden />Back to courses
-                    </button>
-                    {onRetry && <button type="button" onClick={onRetry} className={`${SETTINGS_BTN} focus-visible:ring-2 focus-visible:ring-accent-focus`}>Retry</button>}
+                    <LiquidGlassButton type="button" variant="clear" className="lg-sm text-text-primary" onClick={onBack} icon={<ArrowLeft size={14} aria-hidden />}>Back to courses</LiquidGlassButton>
+                    {onRetry && <LiquidGlassButton type="button" variant="action" className="lg-sm" onClick={onRetry}>Retry</LiquidGlassButton>}
                 </div>
             </div>
         </div>
@@ -95,6 +125,23 @@ function Notice({ title, body, onBack, onRetry }: { title: string; body?: string
 const LessonReader: React.FC<LessonReaderProps> = ({ courseId, initialLessonId, onBack }) => {
     const [course, setCourse] = useState<Course | null>(null);
     const [lessons, setLessons] = useState<Lesson[]>([]);
+    const { groups, groupById, overviews } = useMemo(() => {
+        const parentKeys = new Set(lessons.map((lesson) => lesson.parent).filter((key): key is string => !!key));
+        const groups = new Map<string, Lesson[]>();
+        const groupById = new Map<string, string>();
+        const overviews = new Map<string, string>();
+        for (const lesson of lessons) {
+            const overviewKeys = lesson.parent ? null : moduleKeysForOverview(lesson);
+            const overviewGroup = overviewKeys && [...parentKeys].find((parent) =>
+                parent === overviewKeys.direct || (parent.startsWith(`${overviewKeys.hashed}-`) && /^[a-f0-9]{8}$/i.test(parent.slice(overviewKeys.hashed.length + 1))));
+            const key = lesson.parent ?? overviewGroup ?? '';
+            if (overviewGroup && lesson.title) overviews.set(key, lesson.title);
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key)!.push(lesson);
+            groupById.set(lesson.id, key);
+        }
+        return { groups, groupById, overviews };
+    }, [lessons]);
     const [loading, setLoading] = useState(true);
     const [loadError, setLoadError] = useState<string | null>(null);
     const [disabled, setDisabled] = useState(false);
@@ -108,7 +155,11 @@ const LessonReader: React.FC<LessonReaderProps> = ({ courseId, initialLessonId, 
     useEffect(() => { if (railOpen) studyPane.current?.focus(); }, [railOpen]);
 
     const [activeId, setActiveId] = useState<string | null>(null);
-    const [filter, setFilter] = useState('');
+    const [expandedModules, setExpandedModules] = useState<string[]>([]);
+    const [searchCollapsedModules, setSearchCollapsedModules] = useState<string[]>([]);
+    const [searchQuery, setSearchQuery] = useState('');
+    const [searchState, setSearchState] = useState<SearchState>({ key: '', status: 'ready', hits: [], error: null });
+    const searchSeq = useRef(0);
 
     // Content for the active lesson. A request-sequence ref ignores stale responses so a slow fetch
     // never overwrites a newer one (e.g. when prev/next is clicked quickly).
@@ -130,7 +181,7 @@ const LessonReader: React.FC<LessonReaderProps> = ({ courseId, initialLessonId, 
         let cancelled = false;
         setLoading(true); setLoadError(null); setDisabled(false);
         setCourse(null); setLessons([]); setActiveId(null); setContent({ key: '', status: 'loading', content: '', error: null });
-        setFilter(''); setRailOpen(false); setCompletionErrors({}); setSavingLessons([]);
+        setExpandedModules([]); setSearchCollapsedModules([]); setSearchQuery(''); setRailOpen(false); setCompletionErrors({}); setSavingLessons([]);
         pendingCompletion.current.clear();
         ++completionEpoch.current;
 
@@ -168,6 +219,38 @@ const LessonReader: React.FC<LessonReaderProps> = ({ courseId, initialLessonId, 
 
         return () => { cancelled = true; ++completionEpoch.current; };
     }, [courseId, initialLessonId, courseRetry]);
+
+    // Search only the loaded course. Clearing the timer and sequence-checking the response
+    // prevents an old query (or an old course) from replacing newer results.
+    useEffect(() => {
+        const query = searchQuery.trim();
+        const key = JSON.stringify([courseId, query]);
+        const seq = ++searchSeq.current;
+        if (!query || course?.id !== courseId) {
+            setSearchState({ key, status: 'ready', hits: [], error: null });
+            return;
+        }
+        setSearchState({ key, status: 'loading', hits: [], error: null });
+        const timer = window.setTimeout(() => {
+            void (async () => {
+                try {
+                    const api = window.electronAPI;
+                    if (typeof api?.coursesSearch !== 'function') throw new Error('Course search is unavailable in this build.');
+                    const res = await api.coursesSearch(courseId, query) as Awaited<ReturnType<typeof api.coursesSearch>> & { hits?: CourseSearchHit[] };
+                    if (seq !== searchSeq.current) return;
+                    if (!res || res.disabled || res.ok === false || res.error) {
+                        throw new Error(typeof res?.error === 'string' && res.error.trim() ? res.error
+                            : res?.disabled ? 'Course search is disabled or local storage is unavailable.' : 'Course search failed. Try again.');
+                    }
+                    const hits = Array.isArray(res.results) ? res.results : Array.isArray(res.hits) ? res.hits : [];
+                    setSearchState({ key, status: 'ready', hits: hits.filter((hit) => lessons.some((lesson) => lesson.id === hit.lessonId)), error: null });
+                } catch (err) {
+                    if (seq === searchSeq.current) setSearchState({ key, status: 'ready', hits: [], error: err instanceof Error ? err.message : 'Course search failed. Try again.' });
+                }
+            })();
+        }, 250);
+        return () => { window.clearTimeout(timer); ++searchSeq.current; };
+    }, [courseId, course?.id, lessons, searchQuery]);
 
     // Persist the active lesson so closing and reopening the reader resumes in place.
     useEffect(() => {
@@ -217,13 +300,13 @@ const LessonReader: React.FC<LessonReaderProps> = ({ courseId, initialLessonId, 
         if (!activeId || lessons.length === 0) return; // bounds + no-op are handled by the disabled buttons
         const idx = lessons.findIndex((l) => l.id === activeId);
         const target = lessons[idx + delta];
-        if (target) setActiveId(target.id);
+        if (target) openLesson(target.id);
     };
 
     // Optimistically flip completion, then persist; roll back on IPC failure.
     const toggleComplete = async () => {
         const current = lessons.find((l) => l.id === activeId);
-        if (!current || pendingCompletion.current.has(current.id)) return;
+        if (!current || current.kind !== 'lesson' || pendingCompletion.current.has(current.id)) return;
         const epoch = completionEpoch.current;
         const done = !current.completedAt;
         pendingCompletion.current.add(current.id);
@@ -264,7 +347,7 @@ const LessonReader: React.FC<LessonReaderProps> = ({ courseId, initialLessonId, 
         if (!key) return;
         for (const l of lessons) {
             if (!l.url) continue;
-            if (canonicalKey(l.url) === key) { setActiveId(l.id); return; }
+            if (canonicalKey(l.url) === key) { openLesson(l.id); return; }
         }
     };
 
@@ -277,26 +360,36 @@ const LessonReader: React.FC<LessonReaderProps> = ({ courseId, initialLessonId, 
     if (!current) return <Notice title="Select a lesson" body="Choose a lesson from the list to start reading." onBack={onBack} />;
 
     const total = lessons.length;
-    const doneCount = lessons.filter((l) => !!l.completedAt).length;
-    const pct = total > 0 ? Math.round((doneCount / total) * 100) : 0;
+    const courseLessonCount = lessons.filter((l) => l.kind === 'lesson').length;
+    const doneCount = lessons.filter((l) => l.kind === 'lesson' && !!l.completedAt).length;
+
     const currentIdx = lessons.findIndex((l) => l.id === activeId);
     const trimmedLen = content.content.trim().length;
 
     // A short successful extraction is distinct from a read failure.
     const degraded = content.status === 'ready' && !content.error && trimmedLen > 0 && trimmedLen < 200;
 
-    const visibleLessons = filter.trim() !== ''
-        ? lessons.filter((l) => l.title.toLowerCase().includes(filter.trim().toLowerCase()))
-        : lessons;
+    const activeModule = groupById.get(current.id) ?? '';
+    const sameModule = groups.get(activeModule) ?? [current];
+    const label = activeModule ? moduleTitle(activeModule, overviews) : 'Course lessons (ungrouped)';
+    const scopeLessons = sameModule.filter((l) => l.kind === 'lesson').map((l) => ({ id: l.id, title: l.title }));
 
-    // Study rail scope — the current lesson plus its module-mates (same parent), capped at four per
-    // LLM pass; falls back to just this lesson when no siblings match. Plus course-wide progress and
-    // the module's external (non-lesson) links for the labs section.
-    const sameModule = lessons.filter((l) => (l.parent ?? null) === (current.parent ?? null));
-    const scopeLessons = [current, ...sameModule.filter((l) => l.id !== current.id && l.kind === 'lesson')]
-        .slice(0, 4).map((l) => ({ id: l.id, title: l.title }));
-    const progress = { done: doneCount, total };
     const externalLinks = sameModule.filter((l) => !!l.kind && l.kind !== 'lesson' && !!l.url).map((l) => ({ title: l.title, url: l.url }));
+    const moduleLessonCount = scopeLessons.length;
+    const courseMinutes = lessons.reduce((minutes, lesson) => minutes + (lesson.kind === 'lesson' && Number.isFinite(lesson.durationMinutes) ? lesson.durationMinutes! : 0), 0);
+    const moduleMinutes = sameModule.reduce((minutes, lesson) => minutes + (lesson.kind === 'lesson' && Number.isFinite(lesson.durationMinutes) ? lesson.durationMinutes! : 0), 0);
+    const timedCourseLessons = lessons.filter((lesson) => lesson.kind === 'lesson' && Number.isFinite(lesson.durationMinutes)).length;
+    const timedModuleLessons = sameModule.filter((lesson) => lesson.kind === 'lesson' && Number.isFinite(lesson.durationMinutes)).length;
+    const query = searchQuery.trim();
+    const titleMatches = query && lessons.some((lesson) => lesson.title.toLowerCase().includes(query.toLowerCase()));
+    const search = searchState.key === JSON.stringify([courseId, query]) ? searchState : { key: '', status: 'loading', hits: [], error: null };
+    const openLesson = (id: string) => {
+        if (!groupById.has(id)) return;
+        setActiveId(id); setRailOpen(false);
+        const moduleKey = groupById.get(id)!;
+        setExpandedModules((prev) => prev.includes(moduleKey) ? prev : [...prev, moduleKey]);
+        setSearchCollapsedModules((prev) => prev.filter((key) => key !== moduleKey));
+    };
 
     return (
         <div className="h-full min-h-0 w-full flex flex-col overflow-hidden bg-bg-primary text-text-primary selection:bg-accent-subtle">
@@ -313,9 +406,9 @@ const LessonReader: React.FC<LessonReaderProps> = ({ courseId, initialLessonId, 
 
                 </div>
                 <div className="mt-2 flex flex-wrap items-center gap-1.5">
-                    <span className="mr-auto text-xs tabular-nums text-text-secondary">Lesson {currentIdx + 1}/{total} · {pct}% complete</span>
-                    <button ref={studyTrigger} type="button" className={`${SETTINGS_BTN} xl:hidden focus-visible:ring-2 focus-visible:ring-accent-focus`} onClick={() => setRailOpen((open) => !open)} aria-expanded={railOpen} aria-controls="course-study-pane">
-                        <PanelRightOpen size={14} aria-hidden />Study aids
+                    <span className="mr-auto inline-flex items-center gap-1.5 text-xs tabular-nums text-text-secondary"><BookOpen size={13} aria-hidden />{current.kind === 'lesson' ? 'Lesson' : 'Resource'} {currentIdx + 1}/{total}{current.kind === 'lesson' && current.durationMinutes ? ` · ${current.durationSource === 'provided' ? '' : '~'}${current.durationMinutes} min` : ''}</span>
+                    <button ref={studyTrigger} type="button" className="lg-button lg-clear lg-sm xl:hidden text-text-primary focus-visible:ring-2 focus-visible:ring-accent-focus" onClick={() => setRailOpen((open) => !open)} aria-expanded={railOpen} aria-controls="course-study-pane">
+                        <span className="lg-content"><span className="lg-icon" aria-hidden="true"><PanelRightOpen size={14} /></span><span className="lg-label">Study aids</span></span>
                     </button>
                     <LiquidGlassButton type="button" variant="clear" className="lg-sm shrink-0 text-text-secondary" onClick={() => goPrevNext(-1)} disabled={currentIdx <= 0} title="Previous lesson" aria-label="Previous lesson">
                         <ChevronLeft size={14} />
@@ -326,41 +419,81 @@ const LessonReader: React.FC<LessonReaderProps> = ({ courseId, initialLessonId, 
                     <LiquidGlassButton type="button" variant="clear" className="lg-sm shrink-0 text-text-secondary" onClick={openOriginal} icon={<ExternalLink size={12} />} title={`Open ${current.title} in the browser`} aria-label={`Open ${current.title} in the browser`}>
                         Open original
                     </LiquidGlassButton>
-                    <button type="button" onClick={toggleComplete} disabled={savingLessons.includes(current.id)} aria-busy={savingLessons.includes(current.id)} aria-pressed={!!current.completedAt} aria-label={current.completedAt ? 'Mark as not complete' : 'Mark as complete'} title={current.completedAt ? 'Mark as not complete' : 'Mark as complete'}
-                        className={`${SETTINGS_BTN} focus-visible:ring-2 focus-visible:ring-accent-focus`}>
-                        <Check size={13} strokeWidth={2.5} aria-hidden />{savingLessons.includes(current.id) ? 'Saving…' : current.completedAt ? 'Completed' : 'Complete'}
-                    </button>
+                    {current.kind === 'lesson' && <button type="button" onClick={toggleComplete} disabled={savingLessons.includes(current.id)} aria-busy={savingLessons.includes(current.id)} aria-pressed={!!current.completedAt} aria-label={current.completedAt ? 'Mark as not complete' : 'Mark as complete'} title={current.completedAt ? 'Mark as not complete' : 'Mark as complete'}
+                        className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium transition-colors focus-visible:ring-2 focus-visible:ring-accent-focus disabled:opacity-60 ${current.completedAt ? tones.ok : 'border-accent-secondary bg-accent-subtle text-accent-primary hover:bg-bg-item-surface'}`}>
+                        {current.completedAt ? <CheckCircle2 size={13} aria-hidden /> : <Check size={13} strokeWidth={2.5} aria-hidden />}{savingLessons.includes(current.id) ? 'Saving…' : current.completedAt ? 'Completed' : 'Complete'}
+                    </button>}
                 </div>
                 {completionErrors[current.id] && (
                     <SettingsNotice tone={tones.danger} icon={<XCircle size={14} />} alert className="mt-2">
                         {completionErrors[current.id]}
-                        <button type="button" onClick={toggleComplete} className={`${SETTINGS_BTN} mt-2 focus-visible:ring-2 focus-visible:ring-accent-focus`}>Retry save</button>
+                        <LiquidGlassButton type="button" variant="clear" className="lg-sm mt-2 text-text-primary" onClick={toggleComplete}>Retry save</LiquidGlassButton>
                     </SettingsNotice>
                 )}
             </header>
 
-            {/* Body — left rail + center reading column */}
-            <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
-                <aside aria-label="Course lessons" className="flex w-44 lg:w-56 min-h-0 shrink-0 flex-col border-r border-border-subtle px-3 py-3">
-                    <h2 className="mb-2 text-xs font-semibold text-text-secondary">Lessons</h2>
-                    <input type="text" value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter lessons…"
-                        aria-label="Filter lessons" className={`${SETTINGS_INPUT} mb-2 shrink-0 placeholder:text-text-secondary`} />
+            {/* Percentage-based columns expand with the available launcher width; the study pane replaces the reader below xl. */}
+            <div className="grid min-h-0 min-w-0 flex-1 overflow-hidden [grid-template-columns:minmax(11rem,24%)_minmax(0,1fr)] xl:[grid-template-columns:minmax(12rem,20%)_minmax(0,1fr)_minmax(19rem,28%)]">
+                <aside aria-label="Course lessons" className="flex min-h-0 min-w-0 flex-col border-r border-border-subtle bg-bg-secondary px-3 py-3">
+                    <div className="mb-2 flex items-center justify-between gap-2">
+                        <h2 className="text-xs font-semibold uppercase tracking-wide text-text-secondary">Lessons</h2>
+                        <span aria-label={`${doneCount} of ${courseLessonCount} lessons complete`} className="rounded-full bg-accent-subtle px-2 py-0.5 text-[11px] tabular-nums text-accent-primary">{doneCount}/{courseLessonCount}</span>
+                    </div>
+                    <div className="mb-3 grid gap-1 rounded-lg border border-border-subtle bg-bg-elevated px-2.5 py-2 text-[11px] leading-snug text-text-secondary">
+                        <span className="flex items-center gap-1.5"><Clock3 size={12} aria-hidden className="shrink-0 text-accent-primary" />Course · {courseMinutes ? `~${courseMinutes} min${timedCourseLessons < courseLessonCount ? ` (${timedCourseLessons}/${courseLessonCount} lessons)` : ''}` : 'Time unavailable'}</span>
+                        <span className="pl-[18px]">This module · {moduleMinutes ? `~${moduleMinutes} min${timedModuleLessons < moduleLessonCount ? ` (${timedModuleLessons}/${moduleLessonCount} timed)` : ''}` : 'Time unavailable'}</span>
+                    </div>
+                    <label htmlFor="course-full-text-search" className="sr-only">Search lesson titles and content</label>
+                    <div className="relative mb-2 shrink-0">
+                        <Search size={14} aria-hidden className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-text-secondary" />
+                        <input id="course-full-text-search" type="search" value={searchQuery} onChange={(e) => { setSearchQuery(e.target.value); setSearchCollapsedModules([]); }}
+                            aria-label="Search lessons" aria-controls={query ? 'course-search-results' : undefined} aria-busy={!!query && search.status === 'loading'}
+                            placeholder="Search lessons…" className={`${SETTINGS_INPUT} w-full pl-8 placeholder:text-text-secondary`} />
+                    </div>
+                    {query && <section id="course-search-results" aria-label="Course search results" className="mb-2 max-h-36 shrink-0 overflow-y-auto border-b border-border-subtle pb-2" aria-live="polite">
+                        {search.status === 'loading' ? <p role="status" className="text-xs text-text-secondary">Searching course…</p>
+                            : search.error ? <p role="alert" className="text-xs text-text-secondary">{search.error}</p>
+                                : search.hits.length === 0 ? <p className="text-xs text-text-secondary">{titleMatches ? 'Title matches below.' : 'No content matches.'}</p>
+                                    : search.hits.map((hit) => <button key={hit.lessonId} type="button" onClick={() => openLesson(hit.lessonId)}
+                                        className="mb-1 block w-full rounded-lg px-2 py-1 text-left hover:bg-bg-elevated focus-visible:ring-2 focus-visible:ring-accent-focus">
+                                        <span className="block break-words text-xs font-medium text-text-primary">{hit.title}</span>
+                                        <span className="block break-words text-[11px] text-text-secondary">{hit.snippet}</span>
+                                    </button>)}
+                    </section>}
                     <nav aria-label="Lesson navigation" className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
-                        {visibleLessons.length === 0 ? (
-                            <p className="px-1 pb-2 pt-6 text-center text-xs text-text-secondary">No lessons match.</p>
-                        ) : visibleLessons.map((l) => {
-                            const active = l.id === activeId;
-                            return (
-                                <button key={l.id} type="button" onClick={() => { setActiveId(l.id); setRailOpen(false); }} title={l.title} aria-current={active ? 'page' : undefined}
-                                    className={`mb-0.5 flex w-full items-center gap-1.5 rounded-lg py-2 pr-2 text-left transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-focus ${DEPTH_PL[depthOf(l.tocPath)]} ${active ? 'bg-accent-subtle' : 'hover:bg-bg-elevated'}`}>
-                                    <span className={`flex shrink-0 items-center ${l.completedAt ? 'text-accent-primary' : 'text-transparent select-none'}`}><Check size={12} strokeWidth={3} aria-hidden /></span>
-                                    <span className={`min-w-0 flex-1 truncate text-xs ${active ? 'font-medium text-text-primary' : 'text-text-secondary'}`}>{l.title}</span>
-                                    {l.kind !== 'lesson' && (
-                                        <span className="shrink-0 rounded-full border border-border-subtle bg-bg-elevated px-1.5 py-0.5 text-[10px] uppercase tracking-wide leading-none text-text-secondary">{l.kind}</span>
-                                    )}
-                                </button>
-                            );
+                        {[...groups].map(([key, items], index) => {
+                            const matching = query ? items.filter((l) => l.title.toLowerCase().includes(query.toLowerCase()) || search.hits.some((hit) => hit.lessonId === l.id)) : items;
+                            if (!matching.length) return null;
+                            const count = items.filter((l) => l.kind === 'lesson').length;
+                            const done = items.filter((l) => l.kind === 'lesson' && !!l.completedAt).length;
+                            const expanded = query ? !searchCollapsedModules.includes(key) : expandedModules.includes(key);
+                            const panelId = `course-module-${index}`;
+                            const heading = key ? moduleTitle(key, overviews) : 'Course lessons (ungrouped)';
+                            return <section key={key} className="mb-2">
+                                <h3><button type="button" aria-expanded={expanded} aria-controls={panelId}
+                                    onClick={() => {
+                                        const toggle = (prev: string[]) => prev.includes(key) ? prev.filter((item) => item !== key) : [...prev, key];
+                                        if (query) setSearchCollapsedModules(toggle);
+                                        else setExpandedModules(toggle);
+                                    }}
+                                    className="flex w-full items-center gap-1.5 rounded-lg px-2 py-2 text-left text-xs font-semibold text-text-primary hover:bg-bg-elevated focus-visible:ring-2 focus-visible:ring-accent-focus">
+                                    <ChevronRight size={13} aria-hidden className={`shrink-0 transition-transform ${expanded ? 'rotate-90' : ''}`} />
+                                    <span className="min-w-0 flex-1 break-words leading-snug">{heading}</span>
+                                    <span className={`shrink-0 rounded-full px-1.5 py-0.5 text-[10px] tabular-nums ${done === count && count > 0 ? tones.ok : 'bg-bg-item-surface text-text-secondary'}`}>{done}/{count}</span>
+                                </button></h3>
+                                <div id={panelId} hidden={!expanded}>{matching.map((l) => {
+                                    const active = l.id === activeId;
+                                    return <button key={l.id} type="button" onClick={() => openLesson(l.id)} title={l.title} aria-current={active ? 'page' : undefined}
+                                        className={`mb-0.5 flex w-full items-center gap-1.5 rounded-lg py-2 pr-2 text-left transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-focus ${DEPTH_PL[depthOf(l.tocPath)]} ${active ? 'bg-accent-subtle' : 'hover:bg-bg-elevated'}`}>
+                                        <span className={`flex shrink-0 items-center ${l.completedAt ? tones.text.ok : 'text-text-tertiary'}`}>{l.completedAt ? <CheckCircle2 size={13} aria-hidden /> : <BookOpen size={12} aria-hidden />}</span>
+                                        <span className={`min-w-0 flex-1 truncate text-xs ${active ? 'font-medium text-text-primary' : 'text-text-secondary'}`}>{l.title}</span>
+                                        {l.kind !== 'lesson' && <span className="shrink-0 rounded-full border border-border-subtle bg-bg-elevated px-1.5 py-0.5 text-[10px] uppercase tracking-wide leading-none text-text-secondary">{l.kind}</span>}
+                                    </button>;
+                                })}</div>
+                            </section>;
                         })}
+                        {!!query && search.status !== 'loading' && ![...groups.values()].some((items) => items.some((l) => l.title.toLowerCase().includes(query.toLowerCase()) || search.hits.some((hit) => hit.lessonId === l.id))) &&
+                            <p className="px-1 pb-2 pt-6 text-center text-xs text-text-secondary">No lessons match your search.</p>}
                     </nav>
                 </aside>
 
@@ -388,7 +521,7 @@ const LessonReader: React.FC<LessonReaderProps> = ({ courseId, initialLessonId, 
                             <SettingsNotice tone={tones.danger} icon={<XCircle size={14} />} alert className="mb-4">
                                 {content.error}
                                 <div className="mt-2 flex flex-wrap gap-2">
-                                    <button type="button" onClick={() => setContentRetry((n) => n + 1)} className={`${SETTINGS_BTN} focus-visible:ring-2 focus-visible:ring-accent-focus`}>Retry lesson</button>
+                                    <LiquidGlassButton type="button" variant="action" className="lg-sm" onClick={() => setContentRetry((n) => n + 1)}>Retry lesson</LiquidGlassButton>
                                     {current.url && <LiquidGlassButton type="button" variant="clear" className="lg-sm" onClick={openOriginal} icon={<ExternalLink size={12} />}>Open original</LiquidGlassButton>}
                                 </div>
                             </SettingsNotice>
@@ -405,14 +538,14 @@ const LessonReader: React.FC<LessonReaderProps> = ({ courseId, initialLessonId, 
                     </article>
                 </main>
 
-                <aside ref={studyPane} tabIndex={-1} id="course-study-pane" aria-label="Study aids" className={`${railOpen ? 'flex' : 'hidden xl:flex'} min-h-0 min-w-0 flex-1 xl:flex-none xl:w-96 flex-col overflow-y-auto overscroll-contain xl:border-l border-border-subtle p-3`}>
+                <aside ref={studyPane} tabIndex={-1} id="course-study-pane" aria-label="Study aids" className={`${railOpen ? 'flex' : 'hidden xl:flex'} min-h-0 min-w-0 flex-col overflow-y-auto overscroll-contain border-l border-border-subtle bg-bg-secondary p-3`}>
                     <div className="mb-3 flex items-center justify-between gap-2">
                         <h2 className="text-xs font-semibold text-text-secondary">Study aids</h2>
                         <LiquidGlassButton type="button" variant="clear" className="lg-sm shrink-0 text-text-secondary xl:hidden" onClick={closeStudyPane} title="Close study aids" aria-label="Close study aids">
                             <X size={14} />
                         </LiquidGlassButton>
                     </div>
-                    <StudyRail key={JSON.stringify([courseId, scopeLessons.map((l) => l.id)])} courseId={courseId} scopeLessons={scopeLessons} progress={progress} externalLinks={externalLinks} />
+                    <StudyRail key={JSON.stringify([courseId, scopeLessons.map((l) => l.id)])} courseId={courseId} scopeLessons={scopeLessons} externalLinks={externalLinks} moduleLabel={label} />
                 </aside>
             </div>
         </div>

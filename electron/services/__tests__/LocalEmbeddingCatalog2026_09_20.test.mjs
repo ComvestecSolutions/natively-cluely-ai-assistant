@@ -2,7 +2,9 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import { transformSync } from 'esbuild';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -120,6 +122,72 @@ describe('Local Embedding Model Catalog (2026-09-20)', () => {
   test('revealLocalEmbeddingModelsDirectory is callable and resolves safely', async () => {
     const ok = await revealLocalEmbeddingModelsDirectory();
     assert.ok(typeof ok === 'boolean');
+  });
+});
+
+describe('Local Embedding Model Activation Probe', () => {
+  const source = readFileSync(path.join(repoRoot, 'electron/ipcHandlers.ts'), 'utf8');
+  const start = source.indexOf("  safeHandle('embedding:use-local-model'");
+  assert.ok(start >= 0, 'local-model activation handler exists');
+  const end = source.indexOf('\n  });', start);
+  assert.ok(end > start, 'local-model activation handler closes');
+  const handlerCode = transformSync(source.slice(start, end + '\n  });'.length), { loader: 'ts' }).code;
+
+  async function probeFailure(error) {
+    let handler;
+    let disposed = false;
+    const logged = [];
+    const settings = {
+      get: () => null,
+      set: () => { throw new Error('Probe failure must not change settings'); },
+    };
+    const modules = {
+      './services/SettingsManager': { SettingsManager: { getInstance: () => settings } },
+      './rag/embeddingModelCatalog': { findEmbeddingCatalogModel: () => ({ name: 'Qwen3 Embedding', supported: true, dimensions: 1024 }) },
+      './services/embeddings/localEmbeddingModelInstaller': { statusOf: () => ({ state: 'installed' }) },
+      './rag/providers/LocalEmbeddingProvider': { LocalEmbeddingProvider: class {
+        async embed() { throw error; }
+        async dispose() { disposed = true; }
+      } },
+    };
+    new Function('safeHandle', 'require', 'LOCAL_EMBEDDING_PROBE_SLOT_WAIT_MS', 'console', handlerCode)(
+      (_channel, fn) => { handler = fn; },
+      (name) => { assert.ok(modules[name], `unexpected import ${name}`); return modules[name]; },
+      100,
+      { error: (...args) => logged.push(args) },
+    );
+    const result = await handler(null, 'qwen3-embedding-0.6b-q4');
+    assert.equal(disposed, true, 'failed probe releases its provider');
+    return { result, logged };
+  }
+
+  test('missing chalk in the packaged llama runtime advises repairing the app, not the model', async () => {
+    const errors = [
+      new Error("Cannot find package 'chalk' imported from C:\\Users\\Jane\\AppData\\Local\\Natively\\app.asar.unpacked\\node_modules\\node-llama-cpp\\dist\\index.js"),
+      new Error("Cannot find module 'chalk' imported from /Users/jane/Library/Application Support/Natively/node_modules/node-llama-cpp/dist/index.js"),
+      Object.assign(new Error('Packaged runtime dependency unavailable'), { code: 'MODULE_NOT_FOUND' }),
+    ];
+    for (const error of errors) {
+      const { result, logged } = await probeFailure(error);
+      assert.equal(result.error, 'validation_failed');
+      assert.match(result.message, /reinstall or update the app/i);
+      assert.doesNotMatch(result.message, /corrupt|re-download|C:\\Users|\/Users\/jane/i);
+      assert.ok(logged.some((args) => args.includes(error)), 'original error remains available in diagnostics');
+    }
+  });
+
+  test('invalid GGUF weights retain model repair guidance', async () => {
+    const { result } = await probeFailure(new Error('Failed to load GGUF model: invalid magic bytes'));
+    assert.equal(result.error, 'validation_failed');
+    assert.match(result.message, /invalid magic bytes/);
+    assert.match(result.message, /re-downloading/i);
+    assert.doesNotMatch(result.message, /reinstall or update the app/i);
+  });
+
+  test('occupied ONNX slots retain the busy response', async () => {
+    const { result } = await probeFailure(new Error('No ONNX session slot became free'));
+    assert.equal(result.error, 'busy');
+    assert.match(result.message, /Try again in a moment/);
   });
 });
 

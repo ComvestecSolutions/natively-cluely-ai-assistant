@@ -94,6 +94,8 @@ interface ElectronAPI {
   coursesImport: (input: any) => Promise<any>;
   coursesReindex: (id: string) => Promise<any>;
   coursesLessonContent: (courseId: string, lessonId: string) => Promise<any>;
+  coursesSearch: (courseId: string, query: string) => Promise<{ ok?: boolean; disabled?: boolean; results?: Array<{ lessonId: string; title: string; snippet: string; parent: string | null }>; error?: string }>;
+  coursesLookupStudyAid: (courseId: string, type: 'summary' | 'glossary' | 'quiz' | 'flashcards', lessonIds: string[]) => Promise<{ ok?: boolean; disabled?: boolean; cached?: boolean; data?: unknown; error?: string }>;
   coursesGenerateStudyAid: (courseId: string, type: 'summary' | 'glossary' | 'quiz' | 'flashcards', lessonIds: string[], force?: boolean) => Promise<any>;
   // Courses Studio P4 portability: zip bundle export/import + cascade delete.
   coursesExportBundle: (courseId: string) => Promise<{ ok?: boolean; canceled?: boolean; path?: string; error?: string }>;
@@ -1422,6 +1424,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   coursesReindex: (id: string) => ipcRenderer.invoke('courses:reindex', { id }),
   coursesLessonContent: (courseId: string, lessonId: string) =>
     ipcRenderer.invoke('courses:lesson-content', { courseId, lessonId }),
+  coursesSearch: (courseId: string, query: string) =>
+    ipcRenderer.invoke('courses:search', { courseId, query }),
+  coursesLookupStudyAid: (courseId: string, type: 'summary' | 'glossary' | 'quiz' | 'flashcards', lessonIds: string[]) =>
+    ipcRenderer.invoke('courses:lookup-study-aid', { courseId, type, lessonIds }),
   coursesGenerateStudyAid: (courseId: string, type: 'summary' | 'glossary' | 'quiz' | 'flashcards', lessonIds: string[], force?: boolean) =>
     ipcRenderer.invoke('courses:generate-study-aid', { courseId, type, lessonIds, force }),
   // Courses Studio P4 portability: zip bundle export/import + cascade delete.
@@ -2494,8 +2500,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.removeListener('intelligence-error', subscription);
     };
   },
-  onSessionReset: (callback: () => void) => {
-    const subscription = () => callback();
+  onSessionReset: (callback: (data?: { preserveWindowSize?: boolean; phase?: 'begin' | 'complete'; success?: boolean }) => void) => {
+    const subscription = (_: any, data?: { preserveWindowSize?: boolean; phase?: 'begin' | 'complete'; success?: boolean }) => callback(data);
     ipcRenderer.on('session-reset', subscription);
     return () => {
       ipcRenderer.removeListener('session-reset', subscription);

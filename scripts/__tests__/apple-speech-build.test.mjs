@@ -196,20 +196,66 @@ test('afterPack destination is private to one target app', () => {
   });
 });
 
-test('composite afterPack builds the helper before the existing signing hook', async () => {
+test('afterPack verifies each macOS target app after the helper and before signing', async () => {
+  for (const arch of [1, 3]) {
+    const events = [];
+    const context = {
+      arch,
+      electronPlatformName: 'darwin',
+      appOutDir: path.resolve('release-fixture', `mac-${arch}`),
+      packager: { appInfo: { productFilename: 'Natively' } },
+    };
+    await runAfterPack(context, {
+      buildHelper: async (received) => {
+        assert.equal(received, context);
+        events.push('build');
+      },
+      verifyAssets: async (appPath) => {
+        assert.equal(appPath, path.join(context.appOutDir, 'Natively.app'));
+        events.push('verify');
+      },
+      signApp: async (received) => {
+        assert.equal(received, context);
+        events.push('sign');
+      },
+    });
+    assert.deepEqual(events, ['build', 'verify', 'sign']);
+  }
+});
+
+test('afterPack verifies the Windows output before signing', async () => {
   const events = [];
-  const context = { arch: 3 };
+  const context = { electronPlatformName: 'win32', appOutDir: path.resolve('release-fixture', 'win-unpacked') };
   await runAfterPack(context, {
-    buildHelper: async (received) => {
-      assert.equal(received, context);
-      events.push('build');
+    buildHelper: async () => { events.push('build'); },
+    verifyAssets: async (appPath) => {
+      assert.equal(appPath, context.appOutDir);
+      events.push('verify');
     },
-    signApp: async (received) => {
-      assert.equal(received, context);
-      events.push('sign');
-    },
+    signApp: async () => { events.push('sign'); },
+  });
+  assert.deepEqual(events, ['build', 'verify', 'sign']);
+});
+
+test('other platform targets retain their existing afterPack behavior', async () => {
+  const events = [];
+  await runAfterPack({ electronPlatformName: 'linux' }, {
+    buildHelper: async () => { events.push('build'); },
+    verifyAssets: async () => { throw new Error('only macOS and Windows are checked'); },
+    signApp: async () => { events.push('sign'); },
   });
   assert.deepEqual(events, ['build', 'sign']);
+});
+
+test('verification failure prevents signing and stops packaging', async () => {
+  let signed = false;
+  const context = { electronPlatformName: 'win32', appOutDir: path.resolve('release-fixture', 'win-unpacked') };
+  await assert.rejects(runAfterPack(context, {
+    buildHelper: async () => {},
+    verifyAssets: async () => { throw new Error('Missing chalk from packaged app'); },
+    signApp: async () => { signed = true; },
+  }), /Missing chalk/);
+  assert.equal(signed, false);
 });
 
 test('a helper build failure stops signing and therefore stops packaging', async () => {

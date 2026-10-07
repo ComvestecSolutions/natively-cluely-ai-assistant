@@ -749,8 +749,8 @@ export async function raceStreamWithDeadline(opts: {
   const streamPolicy = providerStreamPolicy(stream);
   const policy = opts.deadlinePolicy === 'caller' ? undefined : streamPolicy;
   const signal = streamPolicy?.signal;
-  const fuMs = policy?.firstUsefulDeadlineMs ?? opts.firstUsefulDeadlineMs;
-  const interTokenStallMs = policy?.interTokenStallMs ?? opts.interTokenStallMs ?? LIVE_INTER_TOKEN_STALL_MS;
+  const fuMs = policy?.noDeadlines ? Infinity : policy?.firstUsefulDeadlineMs ?? opts.firstUsefulDeadlineMs;
+  const interTokenStallMs = policy?.noDeadlines ? Infinity : policy?.interTokenStallMs ?? opts.interTokenStallMs ?? LIVE_INTER_TOKEN_STALL_MS;
   const iterator = (stream as AsyncIterable<string>)[Symbol.asyncIterator]();
   const ABORTED = Symbol('provider-stream-aborted');
   let onAbort: (() => void) | undefined;
@@ -806,7 +806,7 @@ export async function raceStreamWithDeadline(opts: {
     while (true) {
       if (shouldAbort?.()) { cleanup('aborted'); return 'aborted'; }
       let res: IteratorResult<string> | typeof DEADLINE | typeof ABORTED;
-      if (!isSpeculative) {
+      if (!isSpeculative && !policy?.noDeadlines) {
         if (!useful) useful = isUsefulYet();
         const remaining = () => !useful
           ? fuMs - (Date.now() - start)

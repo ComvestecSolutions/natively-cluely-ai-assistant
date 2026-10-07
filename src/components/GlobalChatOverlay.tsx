@@ -1,13 +1,14 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useStreamBuffer } from '../hooks/useStreamBuffer';
-import { X, Copy, Check, Globe, ArrowUp } from 'lucide-react';
-import { DiagramAwareMarkdown } from './diagram/DiagramAwareMarkdown';
+import { X, Globe, ArrowUp } from 'lucide-react';
+import { ChatResponseMarkdown } from './ChatResponseMarkdown';
+import { MessageCopyButton } from './MessageCopyButton';
 import { motion, AnimatePresence } from 'framer-motion';
 import { genMessageId } from '../utils/messageId';
 import nativelyIcon from './icon.png';
 import { getCoursePinIds } from '../lib/coursePins';
 import { useResolvedTheme } from '../hooks/useResolvedTheme';
-import { stripGistTrailer } from '../lib/displayMarkup';
+import { splitGistLineStreaming, stripGistTrailer } from '../lib/displayMarkup';
 
 // ============================================
 // Types
@@ -59,27 +60,17 @@ const UserMessage: React.FC<{ content: string }> = ({ content }) => (
         initial={{ opacity: 0, y: 8 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.15 }}
-        className="flex justify-end mb-6"
+        className="flex flex-col items-end mb-6"
     >
-        <div className="bg-[#2C2C2E] text-white px-5 py-3 rounded-2xl rounded-tr-md max-w-[70%] text-[15px] leading-relaxed">
+        <div className="bg-[#2C2C2E] text-white px-5 py-3 rounded-2xl rounded-tr-md max-w-[70%] text-[15px] leading-relaxed whitespace-pre-wrap">
             {content}
         </div>
+        <MessageCopyButton text={content} kind="prompt" className="mt-2" />
     </motion.div>
 );
 
 const AssistantMessage: React.FC<{ content: string; isStreaming?: boolean; isLatest?: boolean }> = ({ content, isStreaming, isLatest }) => {
-    const [copied, setCopied] = useState(false);
-
-    const handleCopy = async () => {
-        try {
-            await navigator.clipboard.writeText(stripGistTrailer(content));
-            setCopied(true);
-            setTimeout(() => setCopied(false), 2000);
-        } catch (err) {
-            console.error('Failed to copy:', err);
-        }
-    };
-
+    const { body } = splitGistLineStreaming(content);
     return (
         <motion.div
             initial={{ opacity: 0, y: 8 }}
@@ -88,28 +79,9 @@ const AssistantMessage: React.FC<{ content: string; isStreaming?: boolean; isLat
             className="flex flex-col items-start mb-6"
         >
             <div className="text-text-primary text-[15px] leading-relaxed max-w-[85%]">
-                {/* This chat shows answers as plain text. Its standard-chat fallback
-                    can answer a design question, so a ```mermaid block is still
-                    drawn by the shared diagram card; everything else is exactly
-                    the plain text it was. */}
-                <DiagramAwareMarkdown
-                    text={content}
-                    streaming={Boolean(isStreaming)}
-                    // Only the answer just given may be repaired by itself (one model
-                    // call); an older answer in the thread keeps its "Try to fix" button.
-                    allowAutoRepair={Boolean(isLatest)}
-                    renderMarkdown={(chunk, key) => <React.Fragment key={key}>{chunk}</React.Fragment>}
-                />
+                <ChatResponseMarkdown text={body} streaming={isStreaming} isLatest={isLatest} />
             </div>
-            {!isStreaming && content && (
-                <button
-                    onClick={handleCopy}
-                    className="flex items-center gap-2 mt-3 text-[13px] text-text-tertiary hover:text-text-secondary transition-colors"
-                >
-                    {copied ? <Check size={14} className="text-emerald-500" /> : <Copy size={14} />}
-                    {copied ? 'Copied' : 'Copy message'}
-                </button>
-            )}
+            {!isStreaming && content && <MessageCopyButton text={stripGistTrailer(content)} kind="response" className="mt-3" />}
         </motion.div>
     );
 };
@@ -178,6 +150,8 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
     // whatever the other call had already buffered, so the eventual
     // completion can render empty. A ref updates immediately, no batching.
     const submitInFlightRef = useRef(false);
+    const resetPendingRef = useRef(false);
+    const submitQuestionRef = useRef<(question: string) => void>(() => {});
     const cancelActiveTurnRef = useRef<(() => void) | null>(null);
 
     const pendingQuestionsRef = useRef<string[]>([]);
@@ -192,6 +166,33 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
             cancelActiveTurnRef.current?.();
         };
     }, [isOpen]);
+
+    useEffect(() => window.electronAPI?.onSessionReset?.((data) => {
+        if (data?.phase === 'complete') {
+            if (!resetPendingRef.current) return;
+            if (data.success === false) {
+                setErrorMessage("Couldn't finish resetting the chat. Please try Reset again.");
+                return;
+            }
+            resetPendingRef.current = false;
+            const next = pendingQuestionsRef.current.shift();
+            if (next && isOpenRef.current) submitQuestionRef.current(next);
+            return;
+        }
+        // A repeated reset after a failed drain keeps questions typed during
+        // the previous attempt; a new meeting discards outgoing turns.
+        if (data?.phase !== 'begin' || !resetPendingRef.current) pendingQuestionsRef.current = [];
+        resetPendingRef.current = data?.phase === 'begin';
+        lastInitialQueryRef.current = initialQuery;
+        cancelActiveTurnRef.current?.();
+        cancelActiveTurnRef.current = null;
+        submitInFlightRef.current = false;
+        streamBuffer.reset();
+        setMessages([]);
+        if (data?.phase !== 'begin') setQuery('');
+        setChatState('idle');
+        setErrorMessage(null);
+    }), [initialQuery, streamBuffer.reset]);
 
     // ESC key handler
     useEffect(() => {
@@ -222,7 +223,7 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
     // Submit question using global RAG
     const submitQuestion = useCallback(async (question: string) => {
         if (!question.trim() || !isOpenRef.current) return;
-        if (submitInFlightRef.current) {
+        if (resetPendingRef.current || submitInFlightRef.current) {
             pendingQuestionsRef.current.push(question);
             return;
         }
@@ -509,14 +510,19 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
             activeCleanups = [];
             policyCleanup?.();
             queryDeadline.dispose();
-            if (cancelActiveTurnRef.current === cancelTurn) cancelActiveTurnRef.current = null;
-            if (isOpenRef.current) setChatState(prev => (prev === 'error' ? prev : 'idle'));
-            streamBuffer.reset();
-            submitInFlightRef.current = false;
-            const nextQuestion = pendingQuestionsRef.current.shift();
-            if (nextQuestion && isOpenRef.current) void submitQuestion(nextQuestion);
+            // Reset can release the busy guard before the aborted IPC settles.
+            // Its old finally must not erase a newer turn's buffer or busy state.
+            if (cancelActiveTurnRef.current === cancelTurn) {
+                cancelActiveTurnRef.current = null;
+                if (isOpenRef.current) setChatState(prev => (prev === 'error' ? prev : 'idle'));
+                streamBuffer.reset();
+                submitInFlightRef.current = false;
+                const nextQuestion = pendingQuestionsRef.current.shift();
+                if (nextQuestion && isOpenRef.current) void submitQuestion(nextQuestion);
+            }
         }
     }, []);
+    submitQuestionRef.current = submitQuestion;
 
     // One cancellable dispatch per parent query/open cycle. Busy turns queue
     // instead of silently losing the launcher's next Ask-anything submission.
@@ -545,6 +551,7 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
         >
             {isOpen && (
                 <motion.div
+                    data-global-chat
                     initial={{ opacity: 0 }}
                     animate={{ opacity: 1 }}
                     exit={{ opacity: 0 }}

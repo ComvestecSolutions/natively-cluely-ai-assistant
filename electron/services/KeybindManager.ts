@@ -26,8 +26,9 @@ export const DEFAULT_KEYBINDS: KeybindConfig[] = [
     { id: 'general:toggle-mouse-passthrough', label: 'Toggle Mouse Passthrough', accelerator: 'CommandOrControl+Shift+B', isGlobal: true, defaultAccelerator: 'CommandOrControl+Shift+B' },
     { id: 'general:process-screenshots', label: 'Process Screenshots', accelerator: 'CommandOrControl+Enter', isGlobal: true, defaultAccelerator: 'CommandOrControl+Enter' },
     { id: 'general:capture-and-process', label: 'Capture Screen & Ask AI (Global)', accelerator: 'CommandOrControl+Shift+Enter', isGlobal: true, defaultAccelerator: 'CommandOrControl+Shift+Enter' },
-    // Reset is local to the focused chat or the explicitly engaged stealth-typing tap.
-    // A no-activate overlay may be visible while the user reloads a foreground browser.
+    // Default Reset is local to the focused chat or the engaged stealth-typing tap:
+    // a no-activate overlay may be visible while the user reloads a browser.
+    // A custom chord is registered globally when the user explicitly rebinds it.
     { id: 'general:reset-cancel', label: 'Reset / Cancel', accelerator: 'CommandOrControl+R', isGlobal: false, defaultAccelerator: 'CommandOrControl+R' },
     { id: 'general:take-screenshot', label: 'Take Screenshot', accelerator: 'CommandOrControl+H', isGlobal: true, defaultAccelerator: 'CommandOrControl+H' },
     { id: 'general:selective-screenshot', label: 'Selective Screenshot', accelerator: 'CommandOrControl+Shift+H', isGlobal: true, defaultAccelerator: 'CommandOrControl+Shift+H' },
@@ -149,6 +150,9 @@ export class KeybindManager {
         // every editor and browser, and the launcher moves itself with those
         // keys through its own focused handler (Launcher.tsx).
         if (actionId === 'general:toggle-visibility') return true;
+        // The default Cmd/Ctrl+R stays local (foreground browser reload must work),
+        // but a deliberate custom Reset chord must also work from the launcher.
+        if (actionId === 'general:reset-cancel') return true;
         if (actionId === 'general:toggle-mouse-passthrough') return true;
 
         // Screenshot & screen-analyze shortcuts must work globally in BOTH modes.
@@ -164,6 +168,11 @@ export class KeybindManager {
         if (actionId === 'general:capture-dom') return true;
 
         return false;
+    }
+
+    private isCustomResetChord(accelerator: string): boolean {
+        const defaultChord = DEFAULT_KEYBINDS.find(kb => kb.id === 'general:reset-cancel')!.defaultAccelerator;
+        return !!accelerator?.trim() && this.normalizeAccelerator(accelerator) !== this.normalizeAccelerator(defaultChord);
     }
 
     private normalizeAccelerator(acc: string): string {
@@ -287,12 +296,16 @@ export class KeybindManager {
                                 // EC-03 fix: mark that we resolved a conflict so we can persist below
                                 const conflictKb = this.keybinds.get(conflictId)!;
                                 conflictKb.accelerator = '';
+                                if (conflictId === 'general:reset-cancel') conflictKb.isGlobal = false;
                                 this.keybinds.set(conflictId, conflictKb);
                                 hadConflicts = true;
                             }
                         }
 
                         current.accelerator = fileKb.accelerator;
+                        if (fileKb.id === 'general:reset-cancel') {
+                            current.isGlobal = this.isCustomResetChord(current.accelerator);
+                        }
                         this.keybinds.set(fileKb.id, current);
                     }
                 }
@@ -369,11 +382,13 @@ export class KeybindManager {
             if (swappedId) {
                 const conflictKb = this.keybinds.get(swappedId)!;
                 conflictKb.accelerator = oldAccelerator; // Give the conflicting one our old shortcut
+                if (swappedId === 'general:reset-cancel') conflictKb.isGlobal = this.isCustomResetChord(oldAccelerator);
                 this.keybinds.set(swappedId, conflictKb);
             }
         }
 
         currentKb.accelerator = accelerator;
+        if (id === 'general:reset-cancel') currentKb.isGlobal = this.isCustomResetChord(accelerator);
         this.keybinds.set(id, currentKb);
 
         this.save();

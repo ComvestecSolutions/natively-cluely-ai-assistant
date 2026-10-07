@@ -59,6 +59,7 @@ const REQUIRED_PACKAGE_DIRS = [
   'node_modules/@huggingface/transformers',
   'node_modules/onnxruntime-common',
   'node_modules/onnxruntime-node',
+  'node_modules/node-llama-cpp',
 ];
 
 // Required asarUnpack globs (kept as a single source of truth for the
@@ -69,6 +70,10 @@ const REQUIRED_ASARUNPACK_GLOBS = [
   '**/node_modules/onnxruntime-node/**',
   '**/localEmbeddingWorker.js',
   '**/localRerankerWorker.js',
+  '**/ggufRerankerWorker.js',
+  '**/node_modules/node-llama-cpp/**',
+  '**/node_modules/@node-llama-cpp/**',
+  '**/node_modules/@reflink/**',
   '**/whisperWorker.js',
   // 2026-09-05: the interaction router's ONNX worker. RouterModel rewrites
   // app.asar to app.asar.unpacked when it resolves this path, and without the
@@ -98,6 +103,7 @@ const REQUIRED_ASARUNPACK_GLOBS = [
 const REQUIRED_WORKER_FILES = [
   'dist-electron/electron/rag/providers/localEmbeddingWorker.js',
   'dist-electron/electron/rag/localRerankerWorker.js',
+  'dist-electron/electron/rag/ggufRerankerWorker.js',
   'dist-electron/electron/audio/whisper/whisperWorker.js',
   'dist-electron/electron/llm/routing/routerWorker.js',
 ];
@@ -123,6 +129,8 @@ const REQUIRED_UNPACKED_NATIVE_COMMON = [
 ];
 const REQUIRED_UNPACKED_NATIVE_DARWIN = [
   'node_modules/onnxruntime-node/bin/napi-v6/darwin',
+  'node_modules/@node-llama-cpp/mac-arm64-metal',
+  'node_modules/@node-llama-cpp/mac-x64',
   'node_modules/@img/sharp-darwin-arm64/lib',
   'node_modules/@img/sharp-libvips-darwin-arm64/lib',
   'node_modules/@img/sharp-darwin-x64/lib',
@@ -145,6 +153,7 @@ const REQUIRED_UNPACKED_NATIVE_DARWIN = [
 // way the DARWIN one is.
 const REQUIRED_UNPACKED_NATIVE_WIN32 = [
   'node_modules/onnxruntime-node/bin/napi-v6/win32',
+  'node_modules/@node-llama-cpp/win-x64',
   'node_modules/@img/sharp-win32-x64/lib',
   'node_modules/sqlite-vec-windows-x64/vec0.dll',
 ];
@@ -180,6 +189,86 @@ function checkAny(root, relCandidates, label) {
   if (!found) errors.push(`Missing ${label}: tried ${relCandidates.map((r) => path.join(root, r)).join(', ')}`);
 }
 
+function checkNonemptyFile(full, label) {
+  let stat;
+  try { stat = fs.statSync(full); } catch { /* missing */ }
+  if (!stat?.isFile()) errors.push(`Missing ${label}: ${full}`);
+  else if (stat.size === 0) errors.push(`Empty ${label}: ${full}`);
+}
+
+// Both GGUF workers import node-llama-cpp as ESM from app.asar.unpacked.
+// Resolve its production dependencies from the tree being checked, not from
+// the build host: a package in app.asar cannot satisfy a physical ESM import.
+function llamaDependencyDirs(root, packaged = false) {
+  const found = new Map();
+  function visit(name, from, optional = false) {
+    let dir = from;
+    let manifest;
+    for (;;) {
+      const candidate = path.join(dir, 'node_modules', name, 'package.json');
+      if (exists(candidate)) { manifest = candidate; break; }
+      if (dir === root) break;
+      dir = path.dirname(dir);
+    }
+    if (!manifest) {
+      if (!optional) errors.push(`Missing ${packaged ? 'packaged' : 'installed'} node-llama-cpp runtime dependency: ${name}`);
+      return;
+    }
+    if (found.has(manifest)) return;
+    if (packaged) checkNonemptyFile(manifest, 'packaged dependency manifest');
+    let pkg;
+    try { pkg = JSON.parse(fs.readFileSync(manifest, 'utf8')); }
+    catch (e) {
+      errors.push(`Invalid ${packaged ? 'packaged' : 'installed'} dependency manifest: ${manifest} (${e.message})`);
+      return;
+    }
+    const rel = path.relative(root, path.dirname(manifest));
+    found.set(manifest, { name, rel });
+    if (packaged) checkPackageEntrypoint(manifest, pkg);
+    for (const dep of Object.keys(pkg.dependencies ?? {})) visit(dep, path.dirname(manifest));
+    for (const dep of Object.keys(pkg.optionalDependencies ?? {})) visit(dep, path.dirname(manifest), true);
+  }
+  visit('node-llama-cpp', root);
+  return [...found.values()];
+}
+
+function checkPackageEntrypoint(manifest, pkg) {
+  const rootExport = pkg.exports?.['.'] ?? pkg.exports;
+  const entry = typeof rootExport === 'string' ? rootExport
+    : rootExport?.import ?? rootExport?.node ?? rootExport?.default ?? pkg.main;
+  if (typeof entry !== 'string' || entry.includes('*')) return;
+  const packageDir = path.dirname(manifest);
+  const full = path.resolve(packageDir, entry);
+  if (!full.startsWith(packageDir + path.sep)) {
+    errors.push(`Invalid packaged dependency entrypoint outside package: ${full}`);
+    return;
+  }
+  const candidates = [full, `${full}.js`, `${full}.cjs`, `${full}.mjs`, path.join(full, 'index.js')];
+  const file = candidates.find((p) => {
+    try { return fs.statSync(p).isFile(); } catch { return false; }
+  });
+  if (file) checkNonemptyFile(file, 'packaged dependency entrypoint');
+  else errors.push(`Missing packaged dependency entrypoint: ${full}`);
+}
+
+function checkLlamaNativePackage(unpacked, packageName) {
+  const packageDir = path.join(unpacked, 'node_modules', '@node-llama-cpp', packageName);
+  const manifest = path.join(packageDir, 'package.json');
+  checkNonemptyFile(manifest, 'packaged llama native manifest');
+  if (exists(manifest)) {
+    try { checkPackageEntrypoint(manifest, JSON.parse(fs.readFileSync(manifest, 'utf8'))); }
+    catch (e) { errors.push(`Invalid packaged llama native manifest: ${manifest} (${e.message})`); }
+  }
+  const bins = path.join(packageDir, 'bins', packageName);
+  checkNonemptyFile(path.join(bins, 'llama-addon.node'), 'packaged llama native binary');
+  checkNonemptyFile(path.join(bins, '_nlcBuildMetadata.json'), 'packaged llama native metadata');
+  if (packageName === 'win-x64') {
+    for (const dll of ['ggml-base.dll', 'llama-common.dll']) {
+      checkNonemptyFile(path.join(bins, dll), 'packaged llama native binary');
+    }
+  }
+}
+
 function verifySource() {
   console.log('[verify-packaged-local-assets] source mode');
   const modelsRoot = path.join(repoRoot, 'resources', 'models');
@@ -193,6 +282,12 @@ function verifySource() {
   const asarUnpack = pkg?.build?.asarUnpack || [];
   for (const glob of REQUIRED_ASARUNPACK_GLOBS) {
     if (!asarUnpack.includes(glob)) errors.push(`package.json build.asarUnpack is missing required glob: ${glob}`);
+  }
+  for (const { name } of llamaDependencyDirs(repoRoot)) {
+    if (!asarUnpack.includes(`**/node_modules/${name}/**`) &&
+        !asarUnpack.includes(`**/node_modules/${name.split('/')[0]}/**`)) {
+      errors.push(`node-llama-cpp dependency is not asar-unpacked: ${name}`);
+    }
   }
   const extraResources = pkg?.build?.extraResources || [];
   const hasModels = extraResources.some((e) => (typeof e === 'object' ? e.from : e) === 'resources/models/');
@@ -242,6 +337,10 @@ function verifyPackaged(appArg, platformArg) {
   const unpacked = path.join(resources, 'app.asar.unpacked');
   for (const dir of REQUIRED_PACKAGE_DIRS) {
     if (!exists(path.join(unpacked, dir))) errors.push(`Missing unpacked dependency: app.asar.unpacked/${dir}`);
+  }
+  llamaDependencyDirs(unpacked, true);
+  for (const packageName of platform === 'darwin' ? ['mac-arm64-metal', 'mac-x64'] : ['win-x64']) {
+    checkLlamaNativePackage(unpacked, packageName);
   }
 
   // Native binaries & modules that must be present in the packaged app.

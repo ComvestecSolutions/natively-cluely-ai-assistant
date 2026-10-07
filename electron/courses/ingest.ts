@@ -21,6 +21,7 @@ import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import crypto from "node:crypto";
 
 import { htmlToCourseMarkdown } from "./markdown";
+import { getLessonDuration } from "./lessonDuration";
 import { downloadCourseAssets } from "./assets";
 import { safeCourseDirName } from "./courseDir";
 import { fetchAssessmentQuestions, renderAssessmentMarkdown } from "./assessments";
@@ -298,6 +299,7 @@ async function persistLesson(
   ref: LessonFileRef,
   orderNo: number,
   markdown: string,
+  lessonDuration?: number,
 ): Promise<void> {
   const lessonsDir = path.join(rootDir, safeCourseDirName(courseId), "lessons");
   await mkdir(lessonsDir, { recursive: true });
@@ -306,6 +308,7 @@ async function persistLesson(
     `title: ${JSON.stringify(ref.title)}`,
     `url: ${ref.url}`,
     `kind: ${ref.kind}`,
+    ...(lessonDuration === undefined ? [] : [`lessonDuration: ${lessonDuration}`]),
     ...(ref.moduleId ? [`parent: modules/${slugifyText(String(ref.moduleId))}`] : []),
     `order: ${orderNo}`,
     `updatedAt: ${new Date().toISOString()}`,
@@ -437,7 +440,11 @@ export async function runCourseImport(
         }
       }
 
-      await persistLesson(opts.rootDir, courseId, slugs[index], item, index, markdown);
+      const duration = item.kind === "lesson" ? getLessonDuration(markdown, res.body) : null;
+      await persistLesson(
+        opts.rootDir, courseId, slugs[index], item, index, markdown,
+        duration?.source === "provided" ? duration.minutes : undefined,
+      );
 
       if (item.kind === "assessment") {
         // P5 best-effort assessment capture: append extracted questions when the page embeds

@@ -56,6 +56,8 @@ export interface StreamProvider {
    * provider uses cfg.ttftTimeoutMs.
    */
   ttftTimeoutMs?: number;
+  /** A selected local generation can wait for its model or the caller to finish. */
+  noTimeout?: boolean;
   /**
    * Optional intra-family HEDGE partner. When set AND cfg.hedgeEnabled, the
    * engine opens this provider normally, then — if no first token has arrived
@@ -571,12 +573,12 @@ export async function* runStreamingFallback(
         let ttftTimer: ReturnType<typeof setTimeout> | null = null;
         // Per-provider TTFT budget when set (e.g. Pro is slower), else config default.
         const providerTtftMs = provider.ttftTimeoutMs ?? cfg.ttftTimeoutMs;
-        const ttft = new Promise<never>((_, rej) => {
+        const ttft = provider.noTimeout ? null : new Promise<never>((_, rej) => {
           ttftTimer = setTimeout(() => { try { ctrl.abort(); } catch { } rej(new Error('ttft-timeout')); }, providerTtftMs);
         });
         let first: IteratorResult<string>;
         try {
-          first = await Promise.race([firstNext, ttft]);
+          first = ttft ? await Promise.race([firstNext, ttft]) : await firstNext;
         } finally {
           if (ttftTimer) clearTimeout(ttftTimer);
         }
@@ -628,10 +630,10 @@ export async function* runStreamingFallback(
           try {
             const nextChunk = it.next();
             nextChunk.catch(() => { });
-            const stall = new Promise<never>((_, rej) => {
+            const stall = provider.noTimeout ? null : new Promise<never>((_, rej) => {
               stallTimer = setTimeout(() => { try { ctrl.abort(); } catch { } rej(new Error('interchunk-stall')); }, cfg.interChunkTimeoutMs);
             });
-            next = await Promise.race([nextChunk, stall]);
+            next = stall ? await Promise.race([nextChunk, stall]) : await nextChunk;
           } catch (drainErr: any) {
             warn(`[${cfg.logPrefix}] ${provider.name} interrupted mid-stream after commit: ${drainErr?.message || drainErr}`);
             // A caller that asked for post-commit errors gets them here too — this is

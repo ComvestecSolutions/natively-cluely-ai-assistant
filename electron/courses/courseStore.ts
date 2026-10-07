@@ -278,6 +278,7 @@ export class CourseStore {
        ON CONFLICT(url) DO UPDATE SET
          title = excluded.title,
          kind = excluded.kind,
+         parent = excluded.parent,
          order_no = excluded.order_no,
          toc_path = excluded.toc_path,
          local_md_path = COALESCE(excluded.local_md_path, course_lessons.local_md_path),
@@ -319,7 +320,7 @@ export class CourseStore {
 
   countCourseStats(courseId: string): { lessons: number; chunks: number } {
     const lessonRow = this.db
-      .prepare('SELECT COUNT(*) AS count FROM course_lessons WHERE course_id = ?')
+      .prepare("SELECT COUNT(*) AS count FROM course_lessons WHERE course_id = ? AND kind = 'lesson'")
       .get(courseId) as { count: number };
     const chunkRow = this.db
       .prepare('SELECT COUNT(*) AS count FROM course_chunks WHERE course_id = ?')

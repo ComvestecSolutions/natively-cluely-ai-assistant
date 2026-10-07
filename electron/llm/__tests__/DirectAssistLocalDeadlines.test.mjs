@@ -126,17 +126,20 @@ for (const [name, options, afterAnswer] of [
   });
 }
 
-test('actual local body silence is bounded at 60s, with one sanitized failure and no replay', async t => {
+test('actual local body silence is unbounded until the caller cancels, with no replay', async t => {
   const h = harness(t); await flush();
   t.mock.timers.tick(40_000); await flush();
   h.requests[0].body.enqueue(Buffer.from(reasoning)); await flush();
-  t.mock.timers.tick(59_999); await flush();
+  let settled = false;
+  h.pending.then(() => { settled = true; });
+  t.mock.timers.tick(300_001); await flush();
+  assert.equal(settled, false);
   assert.equal(h.requests[0].signal.aborted, false);
-  t.mock.timers.tick(2); await flush();
-  assert.equal((await h.pending).state, 'failed');
+  h.ctrl.abort(); await flush();
+  assert.equal((await h.pending).state, 'cancelled');
   assert.equal(h.requests[0].signal.aborted, true);
   assert.equal(h.requests.length, 1);
-  assert.equal(h.events.filter(e => e.type === 'error').length, 1);
+  assert.equal(h.events.filter(e => e.type === 'error').length, 0);
   assert.doesNotMatch(JSON.stringify(h.events), /PRIVATE/);
 });
 
@@ -245,12 +248,11 @@ test('synchronous cloud open errors retain the normal retry path', async () => {
   assert.equal(visible(events), 'Cloud answer.');
 });
 
-test('actual cloud custom and Ollama streams without published timing do not acquire a local policy', () => {
+test('remote custom keeps cloud timing while local Ollama has no implicit deadline', () => {
   const remote = helper('custom');
   remote.customProvider.curlCommand = remote.customProvider.curlCommand.replace('http://127.0.0.1:1234', 'https://remote.example');
   const { providerStreamPolicy } = require('../../../dist-electron/electron/llm/providerStreamPolicy.js');
-  for (const provider of ['custom', 'ollama']) {
-    const stream = remote.streamDirectAssist({ requestId: 'remote', selection: input(provider).selection, systemPrompt: 's', userPrompt: 'u', imagePaths: [] });
-    assert.equal(providerStreamPolicy(stream), undefined);
-  }
+  const request = provider => ({ requestId: 'remote', selection: input(provider).selection, systemPrompt: 's', userPrompt: 'u', imagePaths: [] });
+  assert.equal(providerStreamPolicy(remote.streamDirectAssist(request('custom'))), undefined);
+  assert.equal(providerStreamPolicy(remote.streamDirectAssist(request('ollama')))?.noDeadlines, true);
 });

@@ -62,7 +62,7 @@ function fakeFetch(t) {
   return requests;
 }
 for (const lane of ['custom', 'curl', 'what-to-answer']) {
-  test(`${lane}: actual selected live stream survives 40s warmup and 160s hidden reasoning under caller route default`, async t => {
+  test(`${lane}: actual selected live stream survives over five minutes of warmup and hidden reasoning`, async t => {
     const requests = fakeFetch(t);
     t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     const h = helper();
@@ -77,7 +77,7 @@ for (const lane of ['custom', 'curl', 'what-to-answer']) {
       isUsefulYet: () => text.trim().length >= 5, onToken: x => { text += x; }, onCleanup: reason => { if (reason !== 'done') ctrl.abort(); } });
     await flush();
     assert.equal(requests.length, 1);
-    t.mock.timers.tick(40_000); await flush();
+    t.mock.timers.tick(300_001); await flush();
     const warmupAborted = requests[0].signal.aborted;
     if (!warmupAborted) {
       requests[0].body.enqueue(Buffer.from(reasoning)); await flush();
@@ -96,6 +96,137 @@ for (const lane of ['custom', 'curl', 'what-to-answer']) {
     assert.equal(requests[0].payload.stream, true);
   });
 }
+for (const lane of ['custom', 'curl', 'provider-override']) {
+  test(`${lane}: explicitly local provider on a public URL has no transport deadline`, async t => {
+    const requests = fakeFetch(t);
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const p = { ...provider('https://selected.example/v1/chat/completions'), localOnly: true };
+    const h = helper(p);
+    if (lane === 'curl') { h.activeCurlProvider = p; h.customProvider = null; }
+    const ctrl = new AbortController();
+    const stream = lane === 'curl' ? h.streamWithDirectCurl(p, 'question', 'system', [], ctrl.signal)
+      : h.streamWithCustom('question', undefined, undefined, 'system', ctrl.signal, lane === 'provider-override' ? p : undefined, lane === 'provider-override');
+    const pending = collect(stream);
+    pending.catch(() => {});
+    try {
+      await flush();
+      assert.equal(requests.length, 1);
+      t.mock.timers.tick(300_001); await flush();
+      assert.equal(requests[0].signal.aborted, false, 'an explicitly local selection must not get a cloud transport timer');
+      requests[0].body.enqueue(Buffer.from(delta('answer') + 'data:[DONE]\n\n'));
+      requests[0].body.close();
+      assert.equal(await pending, 'answer');
+    } finally { ctrl.abort(); }
+  });
+}
+for (const lane of ['chatWithCurl', 'executeCustomProvider']) {
+  test(`${lane}: explicitly local provider on a public URL has no buffered transport deadline`, async t => {
+    const requests = fakeFetch(t);
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const p = { ...provider('https://selected.example/v1/chat/completions'), localOnly: true };
+    const h = helper(p);
+    h.activeCurlProvider = p;
+    const ctrl = new AbortController();
+    const pending = lane === 'chatWithCurl'
+      ? h.chatWithCurl('question', 'system', undefined, ctrl.signal)
+      : h.executeCustomProvider(p.curlCommand, 'question', 'system', 'question', '', undefined, p.responsePath, ctrl.signal);
+    pending.catch(() => {});
+    try {
+      await flush();
+      assert.equal(requests.length, 1);
+      t.mock.timers.tick(300_001); await flush();
+      assert.equal(requests[0].signal.aborted, false, 'an explicitly local selection must not get a cloud transport timer');
+      requests[0].body.enqueue(Buffer.from(delta('answer') + 'data:[DONE]\n\n'));
+      requests[0].body.close();
+      assert.equal(await pending, 'answer');
+    } finally { ctrl.abort(); }
+  });
+}
+test('selected local screenshot has no first-token or inter-chunk time limit', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const h = helper();
+  Object.assign(h, {
+    visionHealth: new Map(), codexCliConfig: { model: 'none', enabled: false },
+    modelVersionManager: { getAllVisionTiers: () => [], onModelError: async () => {} },
+    maybeProbeSelectedVision: () => {},
+    getDirectAssistSelection: () => ({ provider: 'custom', model: 'qwen-local' }),
+    visionVerdict: () => ({ reads: 'yes' }),
+    isCodexAvailable: () => false,
+    antigravityFallbackModel: () => null,
+    hasNatively: () => false,
+  });
+  const ctrl = new AbortController();
+  t.after(() => ctrl.abort());
+  const requests = [];
+  let releaseAnswer;
+  let releaseTail;
+  h.streamWithCustom = async function* (_message, _context, _images, _system, signal) {
+    requests.push(signal);
+    await new Promise((resolve, reject) => {
+      releaseAnswer = resolve;
+      signal.addEventListener('abort', () => reject(new Error('aborted before answer')), { once: true });
+    });
+    yield 'The answer is A.';
+    await new Promise((resolve, reject) => {
+      releaseTail = resolve;
+      signal.addEventListener('abort', () => reject(new Error('aborted during reasoning')), { once: true });
+    });
+    yield ' Explanation.';
+  };
+  const pending = collect(h.streamVisionWithFallback({
+    userContent: 'Question with course material', message: 'Analyze this screenshot',
+    imagePaths: ['screenshot.png'], systemPrompt: 'Answer from the image',
+  }, ctrl.signal));
+  pending.catch(() => {});
+  await flush();
+  assert.equal(requests.length, 1, 'the selected local vision provider must lead');
+  t.mock.timers.tick(300_001); await flush();
+  assert.equal(requests[0].aborted, false, 'local generation must not be cancelled at the five-minute deadline');
+  releaseAnswer(); await flush();
+  t.mock.timers.tick(300_001); await flush();
+  assert.equal(requests[0].aborted, false, 'local reasoning after an answer chunk must not be truncated');
+  releaseTail();
+  assert.equal(await pending, 'The answer is A. Explanation.');
+  assert.equal(requests.length, 1, 'do not repeat an accepted local generation');
+});
+
+test('selected Ollama screenshot and live answer have no implicit time limit', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const h = helper();
+  Object.assign(h, {
+    customProvider: null, activeCurlProvider: null, useOllama: true,
+    ollamaVisionModel: 'qwen3-vl:8b', visionHealth: new Map(),
+    codexCliConfig: { model: 'none', enabled: false },
+    modelVersionManager: { getAllVisionTiers: () => [], onModelError: async () => {} },
+    maybeProbeSelectedVision: () => {},
+    getDirectAssistSelection: () => ({ provider: 'ollama', model: 'qwen3-vl:8b' }),
+    visionVerdict: () => ({ reads: 'yes' }),
+    isCodexAvailable: () => false, antigravityFallbackModel: () => null,
+    hasNatively: () => false,
+  });
+  const ctrl = new AbortController(); t.after(() => ctrl.abort());
+  let finish;
+  let requests = 0;
+  h.streamWithOllama = async function* () {
+    requests++;
+    await new Promise(resolve => { finish = resolve; });
+    yield 'Ollama read the screenshot.';
+  };
+  const pending = collect(h.streamVisionWithFallback({
+    userContent: 'q', message: 'q', imagePaths: ['screenshot.png'], systemPrompt: 's',
+  }, ctrl.signal));
+  pending.catch(() => {});
+  await flush();
+  assert.equal(requests, 1);
+  t.mock.timers.tick(300_001); await flush();
+  assert.equal(ctrl.signal.aborted, false);
+  finish();
+  assert.equal(await pending, 'Ollama read the screenshot.');
+  assert.equal(requests, 1);
+  const { providerStreamPolicy } = require('../../../dist-electron/electron/llm/providerStreamPolicy.js');
+  assert.equal(providerStreamPolicy(h.streamChat(...args(ctrl.signal)))?.noDeadlines, true);
+});
+
 test('explicit Fast Response pick retains the caller deadline even when active model is local', async t => {
   fakeFetch(t); t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   const h = helper(); const ctrl = new AbortController();
@@ -172,27 +303,36 @@ for (const lane of ['custom', 'curl']) {
     assert.equal(text, '');
   });
 }
-test('local body silence is still bounded with meaningful sanitized errors', async t => {
+test('local body silence waits for user cancellation instead of timing out', async t => {
   const requests = fakeFetch(t); t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   const ctrl = new AbortController(); t.after(() => ctrl.abort());
   let text = '';
   const pending = raceStreamWithDeadline({ stream: helper().streamChat(...args(ctrl.signal)), firstUsefulDeadlineMs: 15000,
     isUsefulYet: () => false, onToken: x => { text += x; } });
   await flush(); requests[0].body.enqueue(Buffer.from(reasoning)); await flush();
-  t.mock.timers.tick(60001); await flush();
-  assert.equal(await pending, 'done'); // legacy live contract reports failure as safe Error: prose
-  assert.match(text, /Error: Custom provider timed out waiting for response data/);
-  assert.doesNotMatch(text, /PRIVATE|Error streaming from custom provider/);
+  let settled = false;
+  pending.then(() => { settled = true; });
+  t.mock.timers.tick(300_001); await flush();
+  assert.equal(settled, false);
+  assert.equal(requests[0].signal.aborted, false);
+  ctrl.abort(); await flush();
+  assert.equal(await pending, 'aborted');
+  assert.equal(text, '');
   assert.equal(requests.length, 1);
 });
-test('outer local warmup remains bounded even if preparation never reaches fetch', async t => {
+test('outer local warmup waits for caller cancellation even before fetch', async t => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   const h = helper(); const ctrl = new AbortController();
   h._streamChatInner = async function* () { await new Promise(resolve => ctrl.signal.addEventListener('abort', resolve, { once: true })); };
   const pending = raceStreamWithDeadline({ stream: h.streamChat(...args(ctrl.signal)), firstUsefulDeadlineMs: 15000,
     isUsefulYet: () => false, onToken: () => {}, onCleanup: () => ctrl.abort() });
-  await flush(); t.mock.timers.tick(300001); await flush();
-  assert.equal(await pending, 'first_useful_timeout');
+  await flush();
+  let settled = false;
+  pending.then(() => { settled = true; });
+  t.mock.timers.tick(300_001); await flush();
+  assert.equal(settled, false);
+  ctrl.abort(); await flush();
+  assert.equal(await pending, 'aborted');
 });
 test('unknown custom backend errors explain configuration failure without disclosing their message', async () => {
   const h = helper();
@@ -292,16 +432,17 @@ for (const selected of ['custom', 'antigravity']) {
     assert.equal(calls.sparePlans, 0);
   });
 }
-test('reasoning that never produces an answer cannot extend the existing five-minute transport ceiling', async t => {
+test('continuous local reasoning has no five-minute ceiling and still honors cancellation', async t => {
   const requests = fakeFetch(t); t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   const ctrl = new AbortController(); t.after(() => ctrl.abort());
   const pending = collect(helper().streamChat(...args(ctrl.signal)));
   await flush(); requests[0].body.enqueue(Buffer.from(reasoning)); await flush();
   for (let i = 0; i < 14; i++) { t.mock.timers.tick(20000); requests[0].body.enqueue(Buffer.from(reasoning)); await flush(); }
-  t.mock.timers.tick(20001); await flush();
+  t.mock.timers.tick(20_001); await flush();
+  assert.equal(requests[0].signal.aborted, false);
+  ctrl.abort(); await flush();
   const answer = await pending;
-  assert.match(answer, /Error: Custom provider timed out waiting for response data/);
-  assert.doesNotMatch(answer, /PRIVATE_REASONING/);
+  assert.equal(answer, '');
   assert.equal(requests.length, 1);
 });
 test('raw Direct Assist exposes the frozen local rung policy even if a remote provider is active', async t => {
@@ -313,6 +454,7 @@ test('raw Direct Assist exposes the frozen local rung policy even if a remote pr
   const policy = providerStreamPolicy(stream);
   assert.equal(policy.firstUsefulDeadlineMs, 300000);
   assert.equal(policy.interTokenStallMs, 60000);
+  assert.equal(policy.noDeadlines, true);
   assert.equal(requests.length, 0);
   const pending = collect(stream); await flush();
   t.mock.timers.tick(90000); await flush();

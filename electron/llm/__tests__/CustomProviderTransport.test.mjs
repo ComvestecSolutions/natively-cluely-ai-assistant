@@ -144,7 +144,7 @@ test('caller cancellation during reasoning closes the request without retry or e
   assert.equal(await collect(helper(p).streamWithCustom('q', undefined, undefined, 'sys', ctrl.signal)), '');
   assert.equal(posts.length, 1);
 });
-test('strict local warmup is not aborted by the 15s cloud connect budget', async t => {
+test('strict local warmup has no wall-clock deadline', async t => {
   const p = provider();
   const originalFetch = globalThis.fetch;
   let signal, finish;
@@ -161,7 +161,7 @@ test('strict local warmup is not aborted by the 15s cloud connect budget', async
     const pending = collect(helper(p).streamWithCustom('q', undefined, undefined, 'sys', ctrl.signal, p, true));
     pending.catch(() => {});
     assert.ok(signal);
-    t.mock.timers.tick(30_001);
+    t.mock.timers.tick(300_001);
     const wasAborted = signal.aborted;
     finish();
     if (wasAborted) ctrl.abort();
@@ -387,7 +387,21 @@ test('remote strict providers retain the 15s connect timeout, not the local warm
     await rejected;
   } finally { globalThis.fetch = originalFetch; t.mock.timers.reset(); }
 });
-test('warmup after local headers remains bounded by the existing five-minute total deadline', async t => {
+test('explicitly remote selection at a loopback URL retains cloud connect timeout', async t => {
+  const p = provider({ localOnly: false });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (_url, opts) => new Promise((_resolve, reject) => {
+    opts.signal.addEventListener('abort', () => reject(new Error('PRIVATE network configuration')), { once: true });
+  });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const pending = collect(helper(p).streamWithDirectCurl(p, 'q', 's', []));
+    const rejected = assert.rejects(pending, e => { assert.equal(e.code, 'CONNECT_TIMEOUT'); return true; });
+    t.mock.timers.tick(15_001);
+    await rejected;
+  } finally { globalThis.fetch = originalFetch; t.mock.timers.reset(); }
+});
+test('warmup after local headers waits beyond five minutes until user cancellation', async t => {
   const p = provider();
   const originalFetch = globalThis.fetch;
   let cancelled = false;
@@ -396,13 +410,14 @@ test('warmup after local headers remains bounded by the existing five-minute tot
   }), { headers: { 'Content-Type': 'text/event-stream' } });
   t.mock.timers.enable({ apis: ['setTimeout'] });
   try {
-    const pending = collect(helper(p).streamWithCustom('q', undefined, undefined, 's'));
-    const rejected = assert.rejects(pending, /timed out/);
+    const ctrl = new AbortController();
+    const pending = collect(helper(p).streamWithCustom('q', undefined, undefined, 's', ctrl.signal));
     for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
-    t.mock.timers.tick(120_001);
+    t.mock.timers.tick(300_001);
     assert.equal(cancelled, false);
-    t.mock.timers.tick(180_000);
-    await rejected;
+    ctrl.abort();
+    assert.equal(await pending, '');
+    assert.equal(cancelled, true);
   } finally { globalThis.fetch = originalFetch; t.mock.timers.reset(); }
 });
 test('oversized unterminated SSE frames fail boundedly without exposing the payload', async () => {
@@ -415,7 +430,7 @@ test('oversized unterminated SSE frames fail boundedly without exposing the payl
   });
   assert.equal(posts.length, 1);
 });
-test('idle timeout still covers the body after headers and is not reported as user cancellation', async t => {
+test('local reasoning silence after headers waits for cancellation', async t => {
   const p = provider();
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (_url, opts) => new Response(new ReadableStream({
@@ -426,14 +441,12 @@ test('idle timeout still covers the body after headers and is not reported as us
   }), { headers: { 'Content-Type': 'text/event-stream' } });
   t.mock.timers.enable({ apis: ['setTimeout'] });
   try {
-    const pending = collect(helper(p).streamWithCustom('q', undefined, undefined, 's', undefined, p, true));
-    const rejected = assert.rejects(pending, e => {
-      assert.equal(e.code, 'STREAM_IDLE_TIMEOUT');
-      assert.doesNotMatch(e.message, /PRIVATE/);
-      return true;
-    });
+    const ctrl = new AbortController();
+    const pending = collect(helper(p).streamWithCustom('q', undefined, undefined, 's', ctrl.signal, p, true));
     for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
-    t.mock.timers.tick(60_001);
-    await rejected;
+    t.mock.timers.tick(300_001);
+    assert.equal(ctrl.signal.aborted, false);
+    ctrl.abort();
+    assert.equal(await pending, '');
   } finally { globalThis.fetch = originalFetch; t.mock.timers.reset(); }
 });

@@ -62,10 +62,11 @@ function env(t, platform, { keyring = true } = {}) {
     cm.init();
     return cm;
   }
-  function ipc(cm, { runtimeDenied = false } = {}) {
+  function ipc(cm, { runtimeDenied = false, llmHelper = null } = {}) {
     const handlers = new Map(); const events = []; const module = { exports: {} };
     vm.runInNewContext(compile(customRegion), {
       module, exports: module.exports, console: consoleStub, Error,
+      appState: { processingHelper: { getLLMHelper: () => llmHelper } },
       TEXT_PLACEHOLDER_RE: /\{\{\s*TEXT\s*\}\}/,
       safeHandle: (channel, fn) => handlers.set(channel, fn),
       require: (id) => { assert.equal(id, './services/CredentialsManager'); return { CredentialsManager: { getInstance: () => cm } }; },
@@ -85,6 +86,55 @@ function env(t, platform, { keyring = true } = {}) {
 }
 
 for (const platform of ['darwin', 'win32']) {
+  test(`${platform}: editing the selected local provider updates this session's routing without a restart`, async t => {
+    const e = env(t, platform); const cm = e.manager();
+    assert.equal(cm.saveCurlProvider(provider), true);
+    const active = { ...provider };
+    const selections = [];
+    const llmHelper = {
+      active,
+      getActiveCustomProvider() { return this.active; },
+      getActiveCurlProvider() { return null; },
+      setModel(id, providers) {
+        selections.push(id);
+        this.active = providers.find(p => p.id === id);
+      },
+    };
+    const api = e.ipc(cm, { llmHelper });
+    const edited = { ...provider, curlCommand: provider.curlCommand.replace('localhost:1234', 'localhost:5678') };
+    assert.equal((await api.save(edited)).success, true);
+    assert.equal(e.manager().getCurlProviders()[0].curlCommand, edited.curlCommand, 'a restart reads the edit');
+    assert.equal(llmHelper.getActiveCustomProvider().curlCommand, edited.curlCommand, 'the next request uses the edited endpoint');
+    assert.deepEqual(selections, [provider.id]);
+  });
+
+  test(`${platform}: editing the selected cURL provider refreshes it without switching modes`, async t => {
+    const e = env(t, platform); const cm = e.manager();
+    assert.equal(cm.saveCurlProvider(provider), true);
+    const calls = [];
+    const llmHelper = {
+      active: { ...provider },
+      getActiveCustomProvider() { return null; },
+      getActiveCurlProvider() { return this.active; },
+      switchToCurl(value) { calls.push('curl'); this.active = value; },
+      setModel() { calls.push('model'); },
+    };
+    const edited = { ...provider, curlCommand: provider.curlCommand.replace('localhost:1234', 'localhost:5678') };
+    assert.equal((await e.ipc(cm, { llmHelper }).save(edited)).success, true);
+    assert.equal(llmHelper.active.curlCommand, edited.curlCommand);
+    assert.deepEqual(calls, ['curl']);
+  });
+
+  test(`${platform}: saving another provider does not change the active selection`, async t => {
+    const e = env(t, platform); const cm = e.manager();
+    const llmHelper = {
+      getActiveCustomProvider: () => ({ ...provider, id: 'selected' }),
+      getActiveCurlProvider: () => null,
+      setModel: () => assert.fail('unrelated provider save must not switch models'),
+    };
+    assert.equal((await e.ipc(cm, { llmHelper }).save(provider)).success, true);
+  });
+
   test(`${platform}: denied save/delete are not acknowledged and intact providers recover on next healthy load`, async t => {
     const e = env(t, platform); let cm = e.manager();
     cm.saveCustomProvider({ ...provider, name: 'Legacy provider' }); cm.saveCurlProvider(provider);

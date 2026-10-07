@@ -54,6 +54,7 @@ function harness() {
     return () => set.delete(callback);
   };
   const api = {
+    onSessionReset: subscribe('session-reset'),
     onChatStreamPolicy: subscribe('policy'),
     onRAGStreamChunk: subscribe('chunk'),
     onRAGStreamComplete: subscribe('done'),
@@ -110,6 +111,20 @@ function harness() {
     }
   }
   function emit(channel, data) { [...(listeners.get(channel) ?? [])].forEach((fn) => fn(data)); }
+  function input() {
+    const visit = (node) => {
+      if (!node || typeof node !== 'object') return null;
+      if (node.type === 'input') return node;
+      for (const child of node.children ?? []) {
+        const found = visit(child);
+        if (found) return found;
+      }
+      return null;
+    };
+    const found = visit(tree);
+    assert.ok(found, 'launcher chat input is mounted');
+    return found.props;
+  }
   async function finish(text = 'Answer') {
     emit('chunk', { global: true, chunk: text });
     emit('done', { global: true });
@@ -129,14 +144,86 @@ function harness() {
     now = end;
     await settle();
   }
-  return { render, requests, slots, timers, api, settle, advance, advanceShortTimers, finish, emit,
-    listenerCount: () => [...listeners.values()].reduce((n, set) => n + set.size, 0),
+  return { render, requests, slots, timers, api, settle, advance, advanceShortTimers, finish, emit, input,
+    listenerCount: () => [...listeners].filter(([channel]) => channel !== 'session-reset').reduce((n, [, set]) => n + set.size, 0),
     setPins: (next) => { pins = next; },
     unmount() { slots.forEach((slot) => slot?.cleanup?.()); },
   };
 }
 
 const open = (initialQuery) => ({ isOpen: true, initialQuery, onClose() {} });
+
+test('explicit reset clears launcher chat, cancels queued work and ignores stale stream completion', async () => {
+  const h = harness();
+  h.render(open('old question'));
+  await h.advanceShortTimers();
+  h.emit('chunk', { global: true, requestId: h.requests[0].requestId, chunk: 'old answer' });
+  h.render(open('queued question'));
+  await h.advanceShortTimers();
+  h.emit('session-reset', { preserveWindowSize: true });
+  await h.settle();
+  assert.equal(h.slots[0].length, 0, 'old bubbles are gone');
+  assert.equal(h.slots[1], 'idle', 'the input is ready for a new turn');
+  h.render(open('fresh question'));
+  await h.advanceShortTimers();
+  assert.deepEqual(h.requests.map(r => r.question), ['old question', 'fresh question']);
+  h.requests[0].resolve({ success: true });
+  h.emit('chunk', { global: true, requestId: h.requests[0].requestId, chunk: 'stale text' });
+  await h.settle();
+  assert.equal(h.slots[0].some(m => /old|queued|stale/.test(m.content)), false);
+  await h.finish('new answer');
+});
+
+test('reset blocks new launcher submissions during cleanup and preserves queued turns and drafts on completion', async () => {
+  const h = harness();
+  h.render(open('old question'));
+  await h.advanceShortTimers();
+  const old = h.requests[0];
+  h.emit('session-reset', { preserveWindowSize: true, phase: 'begin' });
+  await h.settle();
+  assert.equal(h.slots[0].length, 0, 'both chats clear when reset starts');
+  h.input().onChange({ target: { value: 'new question' } });
+  h.render();
+  h.input().onKeyDown({ key: 'Enter', preventDefault() {} });
+  await h.settle();
+  assert.equal(h.requests.length, 1, 'new question is queued, never sent against old context');
+  h.input().onChange({ target: { value: 'unsent draft' } });
+  h.render(open('parent question during cleanup'));
+  await h.advanceShortTimers();
+  assert.equal(h.requests.length, 1, 'parent-driven queries also wait for cleanup');
+  old.resolve({ success: true });
+  await h.settle();
+  assert.equal(h.input().value, 'unsent draft');
+  h.emit('session-reset', { preserveWindowSize: true, phase: 'complete', success: true });
+  await h.settle();
+  assert.deepEqual(h.requests.map(r => r.question), ['old question', 'new question']);
+  assert.equal(h.input().value, 'unsent draft', 'completion cannot erase text typed during cleanup');
+  assert.ok(h.slots[0].some(m => m.content === 'new question'), 'completion cannot erase the newly dispatched turn');
+  await h.finish('new answer');
+  assert.deepEqual(h.requests.map(r => r.question), ['old question', 'new question', 'parent question during cleanup']);
+  await h.finish('parent answer');
+});
+
+test('failed cleanup keeps typed launcher questions queued until a successful retry', async () => {
+  const h = harness();
+  h.render(open('old question'));
+  await h.advanceShortTimers();
+  h.emit('session-reset', { preserveWindowSize: true, phase: 'begin' });
+  await h.settle();
+  h.input().onChange({ target: { value: 'question during failure' } });
+  h.render();
+  h.input().onKeyDown({ key: 'Enter', preventDefault() {} });
+  h.emit('session-reset', { preserveWindowSize: true, phase: 'complete', success: false });
+  await h.settle();
+  assert.equal(h.requests.length, 1);
+  assert.equal(h.slots[1], 'idle');
+  assert.match(h.slots[2], /resetting the chat/i);
+  h.emit('session-reset', { preserveWindowSize: true, phase: 'begin' });
+  h.emit('session-reset', { preserveWindowSize: true, phase: 'complete', success: true });
+  await h.settle();
+  assert.deepEqual(h.requests.map(r => r.question), ['old question', 'question during failure']);
+  await h.finish();
+});
 
 test('initial global query subscribes before invoking IPC and forwards course pins', async () => {
   const h = harness();

@@ -84,6 +84,92 @@ function rendererRig() {
   return { scope, state, refs };
 }
 
+test('explicit chat reset clears the active renderer without resizing its window', async () => {
+  const { scope, state } = rendererRig();
+  const dimensions = { width: 732, height: 510 };
+  scope.window.innerHeight = dimensions.height;
+  scope.window.electronAPI.updateContentDimensionsCentered = size => {
+    assert.deepEqual(size, dimensions, 'reset must not request different bounds');
+    return Promise.resolve(dimensions);
+  };
+  scope.customOverlayHeightRef = { current: null };
+  scope.setHeightPinned = value => { state.heightPinned = value; };
+  await scope.resetConversation();
+  assert.deepEqual(Array.from(state.messages), []);
+  assert.equal(scope.customOverlayHeightRef.current, dimensions.height, 'empty chat keeps the current window height');
+  assert.equal(state.heightPinned, true);
+  const onSessionReset = find(renderer, n => ts.isCallExpression(n) && n.expression.getText(renderer) === 'window.electronAPI.onSessionReset');
+  const onBroadcast = execute(onSessionReset.arguments[0], renderer, {
+    console: { log() {} }, resetChatStateRef: { current: scope.resetChatState },
+    chatResetPendingRef: { current: false }, window: scope.window,
+    setCustomWindowWidth: () => assert.fail('chat clear must not reset the window width'),
+    setAppliedWindowWidth: () => assert.fail('chat clear must not reset the applied width'),
+  });
+  onBroadcast({ preserveWindowSize: true, phase: 'begin' });
+  const epoch = scope.chatResetEpochRef.current;
+  onBroadcast({ preserveWindowSize: true, phase: 'complete', success: true });
+  assert.equal(scope.chatResetEpochRef.current, epoch, 'completion cannot clear a fresh turn again');
+  assert.equal(scope.customOverlayHeightRef.current, dimensions.height);
+  assert.equal(state.heightPinned, true);
+  const body = ipcCallback('reset-intelligence').getText(ipc);
+  assert.match(body, /send\('session-reset',\s*\{\s*preserveWindowSize:\s*true,\s*phase/,
+    'explicit reset must distinguish chat clear from meeting reset (which discards size)');
+});
+
+test('reset IPC clears both windows before async cleanup and only releases them afterward', async () => {
+  const sent = [];
+  let release;
+  const appState = {
+    getIntelligenceManager: () => ({ reset() {} }), clearQueues() {},
+    resetConversationTransientState: () => new Promise(done => { release = done; }),
+  };
+  const scope = {
+    console, _chatStreamsBySender: new Map(), _phoneChatLatestId: 0,
+    activeDirectAssistByRequest: new Map(), activeDirectAssistBySurface: new Map(),
+    abortPriorRAGQueriesOfClass() {}, _manualConversationMemory: { clearAllSessions() {} },
+    _manualCodingState: { clearAllSessions() {} }, _manualDiversityGuard: { reset() {} },
+    require: () => ({ abortAndInvalidateChatStreams() {} }), appState,
+    BrowserWindow: { getAllWindows: () => [1, 2].map(id => ({
+      isDestroyed: () => false, webContents: { send: (channel, data) => sent.push([id, channel, data]) },
+    })) },
+  };
+  const pending = execute(ipcCallback('reset-intelligence'), ipc, scope)();
+  assert.equal(typeof release, 'function', 'cleanup has reached its awaited drain');
+  assert.deepEqual(sent.map(([id, channel, data]) => [id, channel, data.phase]), [
+    [1, 'session-reset', 'begin'], [2, 'session-reset', 'begin'],
+  ], 'both chat renderers clear before the slow index drain');
+  release();
+  assert.equal((await pending).success, true);
+  assert.deepEqual(sent.map(([id, channel, data]) => [id, channel, data.phase]), [
+    [1, 'session-reset', 'begin'], [2, 'session-reset', 'begin'],
+    [1, 'session-reset', 'complete'], [2, 'session-reset', 'complete'],
+  ]);
+  assert.ok(sent.every(([, , data]) => data.preserveWindowSize === true), 'chat reset does not alter either window size');
+});
+
+test('failed reset cleanup releases both chat surfaces with an error verdict', async () => {
+  const sent = [];
+  let reject;
+  const scope = {
+    console, _chatStreamsBySender: new Map(), _phoneChatLatestId: 0,
+    activeDirectAssistByRequest: new Map(), activeDirectAssistBySurface: new Map(),
+    abortPriorRAGQueriesOfClass() {}, _manualConversationMemory: { clearAllSessions() {} },
+    _manualCodingState: { clearAllSessions() {} }, _manualDiversityGuard: { reset() {} },
+    require: () => ({ abortAndInvalidateChatStreams() {} }),
+    appState: {
+      getIntelligenceManager: () => ({ reset() {} }), clearQueues() {},
+      resetConversationTransientState: () => new Promise((_, fail) => { reject = fail; }),
+    },
+    BrowserWindow: { getAllWindows: () => [{ isDestroyed: () => false, webContents: { send: (_channel, data) => sent.push(data) } }] },
+  };
+  const pending = execute(ipcCallback('reset-intelligence'), ipc, scope)();
+  assert.equal(sent[0]?.phase, 'begin');
+  reject(new Error('index cleanup failed'));
+  assert.equal((await pending).success, false);
+  assert.equal(sent.at(-1)?.phase, 'complete');
+  assert.equal(sent.at(-1)?.success, false);
+});
+
 for (const processing of [false, true]) {
   test(`Reset / Cancel clears chat immediately, processing=${processing}`, async () => {
     const { scope, state } = rendererRig();
@@ -1259,7 +1345,65 @@ function visitSettings(node) {
 }
 visitSettings(settings);
 
+test('persisted custom Reset chord retains global registration after restart', () => {
+  const reset = { ...backendDefaults.find(kb => kb.id === 'general:reset-cancel') };
+  const receiver = {
+    filePath: 'keybinds.json', keybinds: new Map(), save() {},
+    normalizeAccelerator: acc => acc.toLowerCase().split('+').sort().join('+'),
+  };
+  receiver.isCustomResetChord = execute(method(keybinds, 'isCustomResetChord'), keybinds, { DEFAULT_KEYBINDS: backendDefaults }, receiver);
+  const load = execute(method(keybinds, 'load'), keybinds, {
+    DEFAULT_KEYBINDS: [reset], console,
+    isClipboardEditingAccelerator: () => false, isRegisterableAccelerator: () => true,
+    fs: { existsSync: () => true, readFileSync: () => JSON.stringify([{ id: reset.id, accelerator: 'Control+Alt+R' }]) },
+  }, receiver);
+  load();
+  assert.equal(receiver.keybinds.get(reset.id).isGlobal, true);
+});
+
 for (const platform of ['darwin', 'win32']) {
+  test(`${platform}: custom Reset chord registers globally and dispatches without changing the default local reload policy`, () => {
+    const reset = { ...backendDefaults.find(kb => kb.id === 'general:reset-cancel') };
+    const receiver = {
+      keybinds: new Map([[reset.id, reset]]), activeMode: 'launcher',
+      registrationFailures: new Map(), unusableAccelerators: new Set(),
+      normalizeAccelerator: acc => acc.toLowerCase().split('+').sort().join('+'),
+      getKeybind: id => receiver.keybinds.get(id)?.accelerator,
+      getGlobalShortcutsEnabled: () => true,
+      save() {}, broadcastUpdate() {}, updateMenu() {}, startHealthCheck() {}, markRegistration() {}, notifyResetChordChanged() {},
+      onShortcutTriggeredCallbacks: [],
+    };
+    const registered = new Map();
+    receiver.isCustomResetChord = execute(method(keybinds, 'isCustomResetChord'), keybinds, { DEFAULT_KEYBINDS: backendDefaults }, receiver);
+    receiver.triggerActionById = execute(method(keybinds, 'triggerActionById'), keybinds, {}, receiver);
+    receiver.shouldRegister = execute(method(keybinds, 'shouldRegister'), keybinds, {}, receiver);
+    receiver.registerGlobalShortcuts = execute(method(keybinds, 'registerGlobalShortcuts'), keybinds, {
+      console: { log() {}, warn() {}, error() {} }, isRegisterableAccelerator: () => true,
+      beginFullRegistrationPass: prior => prior,
+      globalShortcut: { unregisterAll: () => registered.clear(), register: (acc, fn) => registered.set(acc, fn), isRegistered: acc => registered.has(acc) },
+    }, receiver);
+    const set = execute(method(keybinds, 'setKeybind'), keybinds, {
+      console, isClipboardEditingAccelerator: () => false, isRegisterableAccelerator: () => true,
+    }, receiver);
+    const fired = [];
+    receiver.onShortcutTriggeredCallbacks.push(id => fired.push(id));
+    receiver.registerGlobalShortcuts();
+    assert.equal(registered.has('CommandOrControl+R'), false, 'browser reload remains local by default');
+    assert.equal(set('general:reset-cancel', 'Control+Alt+R'), true);
+    assert.equal(registered.has('Control+Alt+R'), true, 'custom reset works when the app is not focused');
+    registered.get('Control+Alt+R')();
+    assert.deepEqual(fired, ['general:reset-cancel']);
+    receiver.activeMode = 'overlay';
+    receiver.registerGlobalShortcuts();
+    assert.equal(registered.has('Control+Alt+R'), true, 'custom reset also works in overlay mode');
+    receiver.getGlobalShortcutsEnabled = () => false;
+    receiver.registerGlobalShortcuts();
+    assert.equal(registered.has('Control+Alt+R'), false, 'global-disable setting also disables custom reset');
+    receiver.getGlobalShortcutsEnabled = () => true;
+    assert.equal(set('general:reset-cancel', 'CommandOrControl+R'), true);
+    assert.equal(registered.has('CommandOrControl+R'), false, 'restoring default releases foreground reload');
+  });
+
   test(`${platform}: all 25 Settings shortcuts agree with defaults, rebind IPC, registration and native table`, async () => {
     assert.equal(backendDefaults.length, 25);
     assert.equal(settingsActions.size, 25);
@@ -1370,8 +1514,8 @@ test('global chat dispatch covers Settings-listed actions without changing focus
   const sent = [];
   const calls = [];
   const receiver = {
-    windowHelper: { moveWindowUp: () => calls.push('moveWindowUp'), moveWindowDown: () => calls.push('moveWindowDown'), moveWindowLeft: () => calls.push('moveWindowLeft'), moveWindowRight: () => calls.push('moveWindowRight') },
-    getMainWindow: () => ({}), sendToWindow: (_win, _channel, data) => sent.push(data.action), sendToMeetingSurfaces: (_channel, data) => sent.push(data.action),
+    windowHelper: { moveWindowUp: () => calls.push('moveWindowUp'), moveWindowDown: () => calls.push('moveWindowDown'), moveWindowLeft: () => calls.push('moveWindowLeft'), moveWindowRight: () => calls.push('moveWindowRight'), getLauncherWindow: () => ({}), getOverlayWindow: () => ({}), getCurrentWindowMode: () => 'launcher' },
+    getMainWindow: () => ({}), sendToWindow: (_win, _channel, data) => { sent.push(data.action); return true; }, sendToMeetingSurfaces: (_channel, data) => sent.push(data.action),
     toggleMainWindow: () => calls.push('toggleVisibility'), toggleOverlayMousePassthrough: () => calls.push('toggleMousePassthrough'), captureScreenAndProcess: async () => calls.push('captureAndProcess'),
   };
   const dispatch = execute(dispatchNode, main, { console, SHORTCUT_TOUR_ACTIONS: new Set() }, receiver);

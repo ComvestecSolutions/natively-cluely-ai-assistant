@@ -31,29 +31,40 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import ts from 'typescript';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const sourcePath = path.resolve(__dirname, '../../components/NativelyInterface.tsx');
 const source = readFileSync(sourcePath, 'utf8');
 
-// Extract the body of the onSessionReset callback: from the
-// `onSessionReset(() => {` opening to its matching close brace.
-function extractOnSessionResetBody() {
-  const marker = 'onSessionReset(() => {';
-  const idx = source.indexOf(marker);
-  assert.ok(idx >= 0, 'could not locate the onSessionReset(() => { handler in NativelyInterface.tsx');
-  let i = idx + marker.length;
-  let depth = 1;
-  const start = i;
-  while (i < source.length && depth > 0) {
-    const ch = source[i];
-    if (ch === '{') depth++;
-    else if (ch === '}') depth--;
-    i++;
-  }
-  assert.equal(depth, 0, 'unbalanced braces in onSessionReset handler');
-  return source.slice(start, i - 1);
+// Locate the subscription as a call expression, then keep only statements
+// after the early-return chat-reset guards. Braces in comments or nested
+// callbacks must not affect the meeting-only branch these tests protect.
+const file = ts.createSourceFile(sourcePath, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+function findNodes(predicate) {
+  const matches = [];
+  const visit = node => {
+    if (predicate(node)) matches.push(node);
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  return matches;
 }
+const subscriptions = findNodes(node => ts.isCallExpression(node) && node.expression.getText(file) === 'window.electronAPI.onSessionReset');
+assert.equal(subscriptions.length, 1, 'expected exactly one onSessionReset subscription');
+const handler = subscriptions[0].arguments[0];
+assert.ok(ts.isArrowFunction(handler) && ts.isBlock(handler.body), 'onSessionReset must have a block callback');
+const statements = handler.body.statements;
+const completeIndex = statements.findIndex(node => ts.isIfStatement(node) && /\.phase\s*===\s*['"]complete['"]/.test(node.expression.getText(file)));
+const explicitIndex = statements.findIndex(node => ts.isIfStatement(node) && /\.preserveWindowSize\b/.test(node.expression.getText(file)));
+assert.ok(completeIndex >= 0 && explicitIndex > completeIndex, 'completion and explicit reset must be handled before meeting teardown');
+for (const index of [completeIndex, explicitIndex]) {
+  const branch = statements[index].thenStatement;
+  assert.ok(ts.isBlock(branch) && ts.isReturnStatement(branch.statements.at(-1)), 'non-meeting reset must return before collapsing the meeting layout');
+}
+const explicitBody = statements[explicitIndex].thenStatement.getText(file);
+const meetingBody = statements.slice(explicitIndex + 1).map(node => node.getText(file)).join('\n');
+assert.match(meetingBody, /resetChatStateRef\.current\(\)/, 'meeting reset must clear the reused chat tree');
 
 // Strip line comments so assertions match on actual code, not on the
 // explanatory comments (which intentionally mention strings like
@@ -65,7 +76,30 @@ function stripLineComments(s) {
     .join('\n');
 }
 
-const body = stripLineComments(extractOnSessionResetBody());
+const body = stripLineComments(meetingBody);
+
+test('explicit chat reset exits before meeting width/height teardown and pins the existing height', () => {
+  assert.match(explicitBody, /resetChatStateRef\.current\(true\)/, 'explicit reset must clear chat while preserving its window envelope');
+  assert.doesNotMatch(stripLineComments(explicitBody), /(?:shellWidth\.set|setCustomWindowWidth|setAppliedWindowWidth|customOverlayHeightRef\.current\s*=\s*null)/,
+    'explicit reset must not run the meeting-only size reset');
+  const resetDeclarations = findNodes(node => ts.isVariableDeclaration(node) && node.name.getText(file) === 'resetChatState');
+  assert.equal(resetDeclarations.length, 1, 'expected exactly one resetChatState implementation');
+  const reset = resetDeclarations[0].initializer;
+  assert.ok(ts.isCallExpression(reset) && ts.isArrowFunction(reset.arguments[0]) && ts.isBlock(reset.arguments[0].body));
+  const sizeGuard = reset.arguments[0].body.statements.find(node => ts.isIfStatement(node) && /preserveWindowSize/.test(node.expression.getText(file)));
+  assert.ok(sizeGuard && ts.isBlock(sizeGuard.thenStatement), 'chat clear must guard the existing-height pin');
+  const pin = stripLineComments(sizeGuard.thenStatement.getText(file));
+  assert.match(pin, /customOverlayHeightRef\.current\s*=\s*window\.innerHeight/);
+  assert.match(pin, /setHeightPinned\(true\)/);
+  assert.doesNotMatch(pin, /setCustomWindowWidth|setAppliedWindowWidth/);
+});
+
+test('meeting reset releases the previous meeting’s manual size pins', () => {
+  assert.match(body, /customOverlayHeightRef\.current\s*=\s*null/);
+  assert.match(body, /setHeightPinned\(false\)/);
+  assert.match(body, /setCustomWindowWidth\(null\)/);
+  assert.match(body, /setAppliedWindowWidth\(null\)/);
+});
 
 test('onSessionReset snaps shellWidth back to the collapsed baseline (imperative set, not animate)', () => {
   assert.ok(
@@ -85,7 +119,7 @@ test('onSessionReset snaps shellWidth back to the collapsed baseline (imperative
     // language with long chip labels does not open with Answer wrapped. It is
     // a ref because onSessionReset is a long-lived subscription.
     /shellWidth\.set\(\s*(?:SHELL_WIDTH_COLLAPSED|defaultCollapsedPanelWidth\(\s*\)|defaultCollapsedForRowRef\.current|collapsedWidthFor\(\s*OVERLAY_DEFAULT_WINDOW_WIDTH\s*\))\s*\)/.test(body),
-    'BUG: onSessionReset must imperatively `shellWidth.set(SHELL_WIDTH_COLLAPSED)` so the OS window contracts to the collapsed width on the first paint of the new meeting — otherwise the previous meeting\'s expanded width is shown until the deferred checkCodeVisibility collapse fires ~1-2s later.',
+    'BUG: meeting reset must imperatively collapse the shell on the first paint — otherwise the previous meeting\'s expanded panel is shown until the deferred checkCodeVisibility collapse fires ~1-2s later.',
   );
   // Must be an imperative set, NOT an animate() (which would play a visible
   // wide→narrow tween on meeting start).

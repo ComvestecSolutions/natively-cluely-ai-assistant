@@ -5,6 +5,10 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
+import fs from 'node:fs';
+import os from 'node:os';
+import vm from 'node:vm';
+import ts from 'typescript';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -15,7 +19,7 @@ const [retrievalMod, storeMod] = await Promise.all([
   import(pathToFileURL(path.join(distRoot, 'courseStore.js')).href),
 ]);
 const { searchCourses, sanitizeFtsQuery, makeChunkKey } = retrievalMod;
-const { COURSES_SCHEMA_SQL } = storeMod;
+const { COURSES_SCHEMA_SQL, CourseStore } = storeMod;
 
 const URL_LA = 'https://docs.example.com/ann/algorithms';
 const URL_LB = 'https://docs.example.com/wal/mode';
@@ -173,4 +177,123 @@ describe('retrieval.ts (P2)', () => {
       assert.equal(res[0].chunkId, makeChunkKey(URL_LA, 1));
     });
   });
+});
+
+// Exercise the actual handler bodies with real CourseStore, FTS and persisted
+// markdown/cache, without registering the unrelated Electron IPC handlers.
+it('course IPC search and study aids validate full scope and hydrate only persisted results', async () => {
+  seed();
+  const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'course-ipc-'));
+  try {
+    const store = new CourseStore(db);
+    const courseDir = path.join(userData, 'courses', 'course-a');
+    fs.mkdirSync(path.join(courseDir, 'lessons'), { recursive: true });
+    const ids = ['la', 'la2', 'la3', 'la4', 'la5'];
+    const names = ['First Title', 'Nebulous Title', 'Third Title', 'Fourth Title', 'Fifth Title'];
+    const addLesson = db.prepare(`INSERT INTO course_lessons
+      (id, course_id, title, url, parent, local_md_path, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`);
+    db.prepare('UPDATE course_lessons SET title = ?, local_md_path = ? WHERE id = ?')
+      .run(names[0], 'lessons/la.md', 'la');
+    for (let i = 1; i < ids.length; i++) {
+      addLesson.run(ids[i], 'course-a', names[i], `https://example.com/${ids[i]}`,
+        i === 4 ? 'la' : null, `lessons/${ids[i]}.md`, '2026-01-01');
+    }
+    for (let i = 0; i < ids.length; i++) {
+      fs.writeFileSync(path.join(courseDir, 'lessons', `${ids[i]}.md`), `# ${names[i]}\n\nLesson ${i + 1} material`);
+    }
+    const addChunk = db.prepare(`INSERT INTO course_chunks (course_id, lesson_id, ord, text)
+      VALUES ('course-a', 'la5', ?, ?)`);
+    const addFts = db.prepare(`INSERT INTO course_chunks_fts (rowid, course_id, lesson_id, text)
+      VALUES (?, 'course-a', 'la5', ?)`);
+    for (let i = 0; i < 2; i++) {
+      const text = `nebulous body content ${i}`;
+      const row = addChunk.run(i, text);
+      addFts.run(row.lastInsertRowid, text);
+    }
+
+    const source = fs.readFileSync(path.resolve(__dirname, '../../ipcHandlers.ts'), 'utf8');
+    const readStart = source.indexOf('  const readCourseLessonMd =');
+    const readEnd = source.indexOf("  safeHandle('courses:lesson-content'", readStart);
+    const handlersStart = source.indexOf('  const resolveStudyAidSources =');
+    const handlersEnd = source.indexOf('  // Courses Studio P4 portability:', handlersStart);
+    assert.ok(readStart > 0 && readEnd > readStart && handlersStart > 0 && handlersEnd > handlersStart);
+    const code = ts.transpileModule(source.slice(readStart, readEnd) + source.slice(handlersStart, handlersEnd), {
+      compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
+    }).outputText;
+    const handlers = new Map();
+    let active = true;
+    const prompts = [];
+    vm.runInNewContext(code, {
+      safeHandle: (key, fn) => handlers.set(key, fn),
+      getCourseStore: () => store,
+      isProOrTrialActive: () => active,
+      DatabaseManager: { getInstance: () => ({ getDb: () => db }) },
+      app: { getPath: () => userData },
+      path, fs, searchCourses,
+      resolveCourseDataDir: (root, id) => path.join(root, id),
+      stripCourseFrontmatter: (md) => md,
+      lookupStudyAid: (await import(pathToFileURL(path.join(distRoot, 'studyAids.js')).href)).lookupStudyAid,
+      generateStudyAid: (await import(pathToFileURL(path.join(distRoot, 'studyAids.js')).href)).generateStudyAid,
+      appState: { processingHelper: { getLLMHelper: () => ({
+        fitContextForCurrentModel: (prompt) => prompt,
+        streamChatLongForm: (prompt) => {
+          prompts.push(prompt);
+          return { stream: (async function* () { yield '## Key points\n- First Title, Nebulous Title, Third Title, Fourth Title and Fifth Title each provide lesson material for this module.'; })(), outcome: { truncated: false } };
+        },
+      }) } },
+      console: { warn() {} },
+    });
+    const invoke = (channel, payload) => handlers.get(channel)(null, payload);
+    const title = await invoke('courses:search', { courseId: 'course-a', query: 'Fifth Title' });
+    assert.equal(title.ok, true);
+    assert.equal(title.results[0].lessonId, 'la5');
+    assert.equal(title.results[0].parent, 'la');
+    const body = await invoke('courses:search', { courseId: 'course-a', query: 'nebulous' });
+    assert.deepEqual(Array.from(body.results, (r) => r.lessonId), ['la2', 'la5'],
+      'title matches precede body hits and multiple chunks map to one lesson');
+    assert.match(body.results[1].snippet, /nebulous/);
+    const scoped = await invoke('courses:search', { courseId: 'course-b', query: 'nebulous' });
+    assert.equal(scoped.results.length, 0);
+    assert.equal((await invoke('courses:search', { courseId: 'missing', query: 'nebulous' })).ok, false);
+    assert.equal((await invoke('courses:search', { courseId: 'course-a', query: '   ' })).ok, false);
+
+    for (let i = 0; i < 24; i++) {
+      addLesson.run(`title-${i}`, 'course-a', `Nebulous headline ${i}`,
+        `https://example.com/title-${i}`, null, 'lessons/la.md', '2026-01-01');
+    }
+    const crowded = await invoke('courses:search', { courseId: 'course-a', query: 'nebulous' });
+    assert.equal(crowded.results.length, 20);
+    assert.equal(crowded.results[0].lessonId, 'la2', 'title matches still lead');
+    assert.ok(crowded.results.some((result) => result.lessonId === 'la5' && /nebulous/.test(result.snippet)),
+      'full-text-only lessons remain visible even when titles exceed the result cap');
+
+    const scope = { courseId: 'course-a', type: 'summary', lessonIds: ids };
+    const miss = await invoke('courses:lookup-study-aid', scope);
+    assert.equal(miss.ok, true);
+    assert.equal(miss.cached, false);
+    assert.equal(prompts.length, 0, 'lookup cannot generate');
+    const generated = await invoke('courses:generate-study-aid', scope);
+    assert.equal(generated.ok, true, JSON.stringify(generated));
+    assert.ok(prompts.some((prompt) => prompt.includes('Fifth Title') && prompt.includes('Lesson 5 material')));
+    const beforeLookup = prompts.length;
+    const cached = await invoke('courses:lookup-study-aid', scope);
+    assert.equal(cached.cached, true);
+    assert.equal(cached.data, generated.data);
+    assert.equal(prompts.length, beforeLookup);
+
+    fs.rmSync(path.join(courseDir, 'lessons', 'la5.md'));
+    const unavailable = await invoke('courses:generate-study-aid', scope);
+    assert.equal(unavailable.ok, false);
+    assert.match(unavailable.error, /lesson markdown unavailable/);
+    assert.equal(prompts.length, beforeLookup);
+    assert.equal((await invoke('courses:lookup-study-aid', scope)).ok, false);
+    assert.equal((await invoke('courses:generate-study-aid', { ...scope, lessonIds: ['la', 'unknown'] })).ok, false);
+    assert.equal((await invoke('courses:generate-study-aid', { ...scope, lessonIds: ['la', 'la'] })).ok, false);
+    active = false;
+    assert.equal((await invoke('courses:search', { courseId: 'course-a', query: 'nebulous' })).disabled, true);
+    assert.equal((await invoke('courses:lookup-study-aid', scope)).disabled, true);
+  } finally {
+    db.close();
+    fs.rmSync(userData, { recursive: true, force: true });
+  }
 });

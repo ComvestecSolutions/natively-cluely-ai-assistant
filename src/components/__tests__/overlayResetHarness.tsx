@@ -21,7 +21,7 @@ const api = new Proxy({
   cancelChatStream: () => { calls.cancels++; },
   resetIntelligence: async () => {
     calls.resets++;
-    for (const listener of listeners.get('onSessionReset') ?? []) listener();
+    for (const listener of listeners.get('onSessionReset') ?? []) listener({ preserveWindowSize: true });
     return { success: true };
   },
 }, {

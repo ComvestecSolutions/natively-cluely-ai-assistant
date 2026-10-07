@@ -266,7 +266,7 @@ describe('theme switch wiring', () => {
   test('index.css is a tight dissolve: 240ms, strong ease-in-out, no blur or movement', () => {
     const css = read('../../index.css');
     assert.match(css, /:root\[data-theme-switching\]::view-transition-group\(root\)\s*\{\s*animation-duration: 240ms;\s*animation-timing-function: cubic-bezier\(0\.77, 0, 0\.175, 1\);/);
-    const block = css.slice(css.indexOf('/* ── Theme switch'));
+    const block = css.slice(css.indexOf('/* ── Theme switch'), css.indexOf('/* Indeterminate import-meter sweep'));
     assert.doesNotMatch(block, /filter:\s*blur|@keyframes|transform:/);
   });
 
