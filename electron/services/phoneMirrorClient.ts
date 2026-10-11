@@ -669,7 +669,14 @@ export const PHONE_MIRROR_HTML = `<!doctype html>
       .sys.is-bad { color: var(--danger); }
 
       /* Markdown content */
-      .content { font-size: var(--type-body); line-height: 1.5; letter-spacing: -0.014em; overflow-wrap: anywhere; word-break: break-word; }
+      /* marked emits a literal "\n" for a soft line break (one newline, no
+         blank line), same as the overlay's react-markdown — but as raw HTML
+         it also has a "\n" of pure formatting BETWEEN block tags, which
+         renderPhoneAnswer strips (collapseBlockGaps, the overlay's own fix
+         for this). With only genuine in-text breaks left, pre-wrap here
+         turns them into real line breaks without doubling any block's
+         margin into a blank line. */
+      .content { font-size: var(--type-body); line-height: 1.5; letter-spacing: -0.014em; overflow-wrap: anywhere; word-break: break-word; white-space: pre-wrap; }
       .content > :first-child { margin-top: 0; }
       .content > :last-child { margin-bottom: 0; }
       .content p { margin: 0 0 10px; }

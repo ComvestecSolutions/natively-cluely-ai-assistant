@@ -16,7 +16,7 @@
 
 import { Marked, type Tokens } from 'marked';
 import { STREAMING_MATH_EXTENSIONS } from '../../src/lib/streamingMarkdown';
-import { splitGistLine, splitGistLineStreaming } from '../../src/lib/displayMarkup';
+import { splitGistLine, splitGistLineStreaming, collapseBlockGaps } from '../../src/lib/displayMarkup';
 import { extractVisualBlocks, mentionsVisualTag } from '../../src/lib/diagram/fencedBlocks.mjs';
 import { checkDiagramSource, diagramSourceKey, diagramCardLabel, isPlaceholderDiagram } from '../../src/lib/diagram/diagramPolicy.mjs';
 import { compileVisualSource, PHONE_VISUAL_COLORS } from '../../src/lib/diagram/visualArtifact.mjs';
@@ -278,7 +278,11 @@ export function renderPhoneAnswer(markdown: string, opts: { streaming?: boolean 
   }
   // Wide tables scroll sideways inside the card instead of widening the page.
   // Safe to match on the tag: raw HTML was escaped, so <table> is marked's own.
-  const html = body
+  // collapseBlockGaps strips the "\n" marked leaves as pure formatting BETWEEN
+  // block tags (it leaves genuine in-text soft breaks alone) — the page gives
+  // .content white-space: pre-wrap, so without this every block's margin would
+  // double into a visible blank line, the overlay's own fix for the same bug.
+  const html = collapseBlockGaps(body)
     .replace(/<table>/g, '<div class="table-wrap"><table>')
     .replace(/<\/table>/g, '</table></div>');
   return { html, gist: split.gist };
