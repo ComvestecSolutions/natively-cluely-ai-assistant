@@ -991,6 +991,11 @@ export const PHONE_MIRROR_HTML = `<!doctype html>
         line-height: 22px;
         color: var(--label);
         caret-color: var(--accent-fill);
+        /* A long unbroken word or pasted link must wrap instead of pushing
+           the box wider than the field — narrow phones have little width
+           to spare, so this is where it would overflow first. */
+        overflow-wrap: anywhere;
+        word-break: break-word;
       }
       .field textarea::placeholder { color: var(--label-3); }
       .field textarea:focus-visible { outline: none; }
@@ -1273,6 +1278,16 @@ export const PHONE_MIRROR_HTML = `<!doctype html>
         .composer .icon-btn { width: 40px; height: 40px; flex-basis: 40px; }
         .field textarea { height: 40px; padding-top: 9px; padding-bottom: 9px; }
         .send { margin: 4px 4px 4px 0; }
+      }
+      /* Narrow phones (iPhone SE and similarly compact Android widths): the
+         text field is the one element that must shrink, so give it back
+         every pixel the rest of the row can spare instead of squeezing it
+         against two full-size icon buttons. */
+      @media (max-width: 359px) {
+        .composer { gap: var(--s1); }
+        .composer .icon-btn { width: 40px; height: 40px; flex-basis: 40px; }
+        .field textarea { padding-left: 12px; }
+        .send { width: 30px; height: 30px; margin: 7px 5px 7px 0; }
       }
       /* Keyboard up on a short screen: the chips give their row to the text. */
       .app.is-short.kb-up .chips, .app.is-short.kb-up .tray-wrap { display: none; }
