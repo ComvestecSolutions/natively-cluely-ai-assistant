@@ -648,6 +648,7 @@ export const PHONE_MIRROR_HTML = `<!doctype html>
         transition: opacity var(--duration-fast) var(--ease-smooth-out);
       }
       .row-user.is-sending .bubble { opacity: 0.62; }
+      .user-foot { display: flex; align-items: center; gap: 2px; margin: -4px -8px 0 0; }
       .row-status { font-size: var(--type-caption); line-height: 16px; color: var(--label-3); padding-right: 4px; }
       .row-status button { color: var(--accent); font-weight: 600; font-size: var(--type-caption); }
       .row-user.is-failed .row-status { color: var(--danger); }
@@ -974,8 +975,13 @@ export const PHONE_MIRROR_HTML = `<!doctype html>
         border-radius: var(--r-pill);
         background: var(--fill-1);
         box-shadow: inset 0 0 0 0.5px var(--hair);
-        transition: box-shadow var(--duration-fast) var(--ease-smooth-out), background-color var(--duration-fast) var(--ease-smooth-out);
+        transition: border-radius var(--duration-fast) var(--ease-smooth-out), box-shadow var(--duration-fast) var(--ease-smooth-out), background-color var(--duration-fast) var(--ease-smooth-out);
       }
+      /* A grown (multi-line) textarea makes the field tall; a pill radius
+         (half its height) then curves deep into the corners and the feed
+         behind it shows through. Switch to a normal rounded rect once it's
+         no longer a single line. */
+      .field.is-multiline { border-radius: var(--r-lg); }
       .field:focus-within { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent); }
       .field textarea {
         display: block;
@@ -2187,8 +2193,22 @@ export const PHONE_MIRROR_HTML = `<!doctype html>
           var row = el('div', 'row-user');
           row.dataset.key = entry.key;
           row.append(el('div', 'bubble', entry.content || ''));
+          var foot = el('div', 'user-foot');
+          var copy = el('button', 'copy-btn t-icon-swap');
+          copy.type = 'button';
+          copy.dataset.state = 'a';
+          copy.setAttribute('aria-label', 'Copy prompt');
+          copy.innerHTML = ICON_COPY;
+          copy.addEventListener('click', function () {
+            copyText(entry.content || '').then(function (ok) {
+              if (ok) flashIcon(copy, 1400);
+              else showToast('Copy blocked by the browser', true);
+            });
+          });
+          foot.append(copy);
           var status = el('div', 'row-status');
-          row.append(status);
+          foot.append(status);
+          row.append(foot);
           entry.el = row;
           paintUserState(entry);
           return row;
@@ -3272,7 +3292,9 @@ export const PHONE_MIRROR_HTML = `<!doctype html>
         var DELIVERY_TIMEOUT_MS = 10000;
         function autoGrow() {
           input.style.height = 'auto';
-          input.style.height = Math.min(input.scrollHeight, 132) + 'px';
+          var next = Math.min(input.scrollHeight, 132);
+          input.style.height = next + 'px';
+          input.parentElement.classList.toggle('is-multiline', next > 44);
         }
         input.addEventListener('input', function () { autoGrow(); paintControls(); });
         input.addEventListener('focus', function () { if (!kbBase) kbBase = viewportHeight(); });
