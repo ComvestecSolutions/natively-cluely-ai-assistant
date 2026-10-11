@@ -1005,11 +1005,14 @@ test('custom vision injection follows optimized MIME and restores raw fallback M
   const custom = source.slice(start, end);
 
   assert.ok(start >= 0 && end > start);
-  assert.match(custom, /let preparedImagePath: string \| undefined/);
+  // Every attachment is looped over, not just imagePaths[0], so none of the
+  // user's other screenshots are silently dropped.
+  assert.match(custom, /for \(const sourcePath of imagePaths\)/);
+  assert.match(custom, /let preparedImagePath = sourcePath;/);
   assert.match(custom, /preparedImagePath = sourcePath;[\s\S]*?getImageOptimizer\(\)\.optimize/);
-  assert.match(custom, /base64Image = await getImageOptimizer\(\)\.getBase64\(optimized\);\s*preparedImagePath = optimized\.path/);
+  assert.match(custom, /encoded = await getImageOptimizer\(\)\.getBase64\(optimized\);\s*preparedImagePath = optimized\.path/);
   assert.match(custom, /readFile\(sourcePath\)[\s\S]*?preparedImagePath = sourcePath/);
-  assert.match(custom, /injectImageIntoMessages\(body, base64Image, preparedImagePath\)/);
+  assert.match(custom, /injectImageIntoMessages\(body, base64Images, preparedImagePaths\)/);
   assert.doesNotMatch(custom, /injectImageIntoMessages\(body, base64Image, imagePaths\[0\]\)/);
 });
 

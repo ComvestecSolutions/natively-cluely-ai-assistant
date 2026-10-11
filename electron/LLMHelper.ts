@@ -13343,15 +13343,20 @@ let isMultimodal = !!(imagePaths?.length);
 
     // @ts-ignore third-party parser has no useful declaration for its result
     const curlConfig = curl2Json(provider.curlCommand);
-    let base64Image = '';
-    const imagePath = imagePaths[0];
-    if (imagePath) {
+    // One entry per attachment — every image Direct Assist handed this rung,
+    // not just the first. {{IMAGE_BASE64}} is a single template placeholder,
+    // so a raw cURL template that wires it in by hand only ever gets the
+    // first attachment; injectImageIntoMessages below carries all of them for
+    // an ordinary OpenAI-shaped template.
+    const base64Images: string[] = [];
+    for (const imagePath of imagePaths) {
       try {
-        base64Image = (await fs.promises.readFile(imagePath)).toString('base64');
+        base64Images.push((await fs.promises.readFile(imagePath)).toString('base64'));
       } catch {
         throw new DirectAssistError('INVALID_ATTACHMENT', 'The image attachment could not be read.');
       }
     }
+    const base64Image = base64Images[0] ?? '';
 
     const fullPrompt = systemPrompt ? `${systemPrompt}\n\n${userMessage}` : userMessage;
     const variables = {
@@ -13371,7 +13376,7 @@ let isMultimodal = !!(imagePaths?.length);
     // characters from header values.
     const { url, headers, data: substituted } = applyCurlVariables(curlConfig, variables);
     let data = substituted;
-    if (base64Image && imagePath) data = injectImageIntoMessages(data, base64Image, imagePath);
+    if (base64Images.length) data = injectImageIntoMessages(data, base64Images, imagePaths);
 
     // The metadata-host guard, NOT validateUrlForSsrf — the same policy the
     // other two custom-provider transports use.
@@ -13419,50 +13424,64 @@ let isMultimodal = !!(imagePaths?.length);
     const curlCommand = selectedCustomProvider.curlCommand;
     const requestConfig = curl2Json(curlCommand);
 
-    let base64Image = "";
-    // Tracks the ENCODED file, not the original: the optimizer turns a .png
+    // Tracks the ENCODED files, not the originals: the optimizer turns a .png
     // screenshot into JPEG and the declared mime type is derived from this
-    // path, so pointing it at imagePaths[0] declares a mime that contradicts
-    // the bytes. Assigned from sourcePath below and re-pointed at
-    // optimized.path when the optimizer runs.
-    let preparedImagePath: string | undefined;
+    // path, so pointing it at the source path declares a mime that contradicts
+    // the bytes. Populated in lockstep with base64Images below and re-pointed
+    // at each optimized.path when the optimizer runs.
+    //
+    // One entry per attachment — EVERY image the user attached, not just the
+    // first. Dropping all but imagePaths[0] here used to silently answer from
+    // only one of several screenshots the user explicitly attached.
+    const base64Images: string[] = [];
+    const preparedImagePaths: string[] = [];
     if (imagePaths?.length) {
-      const sourcePath = imagePaths[0];
-      // Raw fallback bytes retain the source file's MIME/extension. Successful
-      // optimization replaces this with ImageOptimizer's MIME-correct temp
-      // path (balanced commonly converts PNG to .jpg).
-      preparedImagePath = sourcePath;
-      try {
-        // 2026-07-19: same image-size fix as executeCustomProvider (see that
-        // method for the full rationale). Optimize before base64-encoding so the
-        // wire payload stays under the 10 MB Anthropic per-image limit.
-        // Use the first image for custom providers (they typically only support one).
-        const optimized = await getImageOptimizer().optimize(sourcePath, {
-          profile: this.imageProfileFor('balanced', 0),
-          provider: 'custom',
-          cacheKey: sourcePath,
-        });
-        base64Image = await getImageOptimizer().getBase64(optimized);
-        preparedImagePath = optimized.path;
-      } catch (e) {
-        if (!strictErrors) {
-          console.warn(
-            "[LLMHelper] streamWithCustom: image optimization failed, falling back to raw read:",
-            e,
-          );
-        }
+      for (const sourcePath of imagePaths) {
+        // Raw fallback bytes retain the source file's MIME/extension. Successful
+        // optimization replaces this with ImageOptimizer's MIME-correct temp
+        // path (balanced commonly converts PNG to .jpg).
+        let preparedImagePath = sourcePath;
+        let encoded = "";
         try {
-          const data = await fs.promises.readFile(sourcePath);
-          base64Image = data.toString("base64");
-          preparedImagePath = sourcePath;
-        } catch (e2) {
-          if (strictErrors) {
-            throw new DirectAssistError('INVALID_ATTACHMENT', 'The image attachment could not be read.');
+          // 2026-07-19: same image-size fix as executeCustomProvider (see that
+          // method for the full rationale). Optimize before base64-encoding so the
+          // wire payload stays under the 10 MB Anthropic per-image limit.
+          const optimized = await getImageOptimizer().optimize(sourcePath, {
+            profile: this.imageProfileFor('balanced', 0),
+            provider: 'custom',
+            cacheKey: sourcePath,
+          });
+          encoded = await getImageOptimizer().getBase64(optimized);
+          preparedImagePath = optimized.path;
+        } catch (e) {
+          if (!strictErrors) {
+            console.warn(
+              "[LLMHelper] streamWithCustom: image optimization failed, falling back to raw read:",
+              e,
+            );
           }
-          /* keep empty for legacy callers */
+          try {
+            const data = await fs.promises.readFile(sourcePath);
+            encoded = data.toString("base64");
+            preparedImagePath = sourcePath;
+          } catch (e2) {
+            if (strictErrors) {
+              throw new DirectAssistError('INVALID_ATTACHMENT', 'The image attachment could not be read.');
+            }
+            continue; /* skip this one image for legacy callers */
+          }
+        }
+        if (encoded) {
+          base64Images.push(encoded);
+          preparedImagePaths.push(preparedImagePath);
         }
       }
     }
+    // {{IMAGE_BASE64}} is a single template placeholder, so a raw cURL template
+    // that wires it in by hand only ever gets the first attachment — the
+    // auto-upgrade path below (injectImageIntoMessages) is what carries all of
+    // them for an ordinary OpenAI-shaped template.
+    const base64Image = base64Images[0] ?? "";
 
     const combinedMessage = context ? `${context}\n\n${message}` : message;
     const directCustomMode = strictErrors && Boolean(providerOverride);
@@ -13490,11 +13509,11 @@ let isMultimodal = !!(imagePaths?.length);
     const { url, headers, data: _sub } = applyCurlVariables(requestConfig, variables);
     let body = _sub;
 
-    // Auto-upgrade last user message to multimodal content array when an image is present.
+    // Auto-upgrade last user message to multimodal content array when images are present.
     // No-op for non-OpenAI formats and templates already containing a proper image_url part.
-    // preparedImagePath — not imagePaths[0] — so the declared mime matches the bytes.
-    if (base64Image && preparedImagePath) {
-      body = injectImageIntoMessages(body, base64Image, preparedImagePath);
+    // preparedImagePaths — not imagePaths — so each declared mime matches its own bytes.
+    if (base64Images.length && preparedImagePaths.length) {
+      body = injectImageIntoMessages(body, base64Images, preparedImagePaths);
     }
 
     // ONE check, not two. An earlier resolution of this merge ran
@@ -14847,15 +14866,12 @@ let isMultimodal = !!(imagePaths?.length);
         );
       }
     }
-    if (provider === 'custom' || provider === 'curl') {
-      if (imagePaths.length > 1) {
-        throw new DirectAssistError(
-          'INVALID_ATTACHMENT',
-          'The selected custom provider accepts at most one image per request.',
-        );
-      }
-      carriedImagePaths = carriedImagePaths.slice(0, Math.max(0, 1 - imagePaths.length));
-    }
+    // custom/curl providers used to be capped at one image per request here
+    // (streamWithCustom/streamWithDirectCurl only ever encoded imagePaths[0]).
+    // Both adapters now encode every attachment and inject one image_url part
+    // per image, so the cap above no longer reflects what the transport can
+    // actually carry — removing it lets a custom/curl provider receive every
+    // screenshot the user attached, the same as every other provider.
 
     // Direct Assist bypasses the legacy context assembler, so enforce the
     // existing provider-data-scope policy here before the sole dispatch. The

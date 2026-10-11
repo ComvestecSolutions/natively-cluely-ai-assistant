@@ -261,20 +261,31 @@ export function imageMimeTypeFromPath(filePath: string): string {
 
 /**
  * Auto-upgrades the last user message in an OpenAI-compatible `messages` array
- * from a plain string to a multimodal content array when a base64 image is present.
+ * from a plain string to a multimodal content array when one or more base64
+ * images are present.
  *
+ * - Accepts either a single `(base64Image, imagePath)` pair or parallel arrays
+ *   of both, so every existing single-image caller keeps working unchanged
+ *   while a caller with several attachments can hand them all over at once —
+ *   each one becomes its own `image_url` part, in order.
  * - If `body.messages` is not an array, returns `body` unchanged (no-op for non-OpenAI formats).
- * - If the last user message already contains an image_url part, it is not duplicated.
+ * - If the last user message already contains an image_url part, nothing is appended
+ *   (the template or an earlier call already carries at least one image).
  * - If the content is already a multimodal array (e.g. user manually included {{IMAGE_BASE64}}
- *   in an image_url field), the image is appended only if not already present.
+ *   in an image_url field), the images are appended only if none is already present.
  * - All other messages and body fields are left untouched (fully backward-compatible).
  */
 export function injectImageIntoMessages(
     body: any,
-    base64Image: string,
-    imagePath: string
+    base64Image: string | readonly string[],
+    imagePath: string | readonly string[]
 ): any {
-    if (!base64Image || !Array.isArray(body?.messages)) return body;
+    const base64List = Array.isArray(base64Image) ? base64Image : [base64Image];
+    const pathList = Array.isArray(imagePath) ? imagePath : [imagePath];
+    const pairs = base64List
+        .map((base64, i) => ({ base64, path: pathList[i] ?? pathList[0] }))
+        .filter((pair): pair is { base64: string; path: string } => Boolean(pair.base64));
+    if (!pairs.length || !Array.isArray(body?.messages)) return body;
 
     const messages: any[] = body.messages.slice();
 
@@ -289,30 +300,26 @@ export function injectImageIntoMessages(
     if (lastUserIdx === -1) return body;
 
     const lastUser = messages[lastUserIdx];
-    const mimeType = imageMimeTypeFromPath(imagePath);
-    const imageUrl = `data:${mimeType};base64,${base64Image}`;
+    const imageParts = pairs.map(({ base64, path }) => ({
+        type: "image_url",
+        image_url: { url: `data:${imageMimeTypeFromPath(path)};base64,${base64}` },
+    }));
 
     if (Array.isArray(lastUser.content)) {
-        // Already a multimodal array — append image_url only if absent
+        // Already a multimodal array — append image_url parts only if absent
         const alreadyHasImage = lastUser.content.some(
             (part: any) => part?.type === "image_url"
         );
         if (alreadyHasImage) return body;
         messages[lastUserIdx] = {
             ...lastUser,
-            content: [
-                ...lastUser.content,
-                { type: "image_url", image_url: { url: imageUrl } },
-            ],
+            content: [...lastUser.content, ...imageParts],
         };
     } else if (typeof lastUser.content === "string") {
         // Plain string → standard OpenAI multimodal array
         messages[lastUserIdx] = {
             ...lastUser,
-            content: [
-                { type: "text", text: lastUser.content },
-                { type: "image_url", image_url: { url: imageUrl } },
-            ],
+            content: [{ type: "text", text: lastUser.content }, ...imageParts],
         };
     }
     // Non-string, non-array content (e.g. null/undefined): leave untouched
