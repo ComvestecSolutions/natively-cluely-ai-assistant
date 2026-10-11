@@ -56,7 +56,7 @@ const electronStub = {
 const originalLoad = Module._load;
 const originalListen = http.Server.prototype.listen;
 const DEV_EXTENSION_ORIGIN = 'chrome-extension://macjecgdfliikhplbbdbpljomcigjnjg';
-const MAX = 12 * 1024 * 1024;
+const MAX = 30 * 1024 * 1024;
 
 // Smallest well-formed-enough headers for each accepted type.
 const JPEG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(200, 7), Buffer.from([0xff, 0xd9])]);

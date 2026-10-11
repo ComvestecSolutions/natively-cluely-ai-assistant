@@ -2426,7 +2426,13 @@ export const PHONE_MIRROR_HTML = `<!doctype html>
           appendEntry(entry);
           pinned = true;
           stick();
-          entry.timer = setTimeout(function () { expirePending(entry); }, PENDING_TIMEOUT_MS);
+          // 'chat' is the "waiting for the model's answer" pending — same as the
+          // main desktop chat window, it never gives up on its own. Every other
+          // action pending (shortcuts like whatToAnswer, followUp, etc.) keeps
+          // the auto-expire, since those have no equivalent indefinite wait.
+          if (action !== 'chat') {
+            entry.timer = setTimeout(function () { expirePending(entry); }, PENDING_TIMEOUT_MS);
+          }
           return entry;
         }
         function takePending(match) {
@@ -2492,9 +2498,10 @@ export const PHONE_MIRROR_HTML = `<!doctype html>
           }
         }
         function awaitingEntry(streamId, t) {
-          var entry = { key: 'p:' + streamId, t: t, kind: 'pending', action: 'desktop', streamId: streamId, label: '', local: true };
-          entry.timer = setTimeout(function () { expirePending(entry); }, PENDING_TIMEOUT_MS);
-          return entry;
+          // No timer: this is the chat Q&A "waiting for an answer" card, same
+          // as 'chat' above — the main desktop chat window never times out
+          // waiting for a Custom Provider either, so the phone should not.
+          return { key: 'p:' + streamId, t: t, kind: 'pending', action: 'desktop', streamId: streamId, label: '', local: true };
         }
         // The placeholder this answer resolves: its own (a desktop question's,
         // by stream id) first, else a question typed here.
@@ -3339,12 +3346,14 @@ export const PHONE_MIRROR_HTML = `<!doctype html>
         // Choose File", on Android the camera-or-files chooser. A web page
         // can't capture the phone's screen itself, so a screenshot is taken
         // with the phone's buttons and picked here. Each image is decoded with
-        // its EXIF rotation applied, scaled to 2048 px on the long edge and
-        // re-encoded as JPEG, which also drops its location metadata. The
-        // page's CSP blocks blob: URLs, so the thumbnail is a data: URL.
-        var IMAGE_MAX_EDGE = 2048;
+        // its EXIF rotation applied and re-encoded as JPEG at full resolution
+        // and near-lossless quality — the canvas round-trip exists only to
+        // normalize the format, bake in orientation and drop location
+        // metadata, never to shrink the photo. The page's CSP blocks blob:
+        // URLs, so the thumbnail is a data: URL.
         var THUMB_MAX_EDGE = 640;
-        var UPLOAD_TIMEOUT_MS = 30000;
+        var FULL_IMAGE_QUALITY = 0.95;
+        var UPLOAD_TIMEOUT_MS = 60000;
         var MAX_IMAGES_PER_PICK = 4;
         imageBtn.addEventListener('keydown', function (e) {
           if (e.key !== 'Enter' && e.key !== ' ') return;
@@ -3391,14 +3400,16 @@ export const PHONE_MIRROR_HTML = `<!doctype html>
         }
         function prepareImage(file) {
           return decodeImage(file).then(function (source) {
-            var full = drawScaled(source, IMAGE_MAX_EDGE);
+            // Infinity → drawScaled's cap never binds, so the full image keeps
+            // the camera's own resolution; only the thumbnail is shrunk.
+            var full = drawScaled(source, Infinity);
             var thumb = drawScaled(source, THUMB_MAX_EDGE).toDataURL('image/jpeg', 0.72);
             if (typeof source.close === 'function') source.close();
             return new Promise(function (resolve, reject) {
               full.toBlob(function (blob) {
                 if (blob) resolve({ blob: blob, thumb: thumb });
                 else reject(new Error('encode'));
-              }, 'image/jpeg', 0.88);
+              }, 'image/jpeg', FULL_IMAGE_QUALITY);
             });
           });
         }
@@ -3492,6 +3503,12 @@ export const PHONE_MIRROR_HTML = `<!doctype html>
           copyText(lines.join(NL)).then(function (ok) { showToast(ok ? 'Transcript copied' : 'Copy blocked by the browser', !ok); });
         }
         function clearScreen() {
+          // Mirrors what the desktop's own "Reset / Cancel" keybind does: both
+          // trigger the exact same resetCancel action through the exact same
+          // global-shortcut dispatch (see electron/ipcHandlers.ts
+          // onPhoneCommand), so the phone's clear button now resets the main
+          // chat window too, not just this page's own view of it.
+          sendCommand({ type: 'action', action: 'resetCancel' });
           clearedAt = Date.now();
           entries.slice().forEach(function (e) {
             if (live && live.entry === e) return;

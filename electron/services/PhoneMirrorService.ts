@@ -161,10 +161,13 @@ const TRANSCRIPT_CHAR_LIMIT = 12_000;
 // Speakers the phone shows. Matches the overlay's rolling bar, which shows the
 // interviewer (system audio) only; the user's own mic never leaves the desktop.
 const PHONE_TRANSCRIPT_SPEAKERS = new Set(['interviewer']);
-// Phone image uploads: the page downscales to 2048 px JPEG (~0.3-1.5 MB), so
-// this cap only has to stop abuse, not fit an original 48 MP photo.
-const PHONE_IMAGE_MAX_BYTES = 12 * 1024 * 1024;
-const PHONE_IMAGE_HANDLER_TIMEOUT_MS = 20_000;
+// Phone image uploads: the page sends the photo at full resolution, re-encoded
+// as near-lossless JPEG (quality 0.95) only to normalize format/orientation and
+// strip location metadata — not to shrink it. A 48 MP phone photo at that
+// quality is commonly 8-20 MB, so the cap is sized for that, not for the old
+// 2048 px/0.88 behaviour.
+const PHONE_IMAGE_MAX_BYTES = 30 * 1024 * 1024;
+const PHONE_IMAGE_HANDLER_TIMEOUT_MS = 30_000;
 // Desktop screenshots on the phone: the overlay's thumbnails (480 px JPEG,
 // ~30-60 kB). Main downscales anything bigger before it gets here; this cap is
 // the backstop. The overlay keeps its last 5, so does the phone's tray.
