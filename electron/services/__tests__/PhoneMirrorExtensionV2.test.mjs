@@ -356,6 +356,57 @@ describe('PhoneMirror v2 — extension token persists across restart', () => {
   });
 });
 
+describe('PhoneMirror v2 — persistent link (non-expiring phone token)', () => {
+  test('enabling persists the phone token across a restart; disabling clears it and mints fresh', async () => {
+    const { SettingsManager } = await import(
+      pathToFileURL(
+        path.resolve(repoRoot, 'dist-electron/electron/services/SettingsManager.js'),
+      ).href
+    );
+    const { CredentialsManager } = await import(
+      pathToFileURL(
+        path.resolve(repoRoot, 'dist-electron/electron/services/CredentialsManager.js'),
+      ).href
+    );
+    // Start from a known-off baseline — a prior test may have left it on.
+    SettingsManager.getInstance().set('phoneMirrorPersistentLink', false);
+
+    const { svc, info: info1 } = await freshService();
+    assert.equal(info1.persistentLink, false, 'off by default');
+
+    // Turning it on while running swaps the live token for a persisted one —
+    // no server restart, just a new token + disconnect (like rotateToken).
+    const afterEnable = await svc.setPersistentLink(true);
+    assert.equal(afterEnable.persistentLink, true);
+    const persistedToken = afterEnable.token;
+    assert.ok(persistedToken && persistedToken.length >= 16, 'enabling mints/persists a phone token');
+
+    const credPath = path.join(userDataDir, 'credentials.enc');
+    const onDisk = safeStorageStub.decryptString(fs.readFileSync(credPath));
+    assert.ok(onDisk.includes(persistedToken), 'persisted phone token written to disk');
+
+    // A stop/start cycle (e.g. an app restart) must reuse that same token —
+    // the whole point of "doesn't expire" — not mint a fresh one.
+    await svc.stop({ persist: false });
+    const info2 = await svc.start({ exposeOnLan: false, persist: false });
+    assert.equal(info2.token, persistedToken, 'restart reuses the persisted phone token');
+    assert.equal(info2.persistentLink, true);
+
+    // Turning the option back off clears the persisted secret and goes back to
+    // a fresh-per-session token — nothing lingers on disk once opted out.
+    const afterDisable = await svc.setPersistentLink(false);
+    assert.equal(afterDisable.persistentLink, false);
+    assert.notEqual(afterDisable.token, persistedToken, 'disabling mints a fresh token');
+    assert.equal(
+      CredentialsManager.getInstance().getPhoneMirrorPersistentToken(),
+      undefined,
+      'persisted secret cleared from disk',
+    );
+
+    await svc.stop({ persist: false });
+  });
+});
+
 // ---------------------------------------------------------------------------
 // 5. extensionConnected status flag — snapshot reflects extension presence and
 //    flips on hello / disconnect (drives the Settings "Connected" dot).

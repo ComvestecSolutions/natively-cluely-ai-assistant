@@ -325,6 +325,18 @@ export interface StoredCredentials {
      */
     phoneMirrorToken?: string;
     /**
+     * Phone (LAN) pairing token, persisted ONLY when the user has explicitly
+     * opted into a non-expiring pairing link (`phoneMirrorPersistentLink`
+     * setting). Normally the phone token is minted fresh every session and
+     * never written to disk (see the comment on `phoneMirrorToken` above for
+     * why: it rides a plaintext LAN QR, so persisting it by default would be a
+     * bigger exposure than persisting the loopback-only extension token).
+     * Opting in trades that extra safety margin for a QR/link that keeps
+     * working after a restart; rotating or turning the option back off clears
+     * this field. Set/cleared by PhoneMirrorService only.
+     */
+    phoneMirrorPersistentToken?: string;
+    /**
      * ChatGPT Codex OAuth tokens. Persisted (encrypted via safeStorage) so the
      * user only signs in once per device. Written by CodexOAuthService on a
      * successful PKCE callback+exchange and on each refresh-token rotation;
@@ -911,6 +923,11 @@ export class CredentialsManager {
     /** Persisted loopback-scoped companion-extension token (stable across restarts). */
     public getPhoneMirrorToken(): string | undefined {
         return this.credentials.phoneMirrorToken;
+    }
+
+    /** Persisted phone (LAN) token, only present while the non-expiring link option is on. */
+    public getPhoneMirrorPersistentToken(): string | undefined {
+        return this.credentials.phoneMirrorPersistentToken;
     }
 
     /**
@@ -1535,6 +1552,27 @@ export class CredentialsManager {
         this.credentials.phoneMirrorToken = token || undefined;
         this.saveCredentials();
         console.log('[CredentialsManager] Extension pairing token updated');
+    }
+
+    /**
+     * Persist the phone (LAN) token so its pairing link/QR survives a restart.
+     * Only written while the user has the "link doesn't expire" option on
+     * (PhoneMirrorService.setPersistentLink) — this is the secret that rides a
+     * plaintext LAN QR, so persisting it is opt-in, unlike the extension token.
+     */
+    public setPhoneMirrorPersistentToken(token: string): void {
+        if (this.refuseWriteWhileDegraded('set persistent phone mirror token')) return;
+        this.credentials.phoneMirrorPersistentToken = token || undefined;
+        this.saveCredentials();
+        console.log('[CredentialsManager] Persistent phone pairing token updated');
+    }
+
+    /** Drop the persisted phone token — called when the non-expiring link option is turned off. */
+    public clearPhoneMirrorPersistentToken(): void {
+        if (this.refuseWriteWhileDegraded('clear persistent phone mirror token')) return;
+        this.credentials.phoneMirrorPersistentToken = undefined;
+        this.saveCredentials();
+        console.log('[CredentialsManager] Persistent phone pairing token cleared');
     }
 
     /**

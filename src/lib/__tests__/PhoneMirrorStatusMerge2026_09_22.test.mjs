@@ -37,6 +37,7 @@ const full = (over = {}) => ({
   extToken: 'ext',
   qrDataUrl: 'data:image/png;base64,QR',
   clients: 0,
+  persistentLink: false,
   extensionConnected: false,
   bindAddress: '0.0.0.0',
   ...over,
@@ -145,6 +146,15 @@ describe('mergePhoneMirrorStatus — full snapshots keep the previous contract',
   test('a full snapshot flipping running replaces the state', () => {
     const prev = full();
     const incoming = full({ running: false, port: 0, bindAddress: '127.0.0.1', primaryUrl: null, qrDataUrl: null, token: null, extToken: null });
+    assert.equal(mergePhoneMirrorStatus(prev, incoming), incoming);
+  });
+
+  test('a full snapshot that only toggles persistentLink replaces the state', () => {
+    // Turning "link doesn't expire" on/off changes nothing else the equality
+    // check tracks (same qr/url/token until a rotate), so persistentLink must
+    // be in that check itself or the toggle would silently not re-render.
+    const prev = full({ persistentLink: false });
+    const incoming = full({ persistentLink: true });
     assert.equal(mergePhoneMirrorStatus(prev, incoming), incoming);
   });
 

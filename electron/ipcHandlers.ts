@@ -19842,6 +19842,19 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 
+  // "Link doesn't expire": opts the phone (LAN) token into persistence so its
+  // pairing link/QR survives a restart instead of being minted fresh each
+  // session. No LAN-bind consent needed — this never changes the bind address,
+  // only whether the existing token is written to disk.
+  safeHandle('phone-mirror:set-persistent-link', async (_, enabled: boolean) => {
+    try {
+      return await PhoneMirrorService.getInstance().setPersistentLink(!!enabled);
+    } catch (e: any) {
+      console.error('[IPC] phone-mirror:set-persistent-link error:', e);
+      return { error: e?.message || 'failed to update persistent link setting' };
+    }
+  });
+
   // Open the 60s one-click pairing window for the companion browser extension.
   // The user clicks "Connect browser extension" in Settings → this arms the
   // /pair endpoint → the extension's "Connect to Natively" button fetches the

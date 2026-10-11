@@ -102,6 +102,10 @@ export interface AppSettings {
     knowledgeMode?: boolean;
     phoneMirrorEnabled?: boolean;
     phoneMirrorExposeOnLan?: boolean;
+    // Off by default: the phone (LAN) token is normally fresh per session (see
+    // PhoneMirrorService._start). Turning this on persists it, so the pairing
+    // QR/link keeps working after a restart instead of needing a re-scan.
+    phoneMirrorPersistentLink?: boolean;
     // External optional provider. Default false: do not spawn Ollama unless
     // the user selects an Ollama model or explicitly opts into auto-start.
     autoStartOllama?: boolean;

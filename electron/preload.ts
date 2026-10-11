@@ -1700,6 +1700,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   phoneMirrorSetLan: (exposeOnLan: boolean) =>
     ipcRenderer.invoke('phone-mirror:set-lan', exposeOnLan),
   phoneMirrorRotateToken: () => ipcRenderer.invoke('phone-mirror:rotate-token'),
+  phoneMirrorSetPersistentLink: (enabled: boolean) =>
+    ipcRenderer.invoke('phone-mirror:set-persistent-link', enabled),
   phoneMirrorArmExtension: () => ipcRenderer.invoke('phone-mirror:arm-extension'),
   phoneMirrorListTabs: () => ipcRenderer.invoke('phone-mirror:list-tabs'),
   phoneMirrorCaptureTab: (tabId: number) => ipcRenderer.invoke('phone-mirror:capture-tab', tabId),

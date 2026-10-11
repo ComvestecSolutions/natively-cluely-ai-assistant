@@ -27,6 +27,8 @@ export interface PhoneMirrorInfo {
   extToken: string | null;
   qrDataUrl: string | null;
   clients: number;
+  /** True when the phone token is persisted so the pairing link/QR never expires. */
+  persistentLink: boolean;
   /** True when a companion browser extension is connected over /ws (capture-ready). */
   extensionConnected: boolean;
   /**
@@ -448,8 +450,47 @@ export class PhoneMirrorService {
     } catch (_) {
       /* credentials not ready — token still rotates for this session */
     }
+    // The non-expiring link option persists whatever the phone token IS, so a
+    // rotate must re-persist the new value — otherwise the next restart would
+    // silently fall back to the stale persisted token instead of this one.
+    if (!!SettingsManager.getInstance().get('phoneMirrorPersistentLink')) {
+      try {
+        CredentialsManager.getInstance().setPhoneMirrorPersistentToken(this.token);
+      } catch (_) {
+        /* still rotates for this session */
+      }
+    }
     this.invalidateQrCache();
     this.disconnectAllClients(4401, 'Token rotated');
+    const info = await this.snapshot();
+    this.emitStatus(info);
+    return info;
+  }
+
+  /**
+   * Turn the "link doesn't expire" option on or off. On: persists the current
+   * phone token (minting one first if the server isn't running yet) so the
+   * next session's pairing link/QR reuses it instead of a fresh one. Off:
+   * drops the persisted secret and goes back to a fresh-per-session token.
+   * Unlike setExposeOnLan this never rebinds the server — the bind address is
+   * unaffected — so it just swaps the live token and disconnects clients, the
+   * same lighter-weight move rotateToken() makes.
+   */
+  async setPersistentLink(enabled: boolean): Promise<PhoneMirrorInfo> {
+    SettingsManager.getInstance().set('phoneMirrorPersistentLink', enabled);
+    if (!this.isRunning()) return this.snapshot();
+    if (enabled) {
+      this.token = loadOrCreatePersistedPhoneToken();
+    } else {
+      try {
+        CredentialsManager.getInstance().clearPhoneMirrorPersistentToken();
+      } catch (_) {
+        /* best-effort — option still turns off for this session */
+      }
+      this.token = generateToken();
+    }
+    this.invalidateQrCache();
+    this.disconnectAllClients(4401, enabled ? 'Persistent link enabled' : 'Persistent link disabled');
     const info = await this.snapshot();
     this.emitStatus(info);
     return info;
@@ -1304,6 +1345,7 @@ export class PhoneMirrorService {
 
   async snapshot(): Promise<PhoneMirrorInfo> {
     const enabled = !!SettingsManager.getInstance().get('phoneMirrorEnabled');
+    const persistentLink = !!SettingsManager.getInstance().get('phoneMirrorPersistentLink');
     if (!this.isRunning()) {
       const info: PhoneMirrorInfo = {
         running: false,
@@ -1317,6 +1359,7 @@ export class PhoneMirrorService {
         extToken: null,
         qrDataUrl: null,
         clients: 0,
+        persistentLink,
         extensionConnected: false,
         extPairedAt: this.extPairedAt,
         bindAddress: this.exposeOnLan ? '0.0.0.0' : '127.0.0.1',
@@ -1356,6 +1399,7 @@ export class PhoneMirrorService {
       extToken: this.extToken,
       qrDataUrl,
       clients: this.phoneClientCount(),
+      persistentLink,
       extensionConnected: this.hasExtensionClient(),
       extPairedAt: this.extPairedAt,
       bindAddress: this.bindAddress,
@@ -1373,9 +1417,12 @@ export class PhoneMirrorService {
 
   private async _start(exposeOnLan: boolean, persistEnabled: boolean): Promise<PhoneMirrorInfo> {
     this.exposeOnLan = exposeOnLan;
-    // Phone token: fresh per session. It rides the LAN in a plaintext QR URL, so a
-    // short-lived secret is the safer default — the phone re-scans each session.
-    this.token = generateToken();
+    // Phone token: fresh per session by default (it rides the LAN in a
+    // plaintext QR URL, so a short-lived secret is the safer default). When
+    // the user opts into "link doesn't expire", reuse/persist it instead so
+    // the pairing link/QR survives a restart.
+    const persistentLink = !!SettingsManager.getInstance().get('phoneMirrorPersistentLink');
+    this.token = persistentLink ? loadOrCreatePersistedPhoneToken() : generateToken();
     // Extension token: reuse the persisted value so the extension pairs ONCE and
     // survives restarts; mint + persist only when there is none yet. Only a
     // deliberate Rotate changes it (see rotateToken).
@@ -2227,6 +2274,25 @@ function loadOrCreatePersistedExtToken(): string {
     if (existing && /^[A-Za-z0-9_-]{16,}$/.test(existing)) return existing;
     const fresh = generateToken();
     cm.setPhoneMirrorToken(fresh);
+    return fresh;
+  } catch (_) {
+    return generateToken();
+  }
+}
+
+/**
+ * Load or mint the persisted phone (LAN) token, used only while the user has
+ * the "link doesn't expire" option on. Mirrors loadOrCreatePersistedExtToken,
+ * but against the separate phoneMirrorPersistentToken field — see its doc
+ * comment in CredentialsManager for why the two secrets are kept apart.
+ */
+function loadOrCreatePersistedPhoneToken(): string {
+  try {
+    const cm = CredentialsManager.getInstance();
+    const existing = cm.getPhoneMirrorPersistentToken();
+    if (existing && /^[A-Za-z0-9_-]{16,}$/.test(existing)) return existing;
+    const fresh = generateToken();
+    cm.setPhoneMirrorPersistentToken(fresh);
     return fresh;
   } catch (_) {
     return generateToken();

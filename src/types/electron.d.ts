@@ -1221,6 +1221,9 @@ export interface ElectronAPI {
   phoneMirrorDisable: () => Promise<{ success: true }>;
   phoneMirrorSetLan: (exposeOnLan: boolean) => Promise<PhoneMirrorInfo | { error: string }>;
   phoneMirrorRotateToken: () => Promise<PhoneMirrorInfo | { error: string }>;
+  // "Link doesn't expire" — persists the phone token so the pairing link/QR
+  // survives a restart instead of being minted fresh each session.
+  phoneMirrorSetPersistentLink: (enabled: boolean) => Promise<PhoneMirrorInfo | { error: string }>;
   // Arm the 60s one-click pairing window for the companion browser extension.
   phoneMirrorArmExtension: () => Promise<{ armedMs: number } | { error: string }>;
   phoneMirrorListTabs: () => Promise<{ tabs: Array<{ id: number; title: string; url: string }>; error?: string }>;
@@ -1483,6 +1486,8 @@ export interface PhoneMirrorInfo {
   extToken: string | null;
   qrDataUrl: string | null;
   clients: number;
+  /** True when the phone token is persisted so the pairing link/QR never expires. */
+  persistentLink: boolean;
   extensionConnected: boolean;
   /** Epoch ms of the last successful one-click extension pair this session (0 = none). */
   extPairedAt?: number;

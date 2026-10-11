@@ -266,6 +266,7 @@ const EMPTY_INFO: PhoneMirrorInfo = {
   extToken: null,
   qrDataUrl: null,
   clients: 0,
+  persistentLink: false,
   extensionConnected: false,
   bindAddress: '127.0.0.1',
 };
@@ -588,7 +589,7 @@ export const PhoneMirrorSettings: React.FC = () => {
   const t = useT();
   const isLight = useResolvedTheme() === 'light';
   const [info, setInfo] = useState<PhoneMirrorInfo>(EMPTY_INFO);
-  const [busy, setBusy] = useState<null | 'enable' | 'disable' | 'lan' | 'rotate'>(null);
+  const [busy, setBusy] = useState<null | 'enable' | 'disable' | 'lan' | 'rotate' | 'persistent-link'>(null);
   // Phone Mirror server errors (status load, enable/disable, LAN, reset).
   const [error, setError] = useState<string | null>(null);
   // Smart Browser Context save errors — shown under their own section.
@@ -624,6 +625,10 @@ export const PhoneMirrorSettings: React.FC = () => {
   // declined LAN dialog or an error animates the switch back once.
   const [pendingRunning, setPendingRunning] = useState<boolean | null>(null);
   const [pendingLan, setPendingLan] = useState<boolean | null>(null);
+  // Same optimistic pattern as pendingLan, but the persistent-link toggle
+  // never restarts the server (PhoneMirrorService.setPersistentLink swaps the
+  // live token in place), so there is no flipView snapshot to pair it with.
+  const [pendingPersistentLink, setPendingPersistentLink] = useState<boolean | null>(null);
   // A LAN flip tears the server down and starts it again, and every broadcast
   // from inside that restart is a half-state: running:false, no QR, no link,
   // every phone and the extension dropped. Rendering them blinked the Enable
@@ -721,7 +726,10 @@ export const PhoneMirrorSettings: React.FC = () => {
   );
 
   const apply = useCallback(
-    async (key: 'enable' | 'disable' | 'lan' | 'rotate', fn: () => Promise<any>): Promise<PhoneMirrorInfo | null> => {
+    async (
+      key: 'enable' | 'disable' | 'lan' | 'rotate' | 'persistent-link',
+      fn: () => Promise<any>,
+    ): Promise<PhoneMirrorInfo | null> => {
       setBusy(key);
       setError(null);
       try {
@@ -779,6 +787,21 @@ export const PhoneMirrorSettings: React.FC = () => {
       }
     }
   }, [apply, info]);
+
+  // Persists the phone token so the pairing link/QR survives a restart
+  // (PhoneMirrorService.setPersistentLink) — no server restart here, so no
+  // flipView snapshot is needed, unlike onToggleLan.
+  const onTogglePersistentLink = useCallback(async () => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
+    setPendingPersistentLink(!info.persistentLink);
+    try {
+      await apply('persistent-link', () => window.electronAPI.phoneMirrorSetPersistentLink(!info.persistentLink));
+    } finally {
+      inFlightRef.current = false;
+      setPendingPersistentLink(null);
+    }
+  }, [apply, info.persistentLink]);
 
   // Rotates BOTH the phone token and the extension token and disconnects every
   // client (PhoneMirrorService.rotateToken), hence the confirm and its copy.
@@ -872,6 +895,7 @@ export const PhoneMirrorSettings: React.FC = () => {
   const pairString = view.port && view.extToken ? `${view.port}:${view.extToken}` : null;
 
   const lanChecked = pendingLan ?? info.exposeOnLan;
+  const persistentLinkChecked = pendingPersistentLink ?? info.persistentLink;
   const runningChecked = pendingRunning ?? view.running;
   const onLan = view.bindAddress === '0.0.0.0';
   const arming = armDeadline !== null;
@@ -1136,6 +1160,21 @@ export const PhoneMirrorSettings: React.FC = () => {
                           </Disclosure>
                         </div>
                       )}
+                      <div className="flex items-center justify-between gap-3 pt-1">
+                        <div className="min-w-0">
+                          <p className="text-xs font-medium text-text-primary">{t("Link doesn't expire")}</p>
+                          <p className="text-xs text-text-secondary">
+                            {t('Keeps working after a restart, until you turn this off or reset pairing.')}
+                          </p>
+                        </div>
+                        <Switch
+                          checked={persistentLinkChecked}
+                          onChange={() => {
+                            void onTogglePersistentLink();
+                          }}
+                          label={t("Link doesn't expire")}
+                        />
+                      </div>
                       <p className="flex items-start gap-2 pt-1 text-xs text-text-secondary">
                         <Lock size={14} className="mt-px shrink-0" />
                         <span>{t('The link carries a private token. Anyone who has it can open the mirror.')}</span>
