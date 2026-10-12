@@ -3289,7 +3289,7 @@ export const PHONE_MIRROR_HTML = `<!doctype html>
         // Come back fast after the phone wakes or the tab returns.
         document.addEventListener('visibilitychange', function () {
           if (document.visibilityState !== 'visible') return;
-          requestWakeLock();
+          keepScreenAwake();
           // A retry already in flight (or a live socket) is left alone.
           if (socket && socket.readyState <= 1) return;
           if (conn === 'reconnecting' || (socket && socket.readyState > 1)) { reconnectDelay = 800; connect(); }
@@ -3608,6 +3608,13 @@ export const PHONE_MIRROR_HTML = `<!doctype html>
         }
 
         // ───── Wake lock: keep the phone's screen on while it's mirroring ─
+        // Two independent mechanisms, kept running together: a page the OS
+        // can revoke this for in the background (app switch, aggressive
+        // Android battery optimisation, no support at all pre-iOS-16.4
+        // Safari and in Firefox) still has the OTHER one holding the screen
+        // open, the same way a video call or a paused-but-buffering player
+        // does — phones have always special-cased active media playback in
+        // their screen-timeout logic, well before the Wake Lock API existed.
         var wakeLock = null;
         function requestWakeLock() {
           if (!('wakeLock' in navigator) || wakeLock) return;
@@ -3616,6 +3623,44 @@ export const PHONE_MIRROR_HTML = `<!doctype html>
             lockHandle.addEventListener('release', function () { wakeLock = null; });
           }, function () { wakeLock = null; });
         }
+        // A muted, always-on video stream from a canvas whose one pixel keeps
+        // toggling (so the stream never looks "ended" or static, which some
+        // phones would otherwise let idle-timeout anyway). No network or
+        // bundled asset: captureStream() is a live MediaStream, not a file.
+        var keepAwakeVideo = null;
+        function startKeepAwakeVideo() {
+          if (keepAwakeVideo) { if (keepAwakeVideo.paused) keepAwakeVideo.play().catch(function () {}); return; }
+          try {
+            var canvas = document.createElement('canvas');
+            canvas.width = 2;
+            canvas.height = 2;
+            var ctx = canvas.getContext('2d');
+            if (!ctx || !canvas.captureStream) return;
+            var on = false;
+            function paint() {
+              on = !on;
+              ctx.fillStyle = on ? '#000' : '#010101';
+              ctx.fillRect(0, 0, 2, 2);
+            }
+            paint();
+            var stream = canvas.captureStream(1);
+            setInterval(paint, 1000);
+            var video = document.createElement('video');
+            video.muted = true;
+            video.setAttribute('muted', '');
+            video.playsInline = true;
+            video.setAttribute('playsinline', '');
+            video.setAttribute('aria-hidden', 'true');
+            video.tabIndex = -1;
+            video.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;opacity:0.01;pointer-events:none;';
+            video.srcObject = stream;
+            video.addEventListener('pause', function () { video.play().catch(function () {}); });
+            document.body.appendChild(video);
+            video.play().catch(function () {});
+            keepAwakeVideo = video;
+          } catch (_) { /* no canvas capture on this phone; the Wake Lock above is all there is */ }
+        }
+        function keepScreenAwake() { requestWakeLock(); startKeepAwakeVideo(); }
 
         // ───── Boot ───────────────────────────────────────────────────────
         // iOS only honours :active when a touch listener exists.
@@ -3633,7 +3678,7 @@ export const PHONE_MIRROR_HTML = `<!doctype html>
           setConn('rejected');
           return;
         }
-        requestWakeLock();
+        keepScreenAwake();
         connect();
       })();
     </script>
